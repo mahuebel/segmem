@@ -402,7 +402,9 @@ def cmd_wake(c, args):
                           "below, then run %s wake again.\n" % (lo, hi - 1, len(todo),
                                                                 "" if len(todo) == 1 else "s", ME))
                     print(nap_prompt(c, "episodic", sc, *todo[0], len(todo) - 1))
-                    sys.exit(1)
+                    # exit 0: as a SessionStart hook, a failed command would
+                    # hide this output. The text already says what to do.
+                    sys.exit(0)
                 out.append("#%d-%d %s" % (lo, hi - 1, s))
     print("\n".join(out))
     print("\nYou are awake.")
@@ -495,11 +497,14 @@ what it learned that passes the 30-day test.
 
 
 HOOK = """\
-Hook (optional): add to ~/.claude/settings.json so every prompt is searched
-for names, #issues, and paths, and the hits arrive as context:
+Hooks (recommended): add to ~/.claude/settings.json. SessionStart makes wake
+run on every start, resume, and compaction without relying on the agent;
+UserPromptSubmit searches every prompt for names, #issues, and paths.
 
-{{"hooks": {{"UserPromptSubmit": [{{"hooks": [{{"type": "command",
-  "command": "{me} hook"}}]}}]}}}}
+{{"hooks": {{
+  "SessionStart": [{{"hooks": [{{"type": "command", "command": "{me} wake"}}]}}],
+  "UserPromptSubmit": [{{"hooks": [{{"type": "command", "command": "{me} hook"}}]}}]
+}}}}
 """
 
 

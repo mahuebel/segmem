@@ -40,15 +40,22 @@ git clone <this repo> ~/.segmem/src
 | `segmem forget <lo>-<hi>` | drop a bad summary; the next nap rebuilds it |
 | `segmem project` | print the scope key for the cwd |
 
-## Recall hook
+## Hooks
 
-Prompts rarely trigger `recall` on their own, so let the harness do it. In
+A startup rule the agent must remember is a rule it will sometimes skip, and
+prompts rarely trigger `recall` on their own. Let the harness do both. In
 `~/.claude/settings.json`:
 
 ```json
-{"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command",
-  "command": "~/.segmem/src/segmem hook"}]}]}}
+{"hooks": {
+  "SessionStart": [{"hooks": [{"type": "command", "command": "~/.segmem/src/segmem wake"}]}],
+  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "~/.segmem/src/segmem hook"}]}]
+}}
 ```
+
+`SessionStart` runs `wake` on every start, resume, and compaction and puts the
+output in context. If a compression is due, wake still exits 0 so the request
+reaches the agent.
 
 On every prompt, `segmem hook` pulls out code spans, `#123` references,
 paths, snake and kebab names, and capitalized words, searches the current

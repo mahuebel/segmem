@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""segmem: segmented, scoped memory for agents. One file, SQLite, no daemon.
+
+Layers (the lakehouse reading of OptMem):
+  bronze  memories   append-only facts; never edited, only superseded
+  silver  kind/scope/entities columns, filled at write time; FTS5 over text
+  gold    summaries  the episodic merge tree, per scope; rebuildable from bronze
+
+Kinds, and what wake does with each:
+  identity    who the user is, how they like to work   loaded whole   supersedes
+  procedural  how things work here                     loaded whole   supersedes
+  episodic    what happened                            decaying cover  history
+  people      who someone is                           names only; recall by name
+"""
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+
+KINDS = ("identity", "procedural", "episodic", "people")
+GLOBAL = "global"
+MAX_BYTES = 280
+WAKE_EPISODIC = 64      # lines of project episodic cover
+WAKE_EPISODIC_GLOBAL = 16
+PROMOTE_MIN = 3         # see should_promote()
+
+ME = os.path.abspath(sys.argv[0])
+
+
+# ---------------------------------------------------------------- store
+
+def db_path():
+    d = os.environ.get("SEGMEM_DIR") or os.path.expanduser("~/.segmem")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "segmem.db")
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS memories (
+  id         INTEGER PRIMARY KEY,
+  ts         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  kind       TEXT NOT NULL CHECK (kind IN ('identity','procedural','episodic','people')),
+  scope      TEXT NOT NULL,
+  seq        INTEGER NOT NULL,           -- position within (kind, scope) stream
+  entities   TEXT NOT NULL DEFAULT '',   -- comma-separated subjects: people, components
+  supersedes INTEGER REFERENCES memories(id),
+  text       TEXT NOT NULL,
+  UNIQUE (kind, scope, seq)
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+  text, entities, content='memories', content_rowid='id'
+);
+CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+  INSERT INTO memories_fts(rowid, text, entities) VALUES (new.id, new.text, new.entities);
+END;
+CREATE TABLE IF NOT EXISTS summaries (
+  kind  TEXT NOT NULL, scope TEXT NOT NULL,
+  lo    INTEGER NOT NULL, hi INTEGER NOT NULL,
+  text  TEXT NOT NULL,
+  PRIMARY KEY (kind, scope, lo, hi)
+);
+"""
+
+
+def connect():
+    c = sqlite3.connect(db_path(), timeout=10)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA foreign_keys=ON")
+    c.executescript(SCHEMA)
+    return c
+
+
+def project():
+    """Scope key for the cwd: the main repo path, shared across worktrees."""
+    if os.environ.get("SEGMEM_PROJECT"):
+        return os.environ["SEGMEM_PROJECT"]
+    try:
+        common = subprocess.run(["git", "rev-parse", "--git-common-dir"],
+                                capture_output=True, text=True, check=True).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return GLOBAL
+    return os.path.dirname(os.path.abspath(common))
+
+
+LIVE = "id NOT IN (SELECT supersedes FROM memories WHERE supersedes IS NOT NULL)"
+
+
+def live(c, kind, scopes):
+    q = ("SELECT * FROM memories WHERE kind=? AND scope IN (%s) AND %s ORDER BY id"
+         % (",".join("?" * len(scopes)), LIVE))
+    return c.execute(q, (kind, *scopes)).fetchall()
+
+
+def stream_len(c, kind, scope):
+    r = c.execute("SELECT COUNT(*) FROM memories WHERE kind=? AND scope=?",
+                  (kind, scope)).fetchone()
+    return r[0]
+
+
+def entity_set(row):
+    return {e.strip().lower() for e in row["entities"].split(",") if e.strip()}
+
+
+# ---------------------------------------------------------------- tree
+# An aligned power-of-two block [lo,hi) of one (kind, scope) stream is
+# summarised into one line. Blocks form a binary merge tree; wake prints a
+# budget-bounded cover of it, finest near the present.
+
+def _cover(T, alpha):
+    root = 1
+    while root < T:
+        root *= 2
+    out, stack = [], [(0, root)]
+    while stack:
+        lo, hi = stack.pop()
+        if lo >= T:
+            continue
+        size = hi - lo
+        if size > 1 and (hi > T or size > alpha * (T - lo)):
+            mid = (lo + hi) // 2
+            stack += [(mid, hi), (lo, mid)]
+        else:
+            out.append((lo, hi))
+    return sorted(out)
+
+
+def cover(T, budget):
+    if T <= 0:
+        return []
+    if T <= budget:
+        return [(i, i + 1) for i in range(T)]
+    lo, hi = 0.0, 1.0
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if len(_cover(T, mid)) > budget:
+            lo = mid
+        else:
+            hi = mid
+    out = _cover(T, hi)
+    while len(out) < budget:
+        i = max((i for i, b in enumerate(out) if b[1] - b[0] > 1), default=None)
+        if i is None:
+            break
+        a, b = out[i]
+        out[i:i + 1] = [(a, (a + b) // 2), ((a + b) // 2, b)]
+    return out
+
+
+def summary(c, kind, scope, lo, hi):
+    r = c.execute("SELECT text FROM summaries WHERE kind=? AND scope=? AND lo=? AND hi=?",
+                  (kind, scope, lo, hi)).fetchone()
+    return r[0] if r else None
+
+
+def pending(c, kind, scope, T):
+    """Blocks that can be built and have not been, smallest first."""
+    todo, size = [], 2
+    while size <= T:
+        for k in range(T // size):
+            lo, hi = k * size, (k + 1) * size
+            if summary(c, kind, scope, lo, hi) is None:
+                todo.append((lo, hi))
+        size *= 2
+    return todo
+
+
+def nap_prompt(c, kind, scope, lo, hi, left):
+    if hi - lo == 2:
+        rows = c.execute("SELECT seq, text FROM memories WHERE kind=? AND scope=? "
+                         "AND seq>=? AND seq<? ORDER BY seq", (kind, scope, lo, hi))
+        body = "\n".join("  #%d %s" % (r["seq"], r["text"]) for r in rows)
+    else:
+        mid, halves = (lo + hi) // 2, []
+        for a, b in ((lo, mid), (mid, hi)):
+            s = summary(c, kind, scope, a, b)
+            if s is None:
+                die("Summary #%d-%d is missing; the tree will rebuild it on the next nap."
+                    % (a, b - 1))
+            halves.append("  #%d-%d %s" % (a, b - 1, s))
+        body = "\n".join(halves)
+    tail = "" if not left else "\n%d compression%s remain after this one." % (
+        left, "" if left == 1 else "s")
+    return ("Compress episodic memories #%d-%d (%s) into one line of at most %d "
+            "bytes.\nKeep what has lasting effect, drop what does not. Invent "
+            "nothing.\n\n%s\n%s\nRun: %s nap %d-%d \"<your line>\""
+            % (lo, hi - 1, short(scope), MAX_BYTES, body, tail, ME, lo, hi - 1))
+
+
+def next_nap(c, scope):
+    for sc in (scope, GLOBAL) if scope != GLOBAL else (GLOBAL,):
+        T = stream_len(c, "episodic", sc)
+        todo = pending(c, "episodic", sc, T)
+        if todo:
+            lo, hi = todo[0]
+            return sc, nap_prompt(c, "episodic", sc, lo, hi, len(todo) - 1)
+    return None
+
+
+# ---------------------------------------------------------------- promotion
+
+def should_promote(row, siblings):
+    """Decide whether a project-scoped identity/procedural fact has earned
+    global scope.
+
+    `row` is the candidate; `siblings` are live rows of the same kind in OTHER
+    project scopes that share at least one entity with it (the same subject).
+    Return True to promote: a global copy is written that names `row` as its
+    origin, and the project rows stay as evidence.
+
+    TODO(user): this is the guardrail against preference bleed. Decide:
+      - how many independent projects count as a pattern (PROMOTE_MIN?)
+      - whether the sibling texts must agree, and how to judge agreement
+        (exact match, shared words, or leave it to the agent at nap time)
+      - whether a project row marked as an override should ever promote
+    """
+    raise NotImplementedError("should_promote: see the TODO above")
+
+
+# ---------------------------------------------------------------- commands
+
+def die(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def flags(args):
+    """Split `--k=v` flags from positionals."""
+    opts, pos = {}, []
+    for a in args:
+        if a.startswith("--") and "=" in a:
+            k, v = a[2:].split("=", 1)
+            opts[k] = v
+        elif a.startswith("--"):
+            opts[a[2:]] = "1"
+        else:
+            pos.append(a)
+    return opts, pos
+
+
+def cmd_note(c, args):
+    opts, pos = flags(args)
+    if len(pos) != 2 or pos[0] not in KINDS:
+        die("usage: %s note <%s> \"<text>\" [--scope=global|project] "
+            "[--entities=a,b] [--supersedes=id]" % (ME, "|".join(KINDS)))
+    kind, text = pos
+    text = " ".join(text.split())
+    if len(text.encode()) > MAX_BYTES:
+        die("Too long: %d bytes, max %d." % (len(text.encode()), MAX_BYTES))
+    default_scope = GLOBAL if kind in ("identity", "people") else project()
+    scope = {"global": GLOBAL, "project": project()}.get(opts.get("scope"), None) \
+        or opts.get("scope") or default_scope
+    sup = int(opts["supersedes"]) if "supersedes" in opts else None
+    if sup is not None and not c.execute("SELECT 1 FROM memories WHERE id=?", (sup,)).fetchone():
+        die("No memory #%d to supersede." % sup)
+    with c:
+        seq = stream_len(c, kind, scope)
+        c.execute("INSERT INTO memories(kind,scope,seq,entities,supersedes,text) "
+                  "VALUES (?,?,?,?,?,?)",
+                  (kind, scope, seq, opts.get("entities", ""), sup, text))
+        rid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+    print("#%d %s %s" % (rid, kind, "(%s)" % short(scope)))
+    nap = next_nap(c, project())
+    if nap:
+        print("\n" + nap[1])
+
+
+def short(scope):
+    return scope if scope == GLOBAL else os.path.basename(scope)
+
+
+def cmd_nap(c, args):
+    if len(args) != 2 or not re.fullmatch(r"\d+-\d+", args[0]):
+        die("usage: %s nap <lo>-<hi> \"<line>\"" % ME)
+    lo, hi = (int(x) for x in args[0].split("-"))
+    hi += 1
+    text = " ".join(args[1].split())
+    if len(text.encode()) > MAX_BYTES:
+        die("Too long: %d bytes, max %d." % (len(text.encode()), MAX_BYTES))
+    nap = next_nap(c, project())
+    if not nap:
+        die("Nothing to compress.")
+    scope = nap[0]
+    with c:
+        c.execute("INSERT OR REPLACE INTO summaries(kind,scope,lo,hi,text) VALUES (?,?,?,?,?)",
+                  ("episodic", scope, lo, hi, text))
+    nap = next_nap(c, project())
+    print(nap[1] if nap else "All compressed.")
+
+
+def cmd_forget(c, args):
+    if len(args) != 1 or not re.fullmatch(r"\d+-\d+", args[0]):
+        die("usage: %s forget <lo>-<hi>" % ME)
+    lo, hi = (int(x) for x in args[0].split("-"))
+    with c:
+        n = c.execute("DELETE FROM summaries WHERE kind='episodic' AND scope=? AND lo=? AND hi=?",
+                      (project(), lo, hi + 1)).rowcount
+    print("Dropped %d summary." % n if n else "No such summary.")
+
+
+def cmd_recall(c, args):
+    if not args:
+        die("usage: %s recall <query>   (FTS5 syntax; searches every scope and kind)" % ME)
+    q = " ".join(args)
+    rows = c.execute(
+        "SELECT m.* FROM memories_fts f JOIN memories m ON m.id=f.rowid "
+        "WHERE memories_fts MATCH ? ORDER BY rank LIMIT 50", (q,)).fetchall()
+    if not rows:
+        print("No match.")
+        return
+    dead = {r[0] for r in c.execute("SELECT supersedes FROM memories WHERE supersedes IS NOT NULL")}
+    for r in rows:
+        flag = " [superseded]" if r["id"] in dead else ""
+        print("#%d %s %s %s%s: %s" % (r["id"], r["ts"][:10], r["kind"], short(r["scope"]), flag, r["text"]))
+
+
+def cmd_promote(c, args):
+    if len(args) != 1 or not args[0].isdigit():
+        die("usage: %s promote <id>" % ME)
+    row = c.execute("SELECT * FROM memories WHERE id=?", (int(args[0]),)).fetchone()
+    if not row or row["scope"] == GLOBAL or row["kind"] not in ("identity", "procedural"):
+        die("Only a project-scoped identity or procedural memory can be promoted.")
+    ents = entity_set(row)
+    siblings = [s for s in live(c, row["kind"], _other_scopes(c, row["scope"]))
+                if ents & entity_set(s)]
+    if not should_promote(row, siblings):
+        print("Not promoted: seen in %d other project%s." % (len(siblings), "" if len(siblings) == 1 else "s"))
+        return
+    with c:
+        seq = stream_len(c, row["kind"], GLOBAL)
+        c.execute("INSERT INTO memories(kind,scope,seq,entities,text) VALUES (?,?,?,?,?)",
+                  (row["kind"], GLOBAL, seq, row["entities"],
+                   "%s (promoted from #%d)" % (row["text"], row["id"])))
+    print("Promoted #%d to global." % row["id"])
+
+
+def _other_scopes(c, scope):
+    return [r[0] for r in c.execute(
+        "SELECT DISTINCT scope FROM memories WHERE scope NOT IN (?,?)", (scope, GLOBAL))]
+
+
+def cmd_wake(c, args):
+    p = project()
+    scopes = [GLOBAL] if p == GLOBAL else [GLOBAL, p]
+    out = ["## Memory (project: %s)" % short(p)]
+
+    for kind, title in (("identity", "Identity"), ("procedural", "Procedural")):
+        rows = live(c, kind, scopes)
+        if not rows:
+            continue
+        out.append("\n### %s" % title)
+        glob = [r for r in rows if r["scope"] == GLOBAL]
+        proj = [r for r in rows if r["scope"] != GLOBAL]
+        # Conflict: a project row sharing a subject with a global row. Project
+        # wins, and both are shown so the agent sees why.
+        conflicted = set()
+        for pr in proj:
+            for g in glob:
+                if entity_set(pr) & entity_set(g):
+                    conflicted.update((pr["id"], g["id"]))
+                    out.append("#%d %s (global) OVERRIDDEN by #%d %s (%s)"
+                               % (g["id"], g["text"], pr["id"], pr["text"], short(p)))
+        for r in rows:
+            if r["id"] not in conflicted:
+                out.append("#%d %s (%s)" % (r["id"], r["text"], short(r["scope"])))
+
+    people = live(c, "people", scopes)
+    if people:
+        names = sorted({e for r in people for e in entity_set(r)})
+        out.append("\n### People known: %s" % ", ".join(names))
+        out.append("Run `%s recall <name>` before acting on or about them." % ME)
+
+    streams = [(GLOBAL, WAKE_EPISODIC)] if p == GLOBAL else \
+        [(p, WAKE_EPISODIC), (GLOBAL, WAKE_EPISODIC_GLOBAL)]
+    for sc, budget in streams:
+        T = stream_len(c, "episodic", sc)
+        if not T:
+            continue
+        out.append("\n### Episodic (%s), oldest first" % short(sc))
+        for lo, hi in cover(T, budget):
+            if hi - lo == 1:
+                r = c.execute("SELECT text FROM memories WHERE kind='episodic' AND scope=? AND seq=?",
+                              (sc, lo)).fetchone()
+                out.append("#%d %s" % (lo, r[0]))
+            else:
+                s = summary(c, "episodic", sc, lo, hi)
+                if s is None:
+                    todo = pending(c, "episodic", sc, T)
+                    print("\n".join(out))
+                    print("\nCannot wake: #%d-%d is not compressed yet. Do the %d compression%s "
+                          "below, then run %s wake again.\n" % (lo, hi - 1, len(todo),
+                                                                "" if len(todo) == 1 else "s", ME))
+                    print(nap_prompt(c, "episodic", sc, *todo[0], len(todo) - 1))
+                    sys.exit(1)
+                out.append("#%d-%d %s" % (lo, hi - 1, s))
+    print("\n".join(out))
+    print("\nYou are awake.")
+    nap = next_nap(c, p)
+    if nap:
+        print("\n" + nap[1])
+
+
+PROMPT = """\
+## Memory
+
+Your memory is segmem: `{me}`. It outlives every session, compaction, and model.
+
+At startup (mandatory): run `{me} wake` before any other tool call and read it to
+the end. Project facts override global ones; an OVERRIDDEN line shows both.
+
+While working: `{me} note <kind> "<one line, max 280 bytes>" [--entities=a,b]`
+  identity    who the user is and how they like to work ("prefers"); global
+  procedural  how this project works and why ("uses"); project-scoped
+  episodic    a decision with its reason, a root cause, a handoff; project-scoped
+  people      who someone is; global, always with --entities=<name>
+Apply a 30-day test: record only what could change a future decision. One
+handoff note at the end of a turn beats one note per state change. No PR heads,
+CI counts, or "awaiting review" status. Never record what the repo already says.
+A fact that replaces an older one: add --supersedes=<id>.
+If `note` asks for a compression, do it before your next action.
+
+When a prompt names a person, component, branch, issue, or past decision:
+`{me} recall <words>` first. It searches every scope and kind.
+
+Subagents: never run segmem. Tell them so when you spawn them.
+"""
+
+
+def cmd_init(c, args):
+    print(PROMPT.format(me=ME))
+
+
+def cmd_project(c, args):
+    print(project())
+
+
+def main():
+    cmds = {"wake": cmd_wake, "note": cmd_note, "nap": cmd_nap, "recall": cmd_recall,
+            "forget": cmd_forget, "promote": cmd_promote, "init": cmd_init,
+            "project": cmd_project}
+    if len(sys.argv) < 2 or sys.argv[1] not in cmds:
+        die("usage: %s <%s> ..." % (ME, "|".join(cmds)))
+    cmds[sys.argv[1]](connect(), sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()

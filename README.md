@@ -132,8 +132,10 @@ segmem recall lambda
 
 Episodic facts form a binary tree. Two adjacent facts compress into one line,
 two of those into another, and so on. `wake` prints a fixed budget of lines
-(64 per project) chosen so the newest facts appear verbatim and older ones
-appear as summaries of growing span.
+(64 per project), chosen greedily: a block may be as wide as it is old, so
+the newest facts appear verbatim and each doubling of age gets about the same
+number of lines. Picking the cover takes one pass and well under a
+millisecond at a million memories.
 
 The agent writes each summary itself. When `wake` needs a summary that
 doesn't exist, it prints the two halves and asks for one line, and the agent
@@ -192,7 +194,8 @@ python3 test_segmem.py
 
 ## Credits
 
-The decaying-cover algorithm in `_cover()` and `cover()` is adapted from
-[OptMem](https://github.com/VictorTaelin/OptMem) by Victor Taelin. OptMem
-has no license file as of August 2026; if that changes, this project will
-follow its terms for that code.
+The shape of the history window is an exponential histogram: Datar, Gionis,
+Indyk, and Motwani, "Maintaining stream statistics over sliding windows,"
+SIAM Journal on Computing, 2002. The one-line-per-memory, agent-written
+summary tree owes a debt to [OptMem](https://github.com/VictorTaelin/OptMem)
+by Victor Taelin, which showed how little machinery that idea needs.

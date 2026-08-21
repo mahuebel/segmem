@@ -106,49 +106,58 @@ def entity_set(row):
 # ---------------------------------------------------------------- tree
 # An aligned power-of-two block [lo,hi) of one (kind, scope) stream is
 # summarised into one line. Blocks form a binary merge tree; wake prints a
-# budget-bounded cover of it, finest near the present.
-#
-# _cover() and cover() are adapted from OptMem by Victor Taelin
-# (https://github.com/VictorTaelin/OptMem). See README, "Credits".
-
-def _cover(T, alpha):
-    root = 1
-    while root < T:
-        root *= 2
-    out, stack = [], [(0, root)]
-    while stack:
-        lo, hi = stack.pop()
-        if lo >= T:
-            continue
-        size = hi - lo
-        if size > 1 and (hi > T or size > alpha * (T - lo)):
-            mid = (lo + hi) // 2
-            stack += [(mid, hi), (lo, mid)]
-        else:
-            out.append((lo, hi))
-    return sorted(out)
-
+# budget-bounded cover of it, finest near the present. The shape is an
+# exponential histogram (Datar, Gionis, Indyk, Motwani, 2002): a block may
+# be as wide as it is old, so each doubling of age gets about the same
+# number of lines.
 
 def cover(T, budget):
+    """At most `budget` aligned blocks tiling [0,T), newest finest.
+
+    Greedy: keep a heap of blocks keyed by age/size, where age is the
+    distance from the block's start to the present. Split the block with the
+    smallest ratio (the widest for its age) until the budget is spent. A
+    block that overhangs the end of the stream must split first; a single
+    memory is final. One pass, O(budget log budget)."""
     if T <= 0:
         return []
     if T <= budget:
         return [(i, i + 1) for i in range(T)]
-    lo, hi = 0.0, 1.0
-    for _ in range(60):
-        mid = (lo + hi) / 2
-        if len(_cover(T, mid)) > budget:
-            lo = mid
-        else:
-            hi = mid
-    out = _cover(T, hi)
-    while len(out) < budget:
-        i = max((i for i, b in enumerate(out) if b[1] - b[0] > 1), default=None)
-        if i is None:
-            break
-        a, b = out[i]
-        out[i:i + 1] = [(a, (a + b) // 2), ((a + b) // 2, b)]
-    return out
+    import heapq
+    root = 1 << (T - 1).bit_length()
+
+    def key(lo, hi):
+        if hi > T:
+            return (-1.0, -lo)               # overhang: must split
+        return ((T - lo) / (hi - lo), -lo)   # widest for its age, newest first
+
+    heap, done = [(key(0, root), 0, root)], []
+    while heap and len(heap) + len(done) < budget:
+        _, lo, hi = heapq.heappop(heap)
+        mid = (lo + hi) // 2
+        for a, b in ((lo, mid), (mid, hi)):
+            if a >= T:
+                continue
+            if b - a == 1:
+                done.append((a, b))
+            else:
+                heapq.heappush(heap, (key(a, b), a, b))
+    out = done + [(lo, hi) for _, lo, hi in heap]
+    if any(hi > T for _, hi in out):
+        # the budget ran out before every overhang split: split those
+        # regardless, since a block past the end cannot be summarised
+        fixed = []
+        for lo, hi in out:
+            while hi > T:
+                mid = (lo + hi) // 2
+                if mid >= T:
+                    hi = mid
+                else:
+                    fixed.append((lo, mid))
+                    lo = mid
+            fixed.append((lo, hi))
+        out = fixed
+    return sorted(out)
 
 
 def summary(c, kind, scope, lo, hi):

@@ -3,8 +3,9 @@
 Long-term memory for coding agents that knows the difference between
 *who you are*, *how this repo works*, and *what happened on Tuesday*.
 
-One Python file. SQLite. No server, no daemon, no API key. Works with Claude
-Code today and with anything that can run a shell command.
+One Python file. SQLite. No server, no daemon, no API key. Works with any
+agent that can run a shell command; Claude Code also gets hooks that make
+the startup read and per-prompt recall automatic.
 
 ## The problem
 
@@ -63,9 +64,16 @@ git clone https://github.com/mahuebel/segmem ~/.segmem/src
 
 1. A `## Memory` block. Paste it into `~/.claude/CLAUDE.md` (or your agent's
    `AGENTS.md`). It tells the agent what to record and when.
-2. A `hooks` block. Merge it into `~/.claude/settings.json`. It makes the
-   harness run `wake` at every session start and search memory on every
-   prompt, so neither depends on the agent remembering.
+2. A `hooks` block for Claude Code. Merge it into `~/.claude/settings.json`.
+   It makes the harness run `wake` at every session start and search memory
+   on every prompt, so neither depends on the agent remembering.
+
+On other harnesses (Codex, Cursor, Aider, your own), skip step 2. The prompt
+block alone carries it: the agent runs `wake` and `recall` itself. That works,
+but it relies on the agent following instructions. If your harness can run a
+command at session start or pipe each prompt to a command, point it at
+`segmem wake` and `segmem hook`; `hook` accepts Claude Code's JSON or plain
+text on stdin.
 
 Start a new session. The first `wake` prints an empty header; the agent fills
 it in as you work.
@@ -134,7 +142,7 @@ block, never ahead of time, and never in the background.
 Raw facts are never edited or deleted. Summaries are a cache: drop one with
 `forget` and the next request rebuilds it.
 
-## Hooks
+## Hooks (Claude Code)
 
 The `init` output includes this for `~/.claude/settings.json`:
 

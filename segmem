@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """segmem: segmented, scoped memory for agents. One file, SQLite, no daemon.
 
-Layers (the lakehouse reading of OptMem):
+Layers, lakehouse style:
   bronze  memories   append-only facts; never edited, only superseded
   silver  kind/scope/entities columns, filled at write time; FTS5 over text
   gold    summaries  the episodic merge tree, per scope; rebuildable from bronze
@@ -107,6 +107,9 @@ def entity_set(row):
 # An aligned power-of-two block [lo,hi) of one (kind, scope) stream is
 # summarised into one line. Blocks form a binary merge tree; wake prints a
 # budget-bounded cover of it, finest near the present.
+#
+# _cover() and cover() are adapted from OptMem by Victor Taelin
+# (https://github.com/VictorTaelin/OptMem). See README, "Credits".
 
 def _cover(T, alpha):
     root = 1

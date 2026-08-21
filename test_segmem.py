@@ -49,12 +49,26 @@ class Segmem(unittest.TestCase):
         run("note", "episodic", "beta event", project="/p/beta")
         self.assertNotIn("beta event", run("wake"))
         self.assertNotIn("alpha event", run("wake", project="/p/beta"))
-        # naps come due smallest block first
-        out = run("nap", "0-1", "alpha 0 and 1")
-        self.assertIn("#2-3", out)
-        out = run("nap", "2-3", "alpha 2 and 3")
-        self.assertIn("#0-3", out)
-        self.assertIn("All compressed", run("nap", "0-3", "alpha 0 to 3"))
+        # four memories fit the wake budget, so nothing comes due
+        self.assertIn("Nothing to compress", run("nap", "0-1", "x", check=False))
+
+    def test_nap_only_when_cover_needs_it(self):
+        for i in range(66):
+            run("note", "episodic", "e%d" % i)
+        out = run("wake", check=False)
+        self.assertIn("Cannot wake", out)
+        self.assertIn("#0-1", out)           # smallest needed block first
+        run("nap", "0-1", "e0 e1")
+        out = run("wake", check=False)
+        # the cover for 66 lines over budget 64 needs only a few old blocks
+        self.assertTrue("You are awake" in out or "Cannot wake" in out)
+        while "Cannot wake" in out:
+            import re
+            lo, hi = re.search(r"nap (\d+)-(\d+)", out).groups()
+            run("nap", "%s-%s" % (lo, hi), "sum %s-%s" % (lo, hi))
+            out = run("wake", check=False)
+        self.assertIn("You are awake", out)
+        self.assertNotIn("Compress", out)    # nothing premature after wake
 
     def test_people_listed_by_name(self):
         run("note", "people", "Alice owns deploys", "--entities=alice")

@@ -154,16 +154,30 @@ def summary(c, kind, scope, lo, hi):
     return r[0] if r else None
 
 
+def budget_for(scope):
+    """Lines of episodic cover wake prints for a scope, from the cwd's view."""
+    p = project()
+    return WAKE_EPISODIC if scope == p or p == GLOBAL else WAKE_EPISODIC_GLOBAL
+
+
 def pending(c, kind, scope, T):
-    """Blocks that can be built and have not been, smallest first."""
-    todo, size = [], 2
-    while size <= T:
-        for k in range(T // size):
-            lo, hi = k * size, (k + 1) * size
-            if summary(c, kind, scope, lo, hi) is None:
-                todo.append((lo, hi))
-        size *= 2
-    return todo
+    """Blocks wake needs and does not have, smallest first. A block is needed
+    when the cover prints it, or when a needed block's summary is built from
+    it. Blocks the cover does not print are never requested: no premature
+    compression."""
+    need = []
+
+    def walk(lo, hi):
+        if hi - lo == 1 or summary(c, kind, scope, lo, hi) is not None:
+            return
+        mid = (lo + hi) // 2
+        walk(lo, mid)
+        walk(mid, hi)
+        need.append((lo, hi))
+
+    for lo, hi in cover(T, budget_for(scope)):
+        walk(lo, hi)
+    return sorted(set(need), key=lambda b: (b[1] - b[0], b[0]))
 
 
 def nap_prompt(c, kind, scope, lo, hi, left):

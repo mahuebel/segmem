@@ -40,6 +40,21 @@ git clone <this repo> ~/.segmem/src
 | `segmem forget <lo>-<hi>` | drop a bad summary; the next nap rebuilds it |
 | `segmem project` | print the scope key for the cwd |
 
+## Recall hook
+
+Prompts rarely trigger `recall` on their own, so let the harness do it. In
+`~/.claude/settings.json`:
+
+```json
+{"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command",
+  "command": "~/.segmem/src/segmem hook"}]}]}}
+```
+
+On every prompt, `segmem hook` pulls out code spans, `#123` references,
+paths, snake and kebab names, and capitalized words, searches the current
+project plus global memory, and adds up to eight live hits as a
+`<segmem-recall>` block. No identifiers, no output; it never blocks a prompt.
+
 Set `SEGMEM_DIR` to move the database, `SEGMEM_PROJECT` to force a scope.
 
 ## Test

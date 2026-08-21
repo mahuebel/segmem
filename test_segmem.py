@@ -5,9 +5,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(HERE, "segmem")
 
 
-def run(*args, project="/p/alpha", check=True):
+def run(*args, project="/p/alpha", check=True, stdin=None):
     env = dict(os.environ, SEGMEM_DIR=run.dir, SEGMEM_PROJECT=project)
-    r = subprocess.run([sys.executable, TOOL, *args], capture_output=True, text=True, env=env)
+    r = subprocess.run([sys.executable, TOOL, *args], capture_output=True, text=True,
+                       env=env, input=stdin)
     if check and r.returncode:
         raise AssertionError(r.stderr + r.stdout)
     return r.stdout + r.stderr
@@ -77,6 +78,19 @@ class Segmem(unittest.TestCase):
         run("note", "procedural", "Uses PNPM", "--entities=pkg", project="/p/d")
         self.assertIn("Promoted #1", run("promote", "1", project="/p/a"))
         self.assertIn("(global)", run("wake", project="/p/zzz"))
+
+    def test_hook_recalls_identifiers(self):
+        import json
+        run("note", "people", "Alice owns deploys", "--entities=alice")
+        run("note", "episodic", "chose Node over Bun for the Lambda runtime")
+        run("note", "episodic", "beta secret", project="/p/beta")
+        out = run("hook", stdin=json.dumps({"prompt": "ask Alice about the Lambda deploy"}))
+        self.assertIn("<segmem-recall>", out)
+        self.assertIn("Alice owns", out)
+        self.assertIn("Lambda", out)
+        self.assertNotIn("beta secret", out)
+        self.assertEqual("", run("hook", stdin=json.dumps({"prompt": "fix it please"})))
+        self.assertEqual("", run("hook", stdin="not json"))
 
 
 if __name__ == "__main__":

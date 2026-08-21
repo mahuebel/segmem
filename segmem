@@ -479,6 +479,109 @@ def cmd_hook(c, args):
     print("</segmem-recall>")
 
 
+# ---------------------------------------------------------------- mcp
+# A stdio MCP server for harnesses without a shell, such as the Claude
+# Desktop chat app. JSON-RPC 2.0, one message per line, stdlib only. Each
+# tool runs the matching command and returns what it would have printed.
+
+MCP_TOOLS = [
+    {"name": "segmem_wake",
+     "description": "Read the memory for the current project. Call this first in every conversation.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "segmem_note",
+     "description": "Record one fact (max 280 bytes). kind: identity (who the user is, 'prefers'), "
+                    "procedural (how this project works, 'uses'), episodic (a decision with its reason, "
+                    "a root cause, a handoff), people (who someone is; always pass entities). Apply a "
+                    "30-day test: record only what could change a future decision.",
+     "inputSchema": {"type": "object", "required": ["kind", "text"], "properties": {
+         "kind": {"type": "string", "enum": list(KINDS)},
+         "text": {"type": "string"},
+         "entities": {"type": "string", "description": "comma-separated subjects: people, components"},
+         "scope": {"type": "string", "description": "'global' or 'project'; defaults by kind"},
+         "supersedes": {"type": "integer", "description": "id of the fact this one replaces"}}}},
+    {"name": "segmem_recall",
+     "description": "Full-text search across every kind and scope. Use when a prompt names a person, "
+                    "component, branch, issue, or past decision.",
+     "inputSchema": {"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}}},
+    {"name": "segmem_nap",
+     "description": "Answer a compression request from wake or note: one line for memories lo-hi.",
+     "inputSchema": {"type": "object", "required": ["range", "text"], "properties": {
+         "range": {"type": "string", "description": "for example 0-1"}, "text": {"type": "string"}}}},
+]
+
+
+def capture(fn, args):
+    """Run a command, return what it printed. Commands call sys.exit; here
+    that is a result, not an exit."""
+    import io
+    out, err = io.StringIO(), io.StringIO()
+    old = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = out, err
+    try:
+        fn(connect(), args)
+    except SystemExit:
+        pass
+    finally:
+        sys.stdout, sys.stderr = old
+    return (out.getvalue() + err.getvalue()).strip()
+
+
+def mcp_call(name, a):
+    if name == "segmem_wake":
+        return capture(cmd_wake, [])
+    if name == "segmem_note":
+        args = [a["kind"], a["text"]]
+        for k in ("entities", "scope", "supersedes"):
+            if a.get(k) not in (None, ""):
+                args.append("--%s=%s" % (k, a[k]))
+        return capture(cmd_note, args)
+    if name == "segmem_recall":
+        return capture(cmd_recall, [a["query"]])
+    if name == "segmem_nap":
+        return capture(cmd_nap, [a["range"], a["text"]])
+    raise KeyError(name)
+
+
+def cmd_mcp(c, args):
+    import json
+    c.close()
+
+    def send(msg):
+        sys.stdout.write(json.dumps(msg) + "\n")
+        sys.stdout.flush()
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except ValueError:
+            continue
+        rid, method, params = req.get("id"), req.get("method", ""), req.get("params") or {}
+        if rid is None:
+            continue  # a notification: nothing to answer
+        try:
+            if method == "initialize":
+                result = {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
+                          "capabilities": {"tools": {}},
+                          "serverInfo": {"name": "segmem", "version": "0.1"}}
+            elif method == "ping":
+                result = {}
+            elif method == "tools/list":
+                result = {"tools": MCP_TOOLS}
+            elif method == "tools/call":
+                text = mcp_call(params.get("name"), params.get("arguments") or {})
+                result = {"content": [{"type": "text", "text": text or "(no output)"}]}
+            else:
+                send({"jsonrpc": "2.0", "id": rid,
+                      "error": {"code": -32601, "message": "unknown method %s" % method}})
+                continue
+            send({"jsonrpc": "2.0", "id": rid, "result": result})
+        except Exception as e:  # never let one bad call kill the server
+            send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": str(e)}})
+
+
 PROMPT = """\
 ## Memory
 
@@ -533,7 +636,7 @@ def cmd_project(c, args):
 def main():
     cmds = {"wake": cmd_wake, "note": cmd_note, "nap": cmd_nap, "recall": cmd_recall,
             "forget": cmd_forget, "promote": cmd_promote, "init": cmd_init,
-            "project": cmd_project, "hook": cmd_hook}
+            "project": cmd_project, "hook": cmd_hook, "mcp": cmd_mcp}
     if len(sys.argv) < 2 or sys.argv[1] not in cmds:
         die("usage: %s <%s> ..." % (ME, "|".join(cmds)))
     cmds[sys.argv[1]](connect(), sys.argv[2:])

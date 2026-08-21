@@ -106,6 +106,30 @@ class Segmem(unittest.TestCase):
         self.assertEqual("", run("hook", stdin=json.dumps({"prompt": "fix it please"})))
         self.assertEqual("", run("hook", stdin="not json"))
 
+    def test_mcp_roundtrip(self):
+        import json
+        msgs = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "segmem_note",
+                "arguments": {"kind": "people", "text": "Alice owns deploys", "entities": "alice"}}},
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "segmem_recall",
+                "arguments": {"query": "alice"}}},
+            {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "segmem_wake", "arguments": {}}},
+            {"jsonrpc": "2.0", "id": 6, "method": "nope"},
+        ]
+        out = run("mcp", stdin="\n".join(json.dumps(m) for m in msgs) + "\n")
+        replies = {r["id"]: r for r in (json.loads(l) for l in out.splitlines() if l.strip())}
+        self.assertEqual(replies[1]["result"]["serverInfo"]["name"], "segmem")
+        self.assertEqual({t["name"] for t in replies[2]["result"]["tools"]},
+                         {"segmem_wake", "segmem_note", "segmem_recall", "segmem_nap"})
+        self.assertIn("#1 people", replies[3]["result"]["content"][0]["text"])
+        self.assertIn("Alice owns", replies[4]["result"]["content"][0]["text"])
+        self.assertIn("You are awake", replies[5]["result"]["content"][0]["text"])
+        self.assertEqual(replies[6]["error"]["code"], -32601)
+        self.assertEqual(len(replies), 6)  # the notification got no reply
+
 
 if __name__ == "__main__":
     unittest.main()

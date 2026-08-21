@@ -166,6 +166,26 @@ The `init` output includes this block. For Claude Code, merge it into
   `<segmem-recall>` block. No identifiers or no hits means no output. It never
   blocks a prompt.
 
+## Claude Desktop and other MCP clients
+
+For a client with no shell (the Claude Desktop chat app, for example), segmem
+runs as an MCP server over stdio, still with no dependencies:
+
+```json
+{"mcpServers": {"segmem": {
+  "command": "~/.segmem/src/segmem", "args": ["mcp"],
+  "env": {"SEGMEM_PROJECT": "global"}
+}}}
+```
+
+On macOS that goes in `~/Library/Application Support/Claude/claude_desktop_config.json`;
+use a full path for `command`, since MCP clients don't expand `~`. Restart the
+app. The tools are `segmem_wake`, `segmem_note`, `segmem_recall`, and
+`segmem_nap`. There are no hooks in a chat client, so add one line to your
+Project instructions or preferences: "Call `segmem_wake` before anything
+else." `SEGMEM_PROJECT` picks the scope; a chat client has no git checkout,
+so `global` is the sensible default.
+
 ## Subagents
 
 Subagents may run `wake` and `recall`. They never write: they can't tell what

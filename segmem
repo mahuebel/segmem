@@ -474,7 +474,9 @@ When a prompt names a person, component, branch, issue, or past decision:
 `{me} recall <words>` first. It searches every scope and kind. A
 <segmem-recall> block in a prompt is this search already done for you.
 
-Subagents: never run segmem. Tell them so when you spawn them.
+Subagents may run `{me} wake` and `{me} recall` but never `note`, `nap`,
+or `promote`. Tell them so when you spawn them. When one returns, you record
+what it learned that passes the 30-day test.
 """
 
 

@@ -69,6 +69,15 @@ class Segmem(unittest.TestCase):
         out = run("wake", check=False)
         self.assertIn("Cannot wake", out)
 
+    def test_promote_needs_three_agreeing_projects(self):
+        run("note", "procedural", "uses pnpm", "--entities=pkg", project="/p/a")
+        run("note", "procedural", "uses pnpm.", "--entities=pkg", project="/p/b")
+        run("note", "procedural", "uses yarn", "--entities=pkg", project="/p/c")
+        self.assertIn("Not promoted", run("promote", "1", project="/p/a"))
+        run("note", "procedural", "Uses PNPM", "--entities=pkg", project="/p/d")
+        self.assertIn("Promoted #1", run("promote", "1", project="/p/a"))
+        self.assertIn("(global)", run("wake", project="/p/zzz"))
+
 
 if __name__ == "__main__":
     unittest.main()

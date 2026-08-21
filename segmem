@@ -200,22 +200,18 @@ def next_nap(c, scope):
 
 # ---------------------------------------------------------------- promotion
 
+def norm(text):
+    return " ".join(re.sub(r"[^\w\s]", " ", text.lower()).split())
+
+
 def should_promote(row, siblings):
-    """Decide whether a project-scoped identity/procedural fact has earned
-    global scope.
-
-    `row` is the candidate; `siblings` are live rows of the same kind in OTHER
-    project scopes that share at least one entity with it (the same subject).
-    Return True to promote: a global copy is written that names `row` as its
-    origin, and the project rows stay as evidence.
-
-    TODO(user): this is the guardrail against preference bleed. Decide:
-      - how many independent projects count as a pattern (PROMOTE_MIN?)
-      - whether the sibling texts must agree, and how to judge agreement
-        (exact match, shared words, or leave it to the agent at nap time)
-      - whether a project row marked as an override should ever promote
-    """
-    raise NotImplementedError("should_promote: see the TODO above")
+    """A project fact earns global scope when the same statement (ignoring
+    case and punctuation) is live in at least PROMOTE_MIN distinct projects,
+    the candidate's own project included. Siblings that merely share a
+    subject but say something else are not evidence."""
+    agree = {s["scope"] for s in siblings if norm(s["text"]) == norm(row["text"])}
+    agree.add(row["scope"])
+    return len(agree) >= PROMOTE_MIN
 
 
 # ---------------------------------------------------------------- commands

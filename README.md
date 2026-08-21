@@ -196,6 +196,4 @@ python3 test_segmem.py
 
 The shape of the history window is an exponential histogram: Datar, Gionis,
 Indyk, and Motwani, "Maintaining stream statistics over sliding windows,"
-SIAM Journal on Computing, 2002. The one-line-per-memory, agent-written
-summary tree owes a debt to [OptMem](https://github.com/VictorTaelin/OptMem)
-by Victor Taelin, which showed how little machinery that idea needs.
+SIAM Journal on Computing, 2002.

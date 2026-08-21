@@ -500,9 +500,10 @@ what it learned that passes the 30-day test.
 
 
 HOOK = """\
-Hooks (recommended): add to ~/.claude/settings.json. SessionStart makes wake
-run on every start, resume, and compaction without relying on the agent;
-UserPromptSubmit searches every prompt for names, #issues, and paths.
+Hooks (recommended): merge into ~/.claude/settings.json (Claude Code) or save
+as ~/.codex/hooks.json (Codex CLI). SessionStart makes wake run on every start
+and resume without relying on the agent; UserPromptSubmit searches every
+prompt for names, #issues, and paths.
 
 {{"hooks": {{
   "SessionStart": [{{"hooks": [{{"type": "command", "command": "{me} wake"}}]}}],

@@ -39,9 +39,9 @@ At the start of a session, in the `segmem` repo:
 Run `segmem recall <name>` before acting on or about them.
 
 ### Episodic (segmem), oldest first
-#0-3 chose SQLite over DuckDB; stdlib, WAL, FTS5
-#4 naps come due only for blocks the wake cover prints
-#5 wake runs from a SessionStart hook; the agent skipped it once
+#0-3 2026-08-21 chose SQLite over DuckDB; stdlib, WAL, FTS5
+#4 2026-08-21 naps come due only for blocks the wake cover prints
+#5 2026-08-22 wake runs from a SessionStart hook; the agent skipped it once
 
 You are awake.
 ```
@@ -90,6 +90,21 @@ it in as you work.
 
 The word choice is the classification. *Prefers* is about you and goes
 global. *Uses* is about a repo and stays there.
+
+## Tags
+
+`--entities=a,b` tags a fact with its subjects: people, components, files.
+Tags are one vocabulary across projects. When you write one that matches an
+existing tag ignoring case, the stored spelling wins; when it's new but close
+to an existing one, `note` says so (`new tag: github_actions (similar:
+github-actions)`), and you use the suggestion next time. A tag that looks
+like a name with no `people` record gets a nudge to create one. `recall`
+prints tags in brackets so you can see what's in use.
+
+Tags earn their keep in three places: they pair project facts with the
+global facts they override, they let `promote` match the same fact across
+projects, and they're what makes a capitalized word in a prompt count as
+something worth looking up.
 
 ## Scope
 
@@ -163,7 +178,8 @@ The `init` output includes this block. For Claude Code, merge it into
   the output in context. A startup rule the agent has to remember is a rule
   it will sometimes skip; this removes the dependency.
 - `UserPromptSubmit` runs `hook`, which pulls identifiers out of your message
-  (code spans, `#123`, paths, snake and kebab names, capitalized words), searches
+  (code spans, `#123`, paths, snake and kebab names, and capitalized words
+  that are known tags), searches
   the current project plus global memory, and adds up to eight hits as a
   `<segmem-recall>` block. No identifiers or no hits means no output. It never
   blocks a prompt.

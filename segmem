@@ -192,11 +192,19 @@ def pending(c, kind, scope, T):
     return sorted(set(need), key=lambda b: (b[1] - b[0], b[0]))
 
 
+def span(c, scope, lo, hi):
+    """The dates a block of episodic memories covers: one date, or first..last."""
+    r = c.execute("SELECT MIN(ts), MAX(ts) FROM memories WHERE kind='episodic' AND scope=? "
+                  "AND seq>=? AND seq<?", (scope, lo, hi)).fetchone()
+    a, b = (r[0] or "")[:10], (r[1] or "")[:10]
+    return a if a == b else "%s..%s" % (a, b[5:])
+
+
 def nap_prompt(c, kind, scope, lo, hi, left):
     if hi - lo == 2:
-        rows = c.execute("SELECT seq, text FROM memories WHERE kind=? AND scope=? "
+        rows = c.execute("SELECT seq, ts, text FROM memories WHERE kind=? AND scope=? "
                          "AND seq>=? AND seq<? ORDER BY seq", (kind, scope, lo, hi))
-        body = "\n".join("  #%d %s" % (r["seq"], r["text"]) for r in rows)
+        body = "\n".join("  #%d %s %s" % (r["seq"], r["ts"][:10], r["text"]) for r in rows)
     else:
         mid, halves = (lo + hi) // 2, []
         for a, b in ((lo, mid), (mid, hi)):
@@ -204,7 +212,7 @@ def nap_prompt(c, kind, scope, lo, hi, left):
             if s is None:
                 die("Summary #%d-%d is missing; the tree will rebuild it on the next nap."
                     % (a, b - 1))
-            halves.append("  #%d-%d %s" % (a, b - 1, s))
+            halves.append("  #%d-%d %s %s" % (a, b - 1, span(c, scope, a, b), s))
         body = "\n".join(halves)
     tail = "" if not left else "\n%d compression%s remain after this one." % (
         left, "" if left == 1 else "s")
@@ -261,6 +269,47 @@ def flags(args):
     return opts, pos
 
 
+def known_tags(c):
+    """Every tag ever written, keyed by lowercase, valued by stored spelling.
+    One vocabulary across scopes: promotion matches siblings by tag."""
+    tags = {}
+    for (ents,) in c.execute("SELECT entities FROM memories WHERE entities != ''"):
+        for e in ents.split(","):
+            e = e.strip()
+            if e:
+                tags.setdefault(e.lower(), e)
+    return tags
+
+
+def canon(c, raw, kind):
+    """Trim and dedupe tags; a tag that matches a known one ignoring case
+    takes the stored spelling. Returns (entities, hints): hints name a new
+    tag's near matches, and a name-like tag with no people record."""
+    tags, out, seen, hints = known_tags(c), [], set(), []
+    people = {e for (ents,) in c.execute("SELECT entities FROM memories WHERE kind='people'")
+              for e in ents.lower().split(",") if e.strip()}
+    import difflib
+    for e in raw.split(","):
+        e = e.strip()
+        k = e.lower()
+        if not e or k in seen:
+            continue
+        seen.add(k)
+        if k in tags:
+            out.append(tags[k])
+            continue
+        out.append(e)
+        near = difflib.get_close_matches(k, list(tags), n=3, cutoff=0.8)
+        if near:
+            hints.append("new tag: %s (similar: %s)" % (e, ", ".join(tags[n] for n in near)))
+    if kind != "people":
+        for e in out:
+            if re.fullmatch(r"[A-Z][a-z]+", e) and e.lower() not in people:
+                hints.append("no people record for %s; if a person: %s note people "
+                             "\"<who they are>\" --entities=%s" % (e, ME, e))
+    return ",".join(out), hints
+
+
 def cmd_note(c, args):
     opts, pos = flags(args)
     if len(pos) != 2 or pos[0] not in KINDS:
@@ -276,13 +325,16 @@ def cmd_note(c, args):
     sup = int(opts["supersedes"]) if "supersedes" in opts else None
     if sup is not None and not c.execute("SELECT 1 FROM memories WHERE id=?", (sup,)).fetchone():
         die("No memory #%d to supersede." % sup)
+    entities, hints = canon(c, opts.get("entities", ""), kind)
     with c:
         seq = stream_len(c, kind, scope)
         c.execute("INSERT INTO memories(kind,scope,seq,entities,supersedes,text) "
                   "VALUES (?,?,?,?,?,?)",
-                  (kind, scope, seq, opts.get("entities", ""), sup, text))
+                  (kind, scope, seq, entities, sup, text))
         rid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
     print("#%d %s %s" % (rid, kind, "(%s)" % short(scope)))
+    for h in hints:
+        print(h)
     nap = next_nap(c, project())
     if nap:
         print("\n" + nap[1])
@@ -334,7 +386,9 @@ def cmd_recall(c, args):
     dead = {r[0] for r in c.execute("SELECT supersedes FROM memories WHERE supersedes IS NOT NULL")}
     for r in rows:
         flag = " [superseded]" if r["id"] in dead else ""
-        print("#%d %s %s %s%s: %s" % (r["id"], r["ts"][:10], r["kind"], short(r["scope"]), flag, r["text"]))
+        tags = " [%s]" % r["entities"] if r["entities"] else ""
+        print("#%d %s %s %s%s%s: %s" % (r["id"], r["ts"][:10], r["kind"], short(r["scope"]),
+                                        tags, flag, r["text"]))
 
 
 def cmd_promote(c, args):
@@ -389,8 +443,12 @@ def cmd_wake(c, args):
 
     people = live(c, "people", scopes)
     if people:
-        names = sorted({e for r in people for e in entity_set(r)})
-        out.append("\n### People known: %s" % ", ".join(names))
+        names = {}
+        for r in people:
+            for e in r["entities"].split(","):
+                if e.strip():
+                    names.setdefault(e.strip().lower(), e.strip())
+        out.append("\n### People known: %s" % ", ".join(names[k] for k in sorted(names)))
         out.append("Run `%s recall <name>` before acting on or about them." % ME)
 
     streams = [(GLOBAL, WAKE_EPISODIC)] if p == GLOBAL else \
@@ -402,9 +460,9 @@ def cmd_wake(c, args):
         out.append("\n### Episodic (%s), oldest first" % short(sc))
         for lo, hi in cover(T, budget):
             if hi - lo == 1:
-                r = c.execute("SELECT text FROM memories WHERE kind='episodic' AND scope=? AND seq=?",
+                r = c.execute("SELECT ts, text FROM memories WHERE kind='episodic' AND scope=? AND seq=?",
                               (sc, lo)).fetchone()
-                out.append("#%d %s" % (lo, r[0]))
+                out.append("#%d %s %s" % (lo, r[0][:10], r[1]))
             else:
                 s = summary(c, "episodic", sc, lo, hi)
                 if s is None:
@@ -417,7 +475,7 @@ def cmd_wake(c, args):
                     # exit 0: as a SessionStart hook, a failed command would
                     # hide this output. The text already says what to do.
                     sys.exit(0)
-                out.append("#%d-%d %s" % (lo, hi - 1, s))
+                out.append("#%d-%d %s %s" % (lo, hi - 1, span(c, sc, lo, hi), s))
     print("\n".join(out))
     print("\nYou are awake.")
     nap = next_nap(c, p)
@@ -432,15 +490,17 @@ his her what which who how when where why do does did can could should would wil
 just also not no yes please let make add fix run use new old all any some into""".split())
 
 
-def identifiers(text):
+def identifiers(text, tags=()):
     """Words in a prompt worth looking up: code spans, #123, paths and
-    snake/kebab names, and capitalised words that are not stopwords."""
+    snake/kebab names, and capitalised words that are known tags. A proper
+    noun that nobody tagged is prose, not an identifier: "Claude" would
+    otherwise match every memory."""
     found = []
     for tok in re.findall(r"`([^`]+)`", text):
         found += tok.split()
     found += re.findall(r"#\d+", text)
     found += re.findall(r"[A-Za-z][\w./-]*[_/.-][\w./-]*", text)
-    found += re.findall(r"\b[A-Z][a-zA-Z0-9]{2,}\b", text)
+    found += [w for w in re.findall(r"\b[A-Z][a-zA-Z0-9]{2,}\b", text) if w.lower() in tags]
     out, seen = [], set()
     for f in found:
         k = f.strip("`.,;:()[]{}'\"").lower()
@@ -459,7 +519,7 @@ def cmd_hook(c, args):
         text = data.get("prompt", "") if isinstance(data, dict) else ""
     except Exception:
         text = sys.stdin.read() if not sys.stdin.isatty() else ""
-    ids = identifiers(text)
+    ids = identifiers(text, known_tags(c))
     if not ids:
         return
     q = " OR ".join('"%s"' % i.replace('"', '""') for i in ids)
@@ -475,7 +535,7 @@ def cmd_hook(c, args):
         return
     print("<segmem-recall>")
     for r in rows:
-        print("#%d %s %s: %s" % (r["id"], r["kind"], short(r["scope"]), r["text"]))
+        print("#%d %s %s %s: %s" % (r["id"], r["ts"][:10], r["kind"], short(r["scope"]), r["text"]))
     print("</segmem-recall>")
 
 
@@ -797,8 +857,10 @@ While working: `{me} note <kind> "<one line, max 280 bytes>" [--entities=a,b]`
   people      who someone is; global, always with --entities=<name>
 Apply a 30-day test: record only what could change a future decision. One
 handoff note at the end of a turn beats one note per state change. No PR heads,
-CI counts, or "awaiting review" status. Never record what the repo already says.
-A fact that replaces an older one: add --supersedes=<id>.
+CI counts, or "awaiting review" status. Record the why and what surprised you;
+git log has the what, and the tool stamps the date (date the text only for a
+past event). A fact that replaces an older one: add --supersedes=<id>.
+When `note` suggests a tag spelling, use it next time; never re-note.
 If `note` asks for a compression, do it before your next action.
 
 When a prompt names a person, component, branch, issue, or past decision:

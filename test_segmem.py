@@ -96,13 +96,16 @@ class Segmem(unittest.TestCase):
     def test_hook_recalls_identifiers(self):
         import json
         run("note", "people", "Alice owns deploys", "--entities=alice")
-        run("note", "episodic", "chose Node over Bun for the Lambda runtime")
+        run("note", "episodic", "chose Node over Bun for the Lambda runtime", "--entities=lambda")
+        run("note", "episodic", "Claude said the Gateway was slow")
         run("note", "episodic", "beta secret", project="/p/beta")
         out = run("hook", stdin=json.dumps({"prompt": "ask Alice about the Lambda deploy"}))
         self.assertIn("<segmem-recall>", out)
         self.assertIn("Alice owns", out)
         self.assertIn("Lambda", out)
         self.assertNotIn("beta secret", out)
+        # a capitalised word that is not a tag is prose, not an identifier
+        self.assertEqual("", run("hook", stdin=json.dumps({"prompt": "Claude, is the Gateway slow?"})))
         self.assertEqual("", run("hook", stdin=json.dumps({"prompt": "fix it please"})))
         self.assertEqual("", run("hook", stdin="not json"))
 
@@ -141,6 +144,28 @@ class Segmem(unittest.TestCase):
         self.assertIn("uses npm", page)
         self.assertNotIn("<script src=", page)      # no external libraries
         self.assertNotIn("https://", page.split("<script>")[0])  # no remote assets
+
+    def test_tags_canonical_and_hinted(self):
+        run("note", "procedural", "uses actions", "--entities=github-actions")
+        out = run("note", "episodic", "ci broke", "--entities=GitHub-Actions,github_actions")
+        self.assertIn("new tag: github_actions (similar: github-actions)", out)
+        page = run("recall", "broke")
+        self.assertIn("[github-actions,github_actions]", page)  # case-matched to the stored spelling
+
+    def test_people_hint(self):
+        out = run("note", "episodic", "Alice fixed the deploy", "--entities=Alice,PrayerPair,useGuard")
+        self.assertIn("no people record for Alice", out)
+        self.assertNotIn("PrayerPair;", out)
+        self.assertNotIn("useGuard;", out)
+        run("note", "people", "Alice owns deploys", "--entities=alice")
+        out = run("note", "episodic", "Alice again", "--entities=Alice")
+        self.assertNotIn("no people record", out)
+        self.assertIn("People known: Alice", run("wake"))  # first stored spelling wins
+
+    def test_wake_shows_dates(self):
+        run("note", "episodic", "an event")
+        out = run("wake")
+        self.assertRegex(out, r"#0 \d{4}-\d{2}-\d{2} an event")
 
 
 if __name__ == "__main__":

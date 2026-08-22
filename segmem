@@ -582,6 +582,206 @@ def cmd_mcp(c, args):
             send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": str(e)}})
 
 
+# ---------------------------------------------------------------- html
+# One self-contained page: data embedded as JSON, no libraries, no server.
+# Read-only; it offers commands to copy, never writes.
+
+HTML_PAGE = r"""<!doctype html><meta charset="utf-8"><title>segmem</title>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--mut:#6b6b6b;--line:#e3e3e3;--acc:#2a62d9;--warn:#b7521a;--fill:#dbe6fb;--card:#f7f7f8}
+@media(prefers-color-scheme:dark){:root{--bg:#131416;--fg:#e8e8e8;--mut:#9a9a9a;--line:#2c2e33;--acc:#7aa2f7;--warn:#e6a06b;--fill:#23314f;--card:#1b1d21}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 ui-sans-serif,system-ui,sans-serif}
+header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;gap:18px;align-items:baseline;flex-wrap:wrap}
+header h1{font-size:16px;margin:0}header span{color:var(--mut)}
+nav{display:flex;gap:4px;padding:8px 20px;border-bottom:1px solid var(--line)}
+nav button{background:none;border:1px solid transparent;color:var(--mut);padding:6px 10px;border-radius:6px;cursor:pointer;font:inherit}
+nav button.on{color:var(--fg);border-color:var(--line);background:var(--card)}
+main{padding:16px 20px;max-width:1200px}section{display:none}section.on{display:block}
+.bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center}
+input,select{font:inherit;padding:5px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mut);font-weight:500;font-size:12px}td.id{color:var(--mut);white-space:nowrap;font-variant-numeric:tabular-nums}
+.k{display:inline-block;padding:1px 7px;border-radius:10px;font-size:12px;background:var(--card);border:1px solid var(--line)}
+.k.identity{border-color:var(--acc)}.k.procedural{border-color:#3a9a5b}.k.episodic{border-color:var(--mut)}.k.people{border-color:#b05ab0}
+.dead{opacity:.5;text-decoration:line-through}.ent{color:var(--acc);cursor:pointer}.ent:hover{text-decoration:underline}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin-bottom:12px}
+.card b{color:var(--warn)}.mut{color:var(--mut)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px;margin-bottom:16px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px}.stat div{font-size:22px}.stat span{color:var(--mut);font-size:12px}
+svg{width:100%;height:auto;display:block;overflow:visible}rect.blk{fill:var(--bg);stroke:var(--line)}
+rect.sum{fill:var(--fill)}rect.cov{stroke:var(--acc);stroke-width:2}rect.leaf{fill:var(--bg)}rect:hover{stroke:var(--warn)}
+.legend{display:flex;gap:16px;color:var(--mut);font-size:12px;margin:6px 0 14px}.legend i{display:inline-block;width:14px;height:10px;border:1px solid var(--line);vertical-align:middle;margin-right:4px}
+pre{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px;white-space:pre-wrap;word-break:break-word;margin:0 0 12px}
+button.cp{font:inherit;font-size:12px;padding:3px 8px;border:1px solid var(--line);background:var(--bg);color:var(--fg);border-radius:6px;cursor:pointer}
+.hint{color:var(--mut);font-size:12px;margin-top:10px}
+</style>
+<header><h1>segmem</h1><span id="meta"></span></header>
+<nav id="nav"></nav>
+<main>
+<section id="overview"></section>
+<section id="facts"><div class="bar">
+<input id="q" placeholder="search text" size="28">
+<select id="fk"><option value="">every kind</option><option>identity</option><option>procedural</option><option>episodic</option><option>people</option></select>
+<select id="fs"><option value="">every scope</option></select>
+<input id="fe" placeholder="entity" size="14">
+<label><input type="checkbox" id="fd"> show superseded</label></div>
+<table><thead><tr><th>#</th><th>when</th><th>kind</th><th>scope</th><th>entities</th><th>text</th></tr></thead><tbody id="rows"></tbody></table></section>
+<section id="overrides"></section>
+<section id="tree"><div class="bar"><label>scope <select id="ts"></select></label>
+<label>wake budget <input type="range" id="tb" min="1" max="256"> <span id="tbv"></span></label></div>
+<div class="legend"><span><i style="background:var(--fill)"></i>summarised</span><span><i style="border-color:var(--acc);border-width:2px"></i>in the wake cover</span><span><i></i>raw memory</span></div>
+<div id="treesvg"></div><h3>Wake preview</h3><pre id="preview"></pre><div id="pending"></div></section>
+<section id="entities"></section>
+</main>
+<script>
+const D = __DATA__;
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const short = sc => sc === 'global' ? 'global' : sc.split('/').pop();
+const dead = new Set(D.memories.filter(m => m.supersedes).map(m => m.supersedes));
+const ents = m => m.entities.split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
+const byId = Object.fromEntries(D.memories.map(m => [m.id, m]));
+
+// ---- cover(): the same greedy as the Python, so the slider is exact
+function cover(T, budget) {
+  if (T <= 0) return [];
+  if (T <= budget) return Array.from({length: T}, (_, i) => [i, i + 1]);
+  let root = 1; while (root < T) root *= 2;
+  const key = (lo, hi) => hi > T ? [-1, -lo] : [(T - lo) / (hi - lo), -lo];
+  const less = (a, b) => a[0][0] !== b[0][0] ? a[0][0] < b[0][0] : a[0][1] < b[0][1];
+  let heap = [[key(0, root), 0, root]], done = [];
+  while (heap.length && heap.length + done.length < budget) {
+    heap.sort((a, b) => less(a, b) ? -1 : 1);
+    const [, lo, hi] = heap.shift(), mid = (lo + hi) >> 1;
+    for (const [a, b] of [[lo, mid], [mid, hi]]) {
+      if (a >= T) continue;
+      if (b - a === 1) done.push([a, b]); else heap.push([key(a, b), a, b]);
+    }
+  }
+  let out = done.concat(heap.map(h => [h[1], h[2]]));
+  const fixed = [];
+  for (let [lo, hi] of out) {
+    while (hi > T) { const mid = (lo + hi) >> 1; if (mid >= T) hi = mid; else { fixed.push([lo, mid]); lo = mid; } }
+    fixed.push([lo, hi]);
+  }
+  return fixed.sort((a, b) => a[0] - b[0]);
+}
+
+// ---- nav
+const tabs = ['overview', 'facts', 'overrides', 'tree', 'entities'];
+$('#nav').innerHTML = tabs.map(t => `<button data-t="${t}">${t}</button>`).join('');
+function show(t) { tabs.forEach(x => { $('#' + x).classList.toggle('on', x === t); }); document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.t === t)); location.hash = t; }
+$('#nav').onclick = e => e.target.dataset.t && show(e.target.dataset.t);
+
+// ---- overview
+const scopes = [...new Set(D.memories.map(m => m.scope))].sort((a, b) => a === 'global' ? -1 : b === 'global' ? 1 : a.localeCompare(b));
+$('#meta').textContent = `${D.memories.length} memories · ${D.summaries.length} summaries · project ${short(D.project)} · ${D.generated}`;
+{
+  const live = D.memories.filter(m => !dead.has(m.id));
+  const cnt = k => live.filter(m => m.kind === k).length;
+  let h = '<div class="grid">' + ['identity', 'procedural', 'episodic', 'people'].map(k => `<div class="stat"><div>${cnt(k)}</div><span>${k}</span></div>`).join('') +
+    `<div class="stat"><div>${dead.size}</div><span>superseded</span></div><div class="stat"><div>${scopes.length}</div><span>scopes</span></div></div>`;
+  h += '<table><thead><tr><th>scope</th><th>identity</th><th>procedural</th><th>episodic</th><th>people</th><th>summaries</th></tr></thead><tbody>';
+  for (const sc of scopes) {
+    const c = k => live.filter(m => m.scope === sc && m.kind === k).length;
+    h += `<tr><td>${esc(short(sc))}</td><td>${c('identity')}</td><td>${c('procedural')}</td><td>${c('episodic')}</td><td>${c('people')}</td><td>${D.summaries.filter(s => s.scope === sc).length}</td></tr>`;
+  }
+  $('#overview').innerHTML = h + '</tbody></table>';
+}
+
+// ---- facts
+$('#fs').innerHTML += scopes.map(s => `<option value="${esc(s)}">${esc(short(s))}</option>`).join('');
+function renderFacts() {
+  const q = $('#q').value.toLowerCase(), k = $('#fk').value, s = $('#fs').value, e = $('#fe').value.toLowerCase(), d = $('#fd').checked;
+  const rows = D.memories.filter(m => (!k || m.kind === k) && (!s || m.scope === s) && (!e || ents(m).includes(e)) && (d || !dead.has(m.id)) && (!q || m.text.toLowerCase().includes(q)));
+  $('#rows').innerHTML = rows.map(m => `<tr class="${dead.has(m.id) ? 'dead' : ''}"><td class="id">${m.id}</td><td class="id">${m.ts.slice(0, 10)}</td><td><span class="k ${m.kind}">${m.kind}</span></td><td>${esc(short(m.scope))}</td><td>${ents(m).map(x => `<span class="ent" data-e="${esc(x)}">${esc(x)}</span>`).join(', ')}</td><td>${esc(m.text)}${m.supersedes ? ` <span class="mut">(replaces #${m.supersedes})</span>` : ''}</td></tr>`).join('') || '<tr><td colspan=6 class="mut">nothing matches</td></tr>';
+}
+['q', 'fk', 'fs', 'fe', 'fd'].forEach(i => $('#' + i).oninput = renderFacts);
+document.body.addEventListener('click', e => { if (e.target.classList.contains('ent')) { $('#fe').value = e.target.dataset.e; show('facts'); renderFacts(); } });
+renderFacts();
+
+// ---- overrides
+{
+  const live = D.memories.filter(m => !dead.has(m.id) && (m.kind === 'identity' || m.kind === 'procedural'));
+  const glob = live.filter(m => m.scope === 'global'), proj = live.filter(m => m.scope !== 'global');
+  const pairs = [];
+  for (const p of proj) for (const g of glob) if (p.kind === g.kind && ents(p).some(x => ents(g).includes(x))) pairs.push([g, p]);
+  $('#overrides').innerHTML = pairs.length ? pairs.map(([g, p]) => `<div class="card"><div>#${g.id} ${esc(g.text)} <span class="mut">(global)</span></div><div><b>overridden in ${esc(short(p.scope))} by</b> #${p.id} ${esc(p.text)}</div><div class="mut">shared subject: ${ents(g).filter(x => ents(p).includes(x)).join(', ')}</div></div>`).join('')
+    : '<p class="mut">No project fact overrides a global one. A pair appears here when a project-scoped identity or procedural fact shares an entity tag with a global one.</p>';
+}
+
+// ---- tree
+const epiScopes = scopes.filter(s => D.memories.some(m => m.scope === s && m.kind === 'episodic'));
+$('#ts').innerHTML = epiScopes.map(s => `<option value="${esc(s)}">${esc(short(s))}</option>`).join('') || '<option value="">no episodic memories</option>';
+$('#tb').value = D.budget; $('#tbv').textContent = D.budget;
+if (epiScopes.includes(D.project)) $('#ts').value = D.project;
+function renderTree() {
+  const sc = $('#ts').value, budget = +$('#tb').value; $('#tbv').textContent = budget;
+  const stream = D.memories.filter(m => m.scope === sc && m.kind === 'episodic').sort((a, b) => a.seq - b.seq);
+  const T = stream.length, sums = Object.fromEntries(D.summaries.filter(s => s.scope === sc).map(s => [s.lo + '-' + s.hi, s.text]));
+  if (!T) { $('#treesvg').innerHTML = ''; $('#preview').textContent = ''; $('#pending').innerHTML = ''; return; }
+  const cov = cover(T, budget), covSet = new Set(cov.map(([a, b]) => a + '-' + b));
+  let root = 1; while (root < T) root *= 2;
+  const levels = []; for (let s = 1; s <= root; s *= 2) levels.push(s);
+  const W = 1000, rowH = 22, gap = 3, H = levels.length * (rowH + gap);
+  let svg = `<svg viewBox="0 0 ${W} ${H}">`;
+  levels.slice().reverse().forEach((size, li) => {
+    const y = li * (rowH + gap);
+    for (let lo = 0; lo < T; lo += size) {
+      const hi = Math.min(lo + size, root), k = lo + '-' + (lo + size), x = lo / T * W, w = (Math.min(lo + size, T) - lo) / T * W - 1;
+      const isLeaf = size === 1, sum = sums[k], cls = ['blk', isLeaf ? 'leaf' : (sum ? 'sum' : ''), covSet.has(k) ? 'cov' : ''].join(' ');
+      const label = isLeaf ? stream[lo].text : (sum || `#${lo}-${lo + size - 1}: not summarised`);
+      svg += `<rect class="${cls}" x="${x}" y="${y}" width="${Math.max(w, 1)}" height="${rowH}" rx="2"><title>#${lo}-${lo + size - 1}\n${esc(label)}</title></rect>`;
+      if (w > 40) svg += `<text x="${x + 4}" y="${y + 15}" font-size="11" fill="var(--mut)" pointer-events="none">#${lo}${size > 1 ? '-' + (lo + size - 1) : ''}</text>`;
+    }
+  });
+  $('#treesvg').innerHTML = svg + '</svg>';
+  const lines = [], missing = [];
+  for (const [lo, hi] of cov) {
+    if (hi - lo === 1) lines.push(`#${lo} ${stream[lo].text}`);
+    else { const s = sums[lo + '-' + hi]; lines.push(`#${lo}-${hi - 1} ${s || '⟨missing summary⟩'}`); if (!s) missing.push([lo, hi]); }
+  }
+  $('#preview').textContent = lines.join('\n');
+  // what nap would ask for: smallest missing block the cover needs, with its missing halves
+  const need = []; const walk = (lo, hi) => { if (hi - lo === 1 || sums[lo + '-' + hi]) return; const mid = (lo + hi) >> 1; walk(lo, mid); walk(mid, hi); need.push([lo, hi]); };
+  cov.forEach(([a, b]) => walk(a, b)); need.sort((a, b) => (a[1] - a[0]) - (b[1] - b[0]) || a[0] - b[0]);
+  $('#pending').innerHTML = need.length ? `<div class="card"><b>${need.length} compression${need.length > 1 ? 's' : ''} due at this budget.</b> First: #${need[0][0]}-${need[0][1] - 1} <button class="cp" data-c='${esc(D.me)} nap ${need[0][0]}-${need[0][1] - 1} "&lt;your line&gt;"'>copy nap command</button></div>` : '<p class="mut">Nothing due at this budget.</p>';
+}
+$('#ts').onchange = renderTree; $('#tb').oninput = renderTree; renderTree();
+document.body.addEventListener('click', e => { if (e.target.classList.contains('cp')) { navigator.clipboard.writeText(e.target.dataset.c.replace(/&lt;/g, '<').replace(/&gt;/g, '>')); e.target.textContent = 'copied'; } });
+
+// ---- entities
+{
+  const m = {};
+  for (const r of D.memories) if (!dead.has(r.id)) for (const e of ents(r)) (m[e] = m[e] || []).push(r);
+  const list = Object.entries(m).sort((a, b) => b[1].length - a[1].length);
+  $('#entities').innerHTML = list.length ? '<table><thead><tr><th>entity</th><th>facts</th><th>kinds</th><th>scopes</th><th>co-occurs with</th></tr></thead><tbody>' + list.map(([e, rs]) => {
+    const co = {}; rs.forEach(r => ents(r).forEach(x => { if (x !== e) co[x] = (co[x] || 0) + 1; }));
+    return `<tr><td><span class="ent" data-e="${esc(e)}">${esc(e)}</span></td><td>${rs.length}</td><td>${[...new Set(rs.map(r => r.kind))].join(', ')}</td><td>${[...new Set(rs.map(r => short(r.scope)))].map(esc).join(', ')}</td><td>${Object.entries(co).sort((a, b) => b[1] - a[1]).map(([x, n]) => `<span class="ent" data-e="${esc(x)}">${esc(x)}</span> (${n})`).join(', ')}</td></tr>`;
+  }).join('') + '</tbody></table>' : '<p class="mut">No entity tags yet. Pass --entities=a,b when you note.</p>';
+}
+show(tabs.includes(location.hash.slice(1)) ? location.hash.slice(1) : 'overview');
+</script>"""
+
+
+def cmd_html(c, args):
+    import json, datetime
+    opts, pos = flags(args)
+    out = pos[0] if pos else os.path.join(os.path.dirname(db_path()), "segmem.html")
+    data = {
+        "memories": [dict(r) for r in c.execute("SELECT * FROM memories ORDER BY id")],
+        "summaries": [dict(r) for r in c.execute("SELECT * FROM summaries")],
+        "project": project(), "budget": WAKE_EPISODIC, "me": ME,
+        "generated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    page = HTML_PAGE.replace("__DATA__", json.dumps(data).replace("</", "<\\/"))
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(page)
+    print(out)
+    if "no-open" not in opts and sys.platform == "darwin":
+        subprocess.run(["open", out], check=False)
+
+
 PROMPT = """\
 ## Memory
 
@@ -636,7 +836,8 @@ def cmd_project(c, args):
 def main():
     cmds = {"wake": cmd_wake, "note": cmd_note, "nap": cmd_nap, "recall": cmd_recall,
             "forget": cmd_forget, "promote": cmd_promote, "init": cmd_init,
-            "project": cmd_project, "hook": cmd_hook, "mcp": cmd_mcp}
+            "project": cmd_project, "hook": cmd_hook, "mcp": cmd_mcp,
+            "html": cmd_html}
     if len(sys.argv) < 2 or sys.argv[1] not in cmds:
         die("usage: %s <%s> ..." % (ME, "|".join(cmds)))
     cmds[sys.argv[1]](connect(), sys.argv[2:])

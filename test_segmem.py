@@ -130,6 +130,18 @@ class Segmem(unittest.TestCase):
         self.assertEqual(replies[6]["error"]["code"], -32601)
         self.assertEqual(len(replies), 6)  # the notification got no reply
 
+    def test_html_is_self_contained(self):
+        run("note", "identity", "prefers pnpm", "--entities=pkg")
+        run("note", "procedural", "uses npm", "--entities=pkg")
+        run("note", "episodic", "an event")
+        out = os.path.join(run.dir, "v.html")
+        self.assertIn(out, run("html", out, "--no-open"))
+        page = open(out, encoding="utf-8").read()
+        self.assertIn("prefers pnpm", page)
+        self.assertIn("uses npm", page)
+        self.assertNotIn("<script src=", page)      # no external libraries
+        self.assertNotIn("https://", page.split("<script>")[0])  # no remote assets
+
 
 if __name__ == "__main__":
     unittest.main()

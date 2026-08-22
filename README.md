@@ -115,6 +115,8 @@ three is a preference.
 | `segmem promote <id>` | lift a project fact to global, if three projects agree |
 | `segmem forget <lo>-<hi>` | drop a bad summary; it's rebuilt on request |
 | `segmem hook` | the prompt hook; reads JSON on stdin |
+| `segmem html [file] [--no-open]` | write a self-contained page that shows the store, and open it |
+| `segmem mcp` | run as an MCP server over stdio |
 | `segmem project` | print the scope key for the current directory |
 
 Examples:
@@ -165,6 +167,27 @@ The `init` output includes this block. For Claude Code, merge it into
   the current project plus global memory, and adds up to eight hits as a
   `<segmem-recall>` block. No identifiers or no hits means no output. It never
   blocks a prompt.
+
+## Seeing what it knows
+
+```sh
+segmem html
+```
+
+writes one self-contained HTML file (no libraries, no server, no network) to
+`~/.segmem/segmem.html` and opens it. Five views:
+
+- **overview**: counts by kind and scope
+- **facts**: every memory, filtered by kind, scope, entity, or text, with
+  superseded ones hidden unless you ask
+- **overrides**: each project fact that beats a global one, and the shared
+  subject that links them
+- **tree**: the episodic merge tree for a scope, with summarised blocks
+  shaded and the current wake cover outlined; a budget slider shows how the
+  wake preview changes, and what compression would come due
+- **entities**: every tag, how often it appears, and what it co-occurs with
+
+The page is read-only. Where an action is implied it offers a command to copy.
 
 ## Claude Desktop and other MCP clients
 

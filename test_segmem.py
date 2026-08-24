@@ -168,6 +168,26 @@ class Segmem(unittest.TestCase):
         out = run("wake")
         self.assertRegex(out, r"#0 \d{4}-\d{2}-\d{2} an event")
 
+    def test_wake_stays_under_transport_limits(self):
+        # 64 near-max episodic notes fit the budget with no summaries needed;
+        # the whole wake must stay under the smallest harness cutoff (30k chars)
+        filler = "x" * 200
+        for i in range(64):
+            run("note", "episodic", "event %d %s" % (i, filler))
+        for i in range(4):
+            run("note", "procedural", "rule %d %s" % (i, filler))
+        out = run("wake")
+        self.assertIn("You are awake", out)
+        self.assertLess(len(out.encode()), 30000)
+
+    def test_hook_caps_facts(self):
+        import json
+        for i in range(12):
+            run("note", "episodic", "widget incident %d" % i, "--entities=widget-core")
+        out = run("hook", stdin=json.dumps({"prompt": "what about widget-core?"}))
+        lines = [l for l in out.splitlines() if l.startswith("#")]
+        self.assertLessEqual(len(lines), 8)
+
 
 if __name__ == "__main__":
     unittest.main()

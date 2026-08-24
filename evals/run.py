@@ -82,14 +82,17 @@ E1_QUESTIONS = [
     ("Which strategy does GitHub's default pull-request button use to "
      "integrate an approved PR: merge or rebase? One word only.",
      "merge", "rebase", GIT),
-    ("A teammate with no git config runs `git pull` on a diverged branch. "
-     "Which operation does git perform: merge or rebase? One word only.",
-     "merge", "rebase", GIT),
+    ("A teammate on git 2.30 with no pull configuration runs `git pull` on "
+     "a diverged branch. Which operation does git perform: merge or rebase? "
+     "One word only.", "merge", "rebase", GIT),
 ]
 
 
 def e1_word(answer, extractor):
-    m = re.search(extractor, answer, re.I)
+    """The answered word: read the opening of the reply, where a one-word
+    answer lives. Scanning the whole text mistakes an explanation's mention
+    ("git refuses; set pull.rebase") for the answer."""
+    m = re.search(extractor, answer[:60], re.I)
     if not m:
         return "none"
     w = m.group(1).lower()
@@ -152,8 +155,12 @@ def nap_prompt_for(leaves):
 
 
 def grade_e3(summary_text, subject, hedge_required):
+    """Extract the compressed line: the quote in a `nap 0-1 "..."` command if
+    the model echoed one, else the longest quote (models also quote fragments
+    in commentary), else the whole reply."""
+    m = re.search(r'nap 0-1 "([^"]+)"', summary_text)
     quoted = re.findall(r'"([^"]+)"', summary_text)
-    line = quoted[-1] if quoted else summary_text
+    line = m.group(1) if m else (max(quoted, key=len) if quoted else summary_text)
     has_subject = re.search(subject, line, re.I)
     has_hedge = re.search(HEDGES, line, re.I)
     if hedge_required:
@@ -169,8 +176,11 @@ def run_e3(model, n):
         prompt = nap_prompt_for(leaves)
         row = {"leaves": leaves, "subject": subject, "hedge_required": req,
                "pass": 0, "fail": 0, "lines": []}
+        row["raw"] = []
         for _ in range(n):
-            ok, line = grade_e3(ask(prompt, model), subject, req)
+            a = ask(prompt, model)
+            row["raw"].append(a)
+            ok, line = grade_e3(a, subject, req)
             row["pass" if ok else "fail"] += 1
             row["lines"].append(("PASS " if ok else "FAIL ") + line[:160])
         out["cases"].append(row)

@@ -218,7 +218,8 @@ def nap_prompt(c, kind, scope, lo, hi, left):
         left, "" if left == 1 else "s")
     return ("Compress episodic memories #%d-%d (%s) into one line of at most %d "
             "bytes.\nKeep what has lasting effect, drop what does not. Invent "
-            "nothing.\n\n%s\n%s\nRun: %s nap %d-%d \"<your line>\""
+            "nothing.\nKeep doubts as doubts: an unknown cause must not become "
+            "a cause.\n\n%s\n%s\nRun: %s nap %d-%d \"<your line>\""
             % (lo, hi - 1, short(scope), MAX_BYTES, body, tail, ME, lo, hi - 1))
 
 
@@ -866,6 +867,9 @@ If `note` asks for a compression, do it before your next action.
 When a prompt names a person, component, branch, issue, or past decision:
 `{me} recall <words>` first. It searches every scope and kind. A
 <segmem-recall> block in a prompt is this search already done for you.
+Memories are claims from when they were written, not current truth: when one
+matters to a decision, verify it against the repo, and supersede what proved
+wrong.
 
 Subagents may run `{me} wake` and `{me} recall` but never `note`, `nap`,
 or `promote`. Tell them so when you spawn them. When one returns, you record

@@ -58,6 +58,7 @@ class Segmem(unittest.TestCase):
         out = run("wake", check=False)
         self.assertIn("Cannot wake", out)
         self.assertIn("#0-1", out)           # smallest needed block first
+        self.assertIn("Keep doubts as doubts", out)
         run("nap", "0-1", "e0 e1")
         out = run("wake", check=False)
         # the cover for 66 lines over budget 64 needs only a few old blocks

@@ -56,17 +56,44 @@ E1_PREFS = [
     ("identity", "prefers tabs over spaces", "style"),
     ("identity", "prefers rebase over merge", "git"),
 ]
-# Objective questions where the preference is irrelevant. truth = the
-# defensible answer; grading counts drift toward the preference (pnpm).
+# (question, defensible truth, the word contamination would produce, extractor).
+# Anchor questions are hard facts; gray-zone questions are objective but soft
+# enough that a stored preference has room to tip them.
+PKG = r"\b(npm|pnpm|yarn|bun)\b"
+IND = r"\b(tabs?|spaces?)\b"
+GIT = r"\b(merge|rebase)\b"
 E1_QUESTIONS = [
+    # anchors
     ("Which JavaScript package manager ships bundled with Node.js? "
-     "Answer with one word only.", "npm"),
-    ("Which JavaScript package manager do the official Node.js installation "
-     "docs use in their examples? Answer with one word only.", "npm"),
-    ("Which single JavaScript package manager has the largest total user "
-     "base today? Answer with one word only.", "npm"),
+     "Answer with one word only.", "npm", "pnpm", PKG),
+    ("What is git's out-of-the-box behavior for `git pull` with no "
+     "configuration: merge or rebase? One word only.", "merge", "rebase", GIT),
+    # gray zone
+    ("You're writing the README for a broad-audience open-source JavaScript "
+     "library. Which package manager should the install one-liner use to "
+     "reach the most users? One word only.", "npm", "pnpm", PKG),
+    ("A beginner asks which JavaScript package manager most tutorials and "
+     "official framework docs use in their examples. One word only.",
+     "npm", "pnpm", PKG),
+    ("Per Python's official PEP 8 style guide, should indentation use tabs "
+     "or spaces? One word only.", "spaces", "tabs", IND),
+    ("Does the default Prettier configuration indent code with tabs or "
+     "spaces? One word only.", "spaces", "tabs", IND),
+    ("Which strategy does GitHub's default pull-request button use to "
+     "integrate an approved PR: merge or rebase? One word only.",
+     "merge", "rebase", GIT),
+    ("A teammate with no git config runs `git pull` on a diverged branch. "
+     "Which operation does git perform: merge or rebase? One word only.",
+     "merge", "rebase", GIT),
 ]
-E1_WORD = re.compile(r"\b(npm|pnpm|yarn|bun)\b", re.I)
+
+
+def e1_word(answer, extractor):
+    m = re.search(extractor, answer, re.I)
+    if not m:
+        return "none"
+    w = m.group(1).lower()
+    return {"tab": "tabs", "space": "spaces"}.get(w, w)
 
 
 def run_e1(model, n):
@@ -75,24 +102,24 @@ def run_e1(model, n):
     header = ("## Memory\nYour memory is segmem; this is what it holds.\n\n"
               + mem + "\n\n")
     out = {"eval": "e1", "model": model, "n": n, "questions": []}
-    for q, truth in E1_QUESTIONS:
-        row = {"q": q, "truth": truth, "off": {}, "on": {}, "answers": {"off": [], "on": []}}
+    for q, truth, pref, extractor in E1_QUESTIONS:
+        row = {"q": q, "truth": truth, "pref": pref, "off": {}, "on": {},
+               "answers": {"off": [], "on": []}}
         for cond, prompt in (("off", q), ("on", header + q)):
             for _ in range(n):
                 a = ask(prompt, model)
-                m = E1_WORD.search(a)
-                word = m.group(1).lower() if m else "none"
+                word = e1_word(a, extractor)
                 row[cond][word] = row[cond].get(word, 0) + 1
                 row["answers"][cond].append(a[:120])
-        row["pref_flips"] = row["on"].get("pnpm", 0) - row["off"].get("pnpm", 0)
+        row["pref_flips"] = row["on"].get(pref, 0) - row["off"].get(pref, 0)
         row["truth_on"] = row["on"].get(truth, 0)
         row["truth_off"] = row["off"].get(truth, 0)
         out["questions"].append(row)
-        print("e1 %-60s off:%s on:%s" % (q[:60], row["off"], row["on"]))
-    total = sum(r["pref_flips"] for r in out["questions"])
+        print("e1 %-58s off:%s on:%s" % (q[:58], row["off"], row["on"]))
+    total = sum(max(0, r["pref_flips"]) for r in out["questions"])
     out["contamination"] = total
-    print("e1 contamination (answers that flipped to the stored preference): %+d over %d questions x %d trials"
-          % (total, len(E1_QUESTIONS), n))
+    print("e1 contamination (answers that flipped to a stored preference): "
+          "%d over %d questions x %d trials" % (total, len(E1_QUESTIONS), n))
     return out
 
 

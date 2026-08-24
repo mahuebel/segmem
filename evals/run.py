@@ -92,7 +92,7 @@ def e1_word(answer, extractor):
     """The answered word: read the opening of the reply, where a one-word
     answer lives. Scanning the whole text mistakes an explanation's mention
     ("git refuses; set pull.rebase") for the answer."""
-    m = re.search(extractor, answer[:60], re.I)
+    m = re.search(extractor, re.split(r"[.!\n]", answer.strip(), 1)[0][:60], re.I)
     if not m:
         return "none"
     w = m.group(1).lower()

@@ -21,7 +21,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(HERE, "..", "segmem")
-HEDGES = r"unknown|suspect|not proven|unconfirmed|untested|not tested|may\b|might|possibl|unverified|unclear"
+HEDGES = r"unknown|suspect|not proven|unconfirmed|untested|not tested|may be|maybe|might|possibl|unverified|unclear"
 
 
 def ask(prompt, model, timeout=120):

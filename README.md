@@ -55,6 +55,20 @@ as names only; the agent looks them up when they come up.
 
 Requires Python 3.8 or later and `git`. Nothing else.
 
+### As a Claude Code plugin
+
+```
+/plugin marketplace add mahuebel/segmem
+/plugin install segmem@segmem
+```
+
+That's the whole install: the three hooks register automatically, and the
+doctrine (what to record and when) is injected at session start, so there is
+no CLAUDE.md paste and no settings.json merge. Skip the manual steps below;
+running both doubles wake and recall.
+
+### Any harness
+
 ```sh
 git clone https://github.com/mahuebel/segmem ~/.segmem/src
 ~/.segmem/src/segmem init

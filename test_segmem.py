@@ -279,6 +279,22 @@ class Segmem(unittest.TestCase):
         self.assertIn("#1 is live again", out)
         self.assertIn("Berlin", run("wake"))
 
+    def test_prompt_prints_doctrine(self):
+        out = run("prompt")
+        self.assertIn("30-day test", out)
+        self.assertIn("touch <name>", out)
+        self.assertNotIn("hooks", out)   # doctrine only; no install block
+
+    def test_plugin_hooks_match_cli(self):
+        import json
+        cfg = json.load(open(os.path.join(HERE, "hooks", "hooks.json")))
+        cmds = [h["command"] for evt in cfg["hooks"].values()
+                for m in evt for h in m["hooks"]]
+        for want in ("segmem\" prompt", "segmem\" wake", "segmem\" hook", "segmem\" stale --hook"):
+            self.assertTrue(any(c.endswith(want) for c in cmds), want)
+        for c in cmds:
+            self.assertIn("${CLAUDE_PLUGIN_ROOT}", c)
+
     def test_hook_caps_facts(self):
         import json
         for i in range(12):

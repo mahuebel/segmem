@@ -805,7 +805,7 @@ def cmd_mcp(c, args):
             if method == "initialize":
                 result = {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
                           "capabilities": {"tools": {}},
-                          "serverInfo": {"name": "segmem", "version": "0.1"}}
+                          "serverInfo": {"name": "segmem", "version": "0.2.0"}}
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
@@ -1078,6 +1078,12 @@ def cmd_init(c, args):
     print(HOOK.format(me=ME), file=sys.stderr)
 
 
+def cmd_prompt(c, args):
+    """The doctrine block alone: what to record and when. As a SessionStart
+    hook (the plugin uses this), it replaces the CLAUDE.md paste."""
+    print(PROMPT.format(me=ME))
+
+
 def cmd_project(c, args):
     print(project())
 
@@ -1086,7 +1092,8 @@ def main():
     cmds = {"wake": cmd_wake, "note": cmd_note, "nap": cmd_nap, "recall": cmd_recall,
             "forget": cmd_forget, "promote": cmd_promote, "init": cmd_init,
             "project": cmd_project, "hook": cmd_hook, "mcp": cmd_mcp,
-            "html": cmd_html, "stale": cmd_stale, "touch": cmd_touch}
+            "html": cmd_html, "stale": cmd_stale, "touch": cmd_touch,
+            "prompt": cmd_prompt}
     if len(sys.argv) < 2 or sys.argv[1] not in cmds:
         die("usage: %s <%s> ..." % (ME, "|".join(cmds)))
     cmds[sys.argv[1]](connect(), sys.argv[2:])

@@ -11,6 +11,9 @@ Kinds, and what wake does with each:
   procedural  how things work here                     loaded whole   supersedes
   episodic    what happened                            decaying cover  history
   people      who someone is                           names only; recall by name
+
+Touches are telemetry, not memory: who got mentioned, recalled, or tagged,
+pressing on the people dossiers. Wake never prints them as facts.
 """
 import os
 import re
@@ -24,6 +27,8 @@ MAX_BYTES = 280
 WAKE_EPISODIC = 64      # lines of project episodic cover
 WAKE_EPISODIC_GLOBAL = 16
 PROMOTE_MIN = 3         # see should_promote()
+STALE_MIN = 6           # weighted touches before a dossier is under pressure
+TOUCH_WEIGHT = {"note": 3, "recall": 2, "prompt": 1}
 
 ME = os.path.abspath(sys.argv[0])
 
@@ -39,7 +44,7 @@ def db_path():
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
   id         INTEGER PRIMARY KEY,
-  ts         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  ts         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   kind       TEXT NOT NULL CHECK (kind IN ('identity','procedural','episodic','people')),
   scope      TEXT NOT NULL,
   seq        INTEGER NOT NULL,           -- position within (kind, scope) stream
@@ -60,6 +65,13 @@ CREATE TABLE IF NOT EXISTS summaries (
   text  TEXT NOT NULL,
   PRIMARY KEY (kind, scope, lo, hi)
 );
+CREATE TABLE IF NOT EXISTS touches (
+  ts      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  entity  TEXT NOT NULL,
+  kind    TEXT NOT NULL CHECK (kind IN ('note','recall','prompt','review','nag')),
+  session TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS touches_by_entity ON touches(entity, ts);
 """
 
 
@@ -94,7 +106,9 @@ def live(c, kind, scopes):
 
 
 def stream_len(c, kind, scope):
-    r = c.execute("SELECT COUNT(*) FROM memories WHERE kind=? AND scope=?",
+    # MAX+1, not COUNT: forget can leave a hole in a non-episodic stream, and
+    # a reused seq would collide with the rows past it.
+    r = c.execute("SELECT COALESCE(MAX(seq)+1, 0) FROM memories WHERE kind=? AND scope=?",
                   (kind, scope)).fetchone()
     return r[0]
 
@@ -249,11 +263,65 @@ def should_promote(row, siblings):
     return len(agree) >= PROMOTE_MIN
 
 
+# ---------------------------------------------------------------- pressure
+# A dossier is a claim under test; touches are the evidence arriving since it
+# was last written or reviewed. Only a people note or an explicit review
+# resets the clock: an episodic note about a person raises pressure on the
+# dossier, it never relieves it.
+
+def touch(c, entities, kind, session=""):
+    rows = [(e.strip().lower(), kind, session) for e in entities if e.strip()]
+    if rows:
+        with c:
+            c.executemany("INSERT INTO touches(entity,kind,session) VALUES (?,?,?)", rows)
+
+
+def dossier_clock(c):
+    """Entity -> when its dossier last met the evidence: the newest people
+    note that tags it, or a later explicit review."""
+    clock = {}
+    for ts, ents in c.execute("SELECT ts, entities FROM memories WHERE kind='people'"):
+        for e in ents.lower().split(","):
+            if e.strip():
+                clock[e.strip()] = max(clock.get(e.strip(), ""), ts)
+    for e, ts in c.execute(
+            "SELECT entity, MAX(ts) FROM touches WHERE kind='review' GROUP BY entity"):
+        if e in clock:
+            clock[e] = max(clock[e], ts)
+    return clock
+
+
+def dossier_pressure(c):
+    """Weighted touches per entity since its clock, heaviest first."""
+    out = []
+    for e, since in dossier_clock(c).items():
+        n = dict(c.execute("SELECT kind, COUNT(*) FROM touches WHERE entity=? AND ts>? "
+                           "AND kind IN ('note','recall','prompt') GROUP BY kind", (e, since)))
+        p = sum(TOUCH_WEIGHT[k] * v for k, v in n.items())
+        if p:
+            out.append((e, p, n, since))
+    return sorted(out, key=lambda r: (-r[1], r[0]))
+
+
+def fmt_counts(n):
+    return ", ".join("%d %s%s" % (n[k], k, "" if n[k] == 1 else "s")
+                     for k in ("note", "recall", "prompt") if n.get(k))
+
+
 # ---------------------------------------------------------------- commands
 
 def die(msg):
     print(msg, file=sys.stderr)
     sys.exit(1)
+
+
+def check_len(text):
+    n = len(text.encode())
+    if n <= MAX_BYTES:
+        return
+    keep = text.encode()[:MAX_BYTES].decode("utf-8", "ignore")
+    die("Too long: %d bytes, max %d. The mark is where the limit falls; "
+        "trim the tail, don't rewrite:\n%s▮%s" % (n, MAX_BYTES, keep, text[len(keep):]))
 
 
 def flags(args):
@@ -318,8 +386,7 @@ def cmd_note(c, args):
             "[--entities=a,b] [--supersedes=id]" % (ME, "|".join(KINDS)))
     kind, text = pos
     text = " ".join(text.split())
-    if len(text.encode()) > MAX_BYTES:
-        die("Too long: %d bytes, max %d." % (len(text.encode()), MAX_BYTES))
+    check_len(text)
     default_scope = GLOBAL if kind in ("identity", "people") else project()
     scope = {"global": GLOBAL, "project": project()}.get(opts.get("scope"), None) \
         or opts.get("scope") or default_scope
@@ -334,11 +401,36 @@ def cmd_note(c, args):
                   (kind, scope, seq, entities, sup, text))
         rid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
     print("#%d %s %s" % (rid, kind, "(%s)" % short(scope)))
-    for h in hints:
+    for h in hints + scope_hints(c, entities, scope, rid):
         print(h)
+    if kind != "people":
+        # a people note is the dossier revision itself, not evidence against it
+        touch(c, entities.split(","), "note")
     nap = next_nap(c, project())
     if nap:
         print("\n" + nap[1])
+
+
+def scope_hints(c, entities, scope, rid):
+    """A tag whose whole history lives in another project marks a likely
+    misfile: recall searches only cwd's project plus global, so a wrong-scoped
+    note is invisible to exactly the sessions that need it."""
+    if scope == GLOBAL or not entities:
+        return []
+    lived = {}
+    for r in c.execute("SELECT scope, entities FROM memories WHERE entities!='' AND id!=?",
+                       (rid,)):
+        for e in entity_set(r):
+            lived.setdefault(e, set()).add(r["scope"])
+    hints = []
+    for e in entities.lower().split(","):
+        others = lived.get(e.strip(), set()) - {GLOBAL}
+        if others and scope not in others:
+            hints.append("prior notes about %s live in %s, not %s; misfiled? %s forget %d, "
+                         "then re-note from the right repo or with --scope=<path>"
+                         % (e.strip(), ", ".join(sorted(short(s) for s in others)),
+                            short(scope), ME, rid))
+    return hints
 
 
 def short(scope):
@@ -351,8 +443,7 @@ def cmd_nap(c, args):
     lo, hi = (int(x) for x in args[0].split("-"))
     hi += 1
     text = " ".join(args[1].split())
-    if len(text.encode()) > MAX_BYTES:
-        die("Too long: %d bytes, max %d." % (len(text.encode()), MAX_BYTES))
+    check_len(text)
     nap = next_nap(c, project())
     if not nap:
         die("Nothing to compress.")
@@ -365,13 +456,39 @@ def cmd_nap(c, args):
 
 
 def cmd_forget(c, args):
-    if len(args) != 1 or not re.fullmatch(r"\d+-\d+", args[0]):
-        die("usage: %s forget <lo>-<hi>" % ME)
-    lo, hi = (int(x) for x in args[0].split("-"))
+    if len(args) != 1 or not re.fullmatch(r"\d+(-\d+)?", args[0]):
+        die("usage: %s forget <id> | <lo>-<hi>   (a misfiled note by id, or a summary block)" % ME)
+    if "-" in args[0]:
+        lo, hi = (int(x) for x in args[0].split("-"))
+        with c:
+            n = c.execute("DELETE FROM summaries WHERE kind='episodic' AND scope=? AND lo=? AND hi=?",
+                          (project(), lo, hi + 1)).rowcount
+        print("Dropped %d summary." % n if n else "No such summary.")
+        return
+    rid = int(args[0])
+    row = c.execute("SELECT * FROM memories WHERE id=?", (rid,)).fetchone()
+    if not row:
+        die("No memory #%d." % rid)
+    # A hole mid-stream would break the episodic tree, whose blocks index by
+    # seq; other kinds load whole and tolerate gaps.
+    if row["kind"] == "episodic" and row["seq"] != stream_len(c, "episodic", row["scope"]) - 1:
+        die("#%d is not the newest episodic note in %s; supersede it instead."
+            % (rid, short(row["scope"])))
+    ref = c.execute("SELECT id FROM memories WHERE supersedes=?", (rid,)).fetchone()
+    if ref:
+        die("#%d is superseded by #%d; forget that one first." % (rid, ref["id"]))
     with c:
-        n = c.execute("DELETE FROM summaries WHERE kind='episodic' AND scope=? AND lo=? AND hi=?",
-                      (project(), lo, hi + 1)).rowcount
-    print("Dropped %d summary." % n if n else "No such summary.")
+        c.execute("INSERT INTO memories_fts(memories_fts, rowid, text, entities) "
+                  "VALUES ('delete', ?, ?, ?)", (rid, row["text"], row["entities"]))
+        c.execute("DELETE FROM memories WHERE id=?", (rid,))
+        if row["kind"] == "episodic":
+            # summaries that covered the deleted row describe rows that no
+            # longer exist; drop them, the tree rebuilds on request
+            c.execute("DELETE FROM summaries WHERE kind='episodic' AND scope=? AND hi>?",
+                      (row["scope"], row["seq"]))
+    print("Forgot #%d (%s, %s)." % (rid, row["kind"], short(row["scope"])))
+    if row["supersedes"]:
+        print("#%d is live again." % row["supersedes"])
 
 
 def cmd_recall(c, args):
@@ -390,6 +507,57 @@ def cmd_recall(c, args):
         tags = " [%s]" % r["entities"] if r["entities"] else ""
         print("#%d %s %s %s%s%s: %s" % (r["id"], r["ts"][:10], r["kind"], short(r["scope"]),
                                         tags, flag, r["text"]))
+    touch(c, {e for r in rows for e in entity_set(r)}, "recall")
+
+
+def cmd_touch(c, args):
+    if len(args) != 1:
+        die("usage: %s touch <entity>   (dossier reviewed, unchanged; resets pressure)" % ME)
+    e = args[0].strip().lower()
+    if e not in dossier_clock(c):
+        die("No people note tags %s." % args[0])
+    touch(c, [e], "review")
+    print("Reviewed %s. The next real change still needs a supersede." % e)
+
+
+def cmd_stale(c, args):
+    opts, _ = flags(args)
+    lim = int(opts.get("min", STALE_MIN))
+    due = [r for r in dossier_pressure(c) if r[1] >= lim]
+    if "hook" in opts:
+        return stale_hook(c, due)
+    if not due:
+        print("No dossier under pressure (threshold %d)." % lim)
+        return
+    for e, p, n, since in due:
+        print("%s: pressure %d (%s) since %s. Supersede its people note or: %s touch %s"
+              % (e, p, fmt_counts(n), since[:10], ME, e))
+
+
+def stale_hook(c, due):
+    """Claude Code Stop hook: when a dossier is under pressure, block the stop
+    once per entity and session so a live agent reviews it. stop_hook_active
+    means this stop is already the result of a block: let it through."""
+    import json
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        data = {}
+    if not isinstance(data, dict) or data.get("stop_hook_active"):
+        return
+    sid = data.get("session_id", "")
+    nagged = {e for (e,) in c.execute(
+        "SELECT DISTINCT entity FROM touches WHERE kind='nag' AND session=?", (sid,))}
+    due = [r for r in due if r[0] not in nagged]
+    if not due:
+        return
+    touch(c, [e for e, _, _, _ in due], "nag", sid)
+    names = "; ".join("%s (%s since %s)" % (e, fmt_counts(n), since[:10])
+                      for e, p, n, since in due)
+    print(json.dumps({"decision": "block", "reason":
+        "Dossiers under pressure: %s. For each: supersede the people note with what "
+        "changed, or confirm it unchanged with `%s touch <entity>`. Keep hedges as "
+        "hedges when you supersede." % (names, ME)}))
 
 
 def cmd_promote(c, args):
@@ -451,6 +619,10 @@ def cmd_wake(c, args):
                     names.setdefault(e.strip().lower(), e.strip())
         out.append("\n### People known: %s" % ", ".join(names[k] for k in sorted(names)))
         out.append("Run `%s recall <name>` before acting on or about them." % ME)
+        for e, p, n, since in dossier_pressure(c):
+            if p >= STALE_MIN and e in names:
+                out.append("%s: dossier from %s, %s since. Supersede it or, if unchanged: "
+                           "%s touch %s" % (names[e], since[:10], fmt_counts(n), ME, e))
 
     streams = [(GLOBAL, WAKE_EPISODIC)] if p == GLOBAL else \
         [(p, WAKE_EPISODIC), (GLOBAL, WAKE_EPISODIC_GLOBAL)]
@@ -515,14 +687,21 @@ def cmd_hook(c, args):
     """Claude Code UserPromptSubmit hook: reads the prompt as JSON on stdin,
     prints matching memories as extra context. Never fails the prompt."""
     import json
+    sid = ""
     try:
         data = json.load(sys.stdin)
         text = data.get("prompt", "") if isinstance(data, dict) else ""
+        sid = data.get("session_id", "") if isinstance(data, dict) else ""
     except Exception:
         text = sys.stdin.read() if not sys.stdin.isatty() else ""
-    ids = identifiers(text, known_tags(c))
+    tags = known_tags(c)
+    ids = identifiers(text, tags)
     if not ids:
         return
+    try:
+        touch(c, [i for i in ids if i.lower() in tags], "prompt", sid)
+    except sqlite3.OperationalError:
+        pass
     q = " OR ".join('"%s"' % i.replace('"', '""') for i in ids)
     p = project()
     try:
@@ -863,6 +1042,8 @@ git log has the what, and the tool stamps the date (date the text only for a
 past event). A fact that replaces an older one: add --supersedes=<id>.
 When `note` suggests a tag spelling, use it next time; never re-note.
 If `note` asks for a compression, do it before your next action.
+When a person was a subject this session, not a mention: before you finish,
+supersede their people note or confirm it unchanged with `{me} touch <name>`.
 
 When a prompt names a person, component, branch, issue, or past decision:
 `{me} recall <words>` first. It searches every scope and kind. A
@@ -881,11 +1062,13 @@ HOOK = """\
 Hooks (recommended): merge into ~/.claude/settings.json (Claude Code) or save
 as ~/.codex/hooks.json (Codex CLI). SessionStart makes wake run on every start
 and resume without relying on the agent; UserPromptSubmit searches every
-prompt for names, #issues, and paths.
+prompt for names, #issues, and paths; Stop nags once per session when a
+people note has fallen behind the evidence.
 
 {{"hooks": {{
   "SessionStart": [{{"hooks": [{{"type": "command", "command": "{me} wake"}}]}}],
-  "UserPromptSubmit": [{{"hooks": [{{"type": "command", "command": "{me} hook"}}]}}]
+  "UserPromptSubmit": [{{"hooks": [{{"type": "command", "command": "{me} hook"}}]}}],
+  "Stop": [{{"hooks": [{{"type": "command", "command": "{me} stale --hook"}}]}}]
 }}}}
 """
 
@@ -903,7 +1086,7 @@ def main():
     cmds = {"wake": cmd_wake, "note": cmd_note, "nap": cmd_nap, "recall": cmd_recall,
             "forget": cmd_forget, "promote": cmd_promote, "init": cmd_init,
             "project": cmd_project, "hook": cmd_hook, "mcp": cmd_mcp,
-            "html": cmd_html}
+            "html": cmd_html, "stale": cmd_stale, "touch": cmd_touch}
     if len(sys.argv) < 2 or sys.argv[1] not in cmds:
         die("usage: %s <%s> ..." % (ME, "|".join(cmds)))
     cmds[sys.argv[1]](connect(), sys.argv[2:])

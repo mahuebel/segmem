@@ -119,6 +119,28 @@ entity tag), wake prints `OVERRIDDEN` with both.
 same statement is live in three projects. One observation is a convention;
 three is a preference.
 
+## Pressure
+
+A people note is a claim under test, and the store tracks the evidence
+arriving against it. Every time an entity is tagged in a new note (weight 3),
+served by `recall` (2), or mentioned in a prompt (1), that's a touch. Touches
+are telemetry, not memory: `wake` never prints them as facts.
+
+Only a people note or an explicit review resets the clock; an episodic note
+*about* a person raises pressure on their dossier, it never relieves it. When
+the weighted touches since the last revision reach the threshold (6):
+
+- `segmem stale` lists the dossiers under pressure, with counts and dates.
+- `wake` flags them under the people list: `alice: dossier from 2026-08-24,
+  3 notes since`.
+- The `Stop` hook interrupts the agent once per session with the same list
+  and one instruction: supersede each dossier with what changed, or confirm
+  it unchanged with `segmem touch <name>`.
+
+`touch` is the honest way out: it records "reviewed, no change needed"
+without writing a fake supersede that would pollute history. Nothing ever
+rewrites a people note without an agent deciding to.
+
 ## Commands
 
 | Command | What it does |
@@ -128,7 +150,10 @@ three is a preference.
 | `segmem recall <query>` | full-text search across every kind and scope |
 | `segmem nap <lo>-<hi> "<text>"` | answer a compression request |
 | `segmem promote <id>` | lift a project fact to global, if three projects agree |
+| `segmem forget <id>` | delete a misfiled note; episodic only when newest |
 | `segmem forget <lo>-<hi>` | drop a bad summary; it's rebuilt on request |
+| `segmem stale [--min=n] [--hook]` | list people notes under evidence pressure |
+| `segmem touch <entity>` | dossier reviewed, unchanged; resets its pressure |
 | `segmem hook` | the prompt hook; reads JSON on stdin |
 | `segmem html [file] [--no-open]` | write a self-contained page that shows the store, and open it |
 | `segmem mcp` | run as an MCP server over stdio |
@@ -159,8 +184,9 @@ doesn't exist, it prints the two halves and asks for one line, and the agent
 answers with `nap`. Compression is requested only when wake would print the
 block, never ahead of time, and never in the background.
 
-Raw facts are never edited or deleted. Summaries are a cache: drop one with
-`forget` and the next request rebuilds it.
+Raw facts are never edited. A misfiled note can be forgotten by id; anything
+else is superseded, not deleted. Summaries are a cache: drop one with
+`forget <lo>-<hi>` and the next request rebuilds it.
 
 ## Hooks
 
@@ -170,7 +196,8 @@ The `init` output includes this block. For Claude Code, merge it into
 ```json
 {"hooks": {
   "SessionStart": [{"hooks": [{"type": "command", "command": "~/.segmem/src/segmem wake"}]}],
-  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "~/.segmem/src/segmem hook"}]}]
+  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "~/.segmem/src/segmem hook"}]}],
+  "Stop": [{"hooks": [{"type": "command", "command": "~/.segmem/src/segmem stale --hook"}]}]
 }}
 ```
 
@@ -183,6 +210,9 @@ The `init` output includes this block. For Claude Code, merge it into
   the current project plus global memory, and adds up to eight hits as a
   `<segmem-recall>` block. No identifiers or no hits means no output. It never
   blocks a prompt.
+- `Stop` runs `stale --hook`, which interrupts the agent when a people note
+  has fallen behind the evidence, once per entity and session, and never
+  twice in a row: a stop caused by its own block passes through.
 
 ## Seeing what it knows
 
@@ -241,6 +271,7 @@ parallel sessions can write without a lock file.
 | `memories` | append-only facts: `kind`, `scope`, `entities`, `supersedes`, `text` |
 | `memories_fts` | FTS5 index over text and entities |
 | `summaries` | the episodic tree, keyed by `(kind, scope, lo, hi)` |
+| `touches` | usage telemetry: mentions, recalls, and tags pressing on dossiers |
 
 Set `SEGMEM_DIR` to keep the database elsewhere (a synced folder works) and
 `SEGMEM_PROJECT` to force a scope key.

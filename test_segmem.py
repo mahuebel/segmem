@@ -180,6 +180,105 @@ class Segmem(unittest.TestCase):
         self.assertIn("You are awake", out)
         self.assertLess(len(out.encode()), 30000)
 
+    def test_note_too_long_shows_trim_mark(self):
+        out = run("note", "episodic", "word " * 60, check=False)
+        self.assertIn("Too long", out)
+        self.assertIn("▮", out)
+        before = out.split("▮")[0].split("\n")[-1]
+        self.assertLessEqual(len(before.encode()), 280)
+
+    def test_pressure_builds_and_resets(self):
+        run("note", "people", "Alice owns deploys", "--entities=alice")
+        self.assertIn("No dossier under pressure", run("stale"))
+        run("note", "episodic", "alice conceded the rollout in writing", "--entities=alice")
+        run("note", "episodic", "alice rebranded the standup", "--entities=alice")
+        out = run("stale")     # two notes at weight 3 meet the threshold of 6
+        self.assertIn("alice", out)
+        self.assertIn("2 notes", out)
+        run("touch", "alice")
+        self.assertIn("No dossier under pressure", run("stale"))
+        # the next note about her starts the cycle again
+        run("note", "episodic", "alice hired a deputy", "--entities=alice")
+        self.assertIn("1 note", run("stale", "--min=3"))
+        # an entity nobody has a dossier for builds no pressure
+        self.assertIn("No people note", run("touch", "widget", check=False))
+
+    def test_recall_and_prompt_mentions_press_lighter_than_notes(self):
+        import json
+        run("note", "people", "Alice owns deploys", "--entities=alice")
+        run("recall", "alice")
+        run("hook", stdin=json.dumps({"prompt": "ask Alice about deploys", "session_id": "s1"}))
+        out = run("stale", "--min=1")
+        self.assertIn("1 recall, 1 prompt", out)
+        self.assertIn("pressure 3", out)
+
+    def test_supersede_resets_pressure(self):
+        run("note", "people", "Alice owns deploys", "--entities=alice")
+        run("note", "episodic", "alice event a", "--entities=alice")
+        run("note", "episodic", "alice event b", "--entities=alice")
+        self.assertIn("alice", run("stale"))
+        run("note", "people", "Alice owns deploys and the rollout", "--entities=alice",
+            "--supersedes=1")
+        self.assertIn("No dossier under pressure", run("stale"))
+
+    def test_stop_hook_nags_once_per_session(self):
+        import json
+        run("note", "people", "Alice owns deploys", "--entities=alice")
+        for i in range(2):
+            run("note", "episodic", "alice event %d" % i, "--entities=alice")
+        out = run("stale", "--hook", stdin=json.dumps({"session_id": "s1"}))
+        self.assertIn('"decision": "block"', out)
+        self.assertIn("alice", out)
+        # once per entity and session
+        self.assertEqual("", run("stale", "--hook", stdin=json.dumps({"session_id": "s1"})))
+        # never blocks the stop its own block caused
+        self.assertEqual("", run("stale", "--hook",
+                                 stdin=json.dumps({"session_id": "s2", "stop_hook_active": True})))
+        # a new session nags again; a review then quiets every session
+        self.assertIn("block", run("stale", "--hook", stdin=json.dumps({"session_id": "s3"})))
+        run("touch", "alice")
+        self.assertEqual("", run("stale", "--hook", stdin=json.dumps({"session_id": "s4"})))
+
+    def test_wake_flags_stale_dossier(self):
+        run("note", "people", "Alice owns deploys", "--entities=alice")
+        w = run("wake")
+        self.assertNotIn("dossier from", w)
+        run("note", "episodic", "alice event a", "--entities=alice")
+        run("note", "episodic", "alice event b", "--entities=alice")
+        w = run("wake")
+        self.assertIn("dossier from", w)
+        self.assertIn("touch alice", w)
+
+    def test_note_warns_on_scope_mismatch(self):
+        run("note", "episodic", "vp sync notes", "--entities=hr-hub", project="/p/hr-hub")
+        out = run("note", "episodic", "more vp sync", "--entities=hr-hub", project="/p/armory")
+        self.assertIn("prior notes about hr-hub live in hr-hub, not armory", out)
+        self.assertIn("forget 2", out)
+        # a tag already at home in this project draws no warning
+        out = run("note", "episodic", "follow-up", "--entities=hr-hub", project="/p/hr-hub")
+        self.assertNotIn("misfiled", out)
+
+    def test_forget_note_by_id(self):
+        run("note", "episodic", "first")
+        run("note", "episodic", "misfiled")
+        self.assertIn("not the newest", run("forget", "1", check=False))
+        self.assertIn("Forgot #2", run("forget", "2"))
+        w = run("wake")
+        self.assertIn("first", w)
+        self.assertNotIn("misfiled", w)
+        self.assertIn("No match", run("recall", "misfiled"))
+        # the freed seq is reused cleanly
+        run("note", "episodic", "replacement")
+        self.assertIn("replacement", run("wake"))
+
+    def test_forget_and_supersede_chain(self):
+        run("note", "identity", "lives in Berlin")
+        run("note", "identity", "lives in Lisbon", "--supersedes=1")
+        self.assertIn("superseded by #2", run("forget", "1", check=False))
+        out = run("forget", "2")
+        self.assertIn("#1 is live again", out)
+        self.assertIn("Berlin", run("wake"))
+
     def test_hook_caps_facts(self):
         import json
         for i in range(12):

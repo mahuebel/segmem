@@ -495,9 +495,19 @@ def cmd_recall(c, args):
     if not args:
         die("usage: %s recall <query>   (FTS5 syntax; searches every scope and kind)" % ME)
     q = " ".join(args)
-    rows = c.execute(
-        "SELECT m.* FROM memories_fts f JOIN memories m ON m.id=f.rowid "
-        "WHERE memories_fts MATCH ? ORDER BY rank LIMIT 50", (q,)).fetchall()
+    sql = ("SELECT m.* FROM memories_fts f JOIN memories m ON m.id=f.rowid "
+           "WHERE memories_fts MATCH ? ORDER BY rank LIMIT 50")
+    try:
+        rows = c.execute(sql, (q,)).fetchall()
+    except sqlite3.OperationalError:
+        # FTS5 reads a bare hyphen or colon as syntax ("no such column: op"
+        # for mem-op). Retry with terms quoted, keeping the operators.
+        q = " ".join(t if t in ("OR", "AND", "NOT") else '"%s"' % t.replace('"', '""')
+                     for t in q.split())
+        try:
+            rows = c.execute(sql, (q,)).fetchall()
+        except sqlite3.OperationalError as e:
+            die("Bad query: %s" % e)
     if not rows:
         print("No match.")
         return

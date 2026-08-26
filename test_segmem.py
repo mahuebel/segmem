@@ -279,6 +279,16 @@ class Segmem(unittest.TestCase):
         self.assertIn("#1 is live again", out)
         self.assertIn("Berlin", run("wake"))
 
+    def test_recall_survives_fts_operators(self):
+        run("note", "episodic", "mem-op refactor landed", "--entities=mem-op")
+        out = run("recall", "mem-op OR atlas")     # hyphen is FTS5 syntax raw
+        self.assertIn("mem-op refactor", out)
+        self.assertIn("mem-op refactor", run("recall", "mem-op"))
+        self.assertIn("No match", run("recall", "atlas"))
+        # real FTS5 syntax still reaches the engine untouched
+        self.assertIn("mem-op refactor", run("recall", "refactor OR nothingness"))
+        self.assertIn("No match", run("recall", "refactor NOT landed"))
+
     def test_prompt_prints_doctrine(self):
         out = run("prompt")
         self.assertIn("30-day test", out)

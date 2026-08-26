@@ -290,6 +290,10 @@ parallel sessions can write without a lock file.
 Set `SEGMEM_DIR` to keep the database elsewhere (a synced folder works) and
 `SEGMEM_PROJECT` to force a scope key.
 
+To inspect the database by hand, go through Python (`python3 -c "import
+sqlite3; ..."`): the stock macOS `sqlite3` CLI is built without FTS5 and
+cannot open the index that segmem's queries depend on.
+
 ## Test
 
 ```sh

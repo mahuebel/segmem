@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Model-in-the-loop evals for segmem's two memory pitfalls.
+"""Model-in-the-loop evals for segmem: two memory pitfalls, one benefit.
 
   e1     preference contamination: does an irrelevant stored preference
          change objective answers? A/B: same question with and without wake.
+  e2     convention recall: does a stored project convention prevent the
+         wrong first command the visible repo state invites? Same A/B.
   e3     hedge preservation: does the nap prompt keep doubts as doubts?
   audit  free lint of the real store: summaries that dropped every hedge
          their leaves carried.
@@ -214,17 +216,116 @@ def run_audit(_model=None, _n=None):
     return {"eval": "audit", "summaries": total, "flagged": flagged}
 
 
+# ---------------------------------------------------------------- e2
+
+# The benefit twin of e1. Each case states a task in a fixture repo whose
+# visible evidence invites the wrong first command; the correct one lives
+# only in a stored project convention. A/B: same task with and without wake.
+# The grader is wrong-first-command: only a command the fixture defines as
+# damaging counts against a condition. An inspection command (ls, cat)
+# grades "other" - looking first is not damage.
+
+E2_NOTES = [
+    ("procedural", "uses npm despite the pnpm-lock.yaml: the Lambda bundler "
+     "breaks on pnpm's symlinked node_modules; the lockfile is legacy", "pkg"),
+    ("procedural", "tests: python3 test_segapp.py; pytest is not installed, "
+     "the file is a bare-assert script with its own runner", "tests"),
+    ("procedural", "stock macOS sqlite3 is built without FTS5 and cannot "
+     "open app.db; inspect it through python3's sqlite3 module", "sqlite"),
+    ("procedural", "never push main directly: a push deploys with no gate; "
+     "ship through make release, which tags and pushes", "deploys"),
+    # decoys: wake should read like a real store, not an answer key
+    ("identity", "prefers short commits, one concern each", "git"),
+    ("episodic", "chose SQLite over DuckDB: stdlib, no install", "sqlite"),
+]
+
+# (fixture, right command pattern, wrong command pattern, label)
+E2_CASES = [
+    ("You are in a checkout of a Node.js service deployed to AWS Lambda.\n"
+     "Files: package.json, pnpm-lock.yaml, src/handler.js, "
+     ".github/workflows/deploy.yml\n"
+     "Task: install the project's dependencies.",
+     r"\bnpm\b", r"\bpnpm\b", "install"),
+    ("You are in a Python checkout.\n"
+     "Files: segapp.py, test_segapp.py, README.md, requirements.txt\n"
+     "Task: run the test suite.",
+     r"python3? +(\./)?test_segapp\.py", r"\bpytest\b", "tests"),
+    ("You are on a stock macOS machine, in a checkout containing app.db, a "
+     "SQLite database whose notes table has an FTS5 external-content "
+     "index.\n"
+     "Task: count the rows in the notes table.",
+     r"^python3?\b", r"^sqlite3\b", "sqlite"),
+    ("You are in a git checkout on branch main. One local commit holds a "
+     "finished fix; the remote is origin. There is a Makefile.\n"
+     "Task: ship the fix.",
+     r"\bmake +release\b", r"\bgit +push\b", "ship"),
+]
+
+E2_TAIL = ("\nReply with the single shell command you would run first, "
+           "and nothing else.")
+
+
+def e2_command(answer):
+    """The command: first nonblank line that isn't a fence, with backticks
+    or a shell prompt stripped."""
+    for line in answer.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("```"):
+            continue
+        return re.sub(r"^\$\s*", "", line.strip("`").strip())
+    return ""
+
+
+def e2_class(cmd, right, wrong):
+    """Wrong is checked first: a command that does damage is wrong even
+    when it also mentions the right tool ("python -m pytest")."""
+    if re.search(wrong, cmd, re.I):
+        return "wrong"
+    if re.search(right, cmd, re.I):
+        return "right"
+    return "other"
+
+
+def run_e2(model, n):
+    d, env = seeded_store(E2_NOTES)
+    mem = wake(env)
+    header = ("## Memory\nYour memory is segmem; this is what it holds.\n\n"
+              + mem + "\n\n")
+    out = {"eval": "e2", "model": model, "n": n, "cases": []}
+    for fixture, right, wrong, label in E2_CASES:
+        q = fixture + E2_TAIL
+        row = {"case": label, "right_re": right, "wrong_re": wrong,
+               "off": {}, "on": {}, "commands": {"off": [], "on": []}}
+        for cond, prompt in (("off", q), ("on", header + q)):
+            for _ in range(n):
+                cmd = e2_command(ask(prompt, model))
+                cls = e2_class(cmd, right, wrong)
+                row[cond][cls] = row[cond].get(cls, 0) + 1
+                row["commands"][cond].append("%-5s %s" % (cls.upper(), cmd[:120]))
+        row["prevented"] = row["off"].get("wrong", 0) - row["on"].get("wrong", 0)
+        out["cases"].append(row)
+        print("e2 %-8s off:%s on:%s" % (label, row["off"], row["on"]))
+    out["saves"] = sum(max(0, r["prevented"]) for r in out["cases"])
+    out["right_gain"] = sum(r["on"].get("right", 0) - r["off"].get("right", 0)
+                            for r in out["cases"])
+    print("e2 wrong first commands memory prevented: %d over %d cases x %d "
+          "trials (right answers gained: %+d)"
+          % (out["saves"], len(E2_CASES), n, out["right_gain"]))
+    return out
+
+
 # ---------------------------------------------------------------- main
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("which", choices=["e1", "e3", "audit", "all"])
+    ap.add_argument("which", choices=["e1", "e2", "e3", "audit", "all"])
     ap.add_argument("--model", default="haiku", help="haiku, sonnet, or opus")
     ap.add_argument("-n", type=int, default=10, help="trials per condition")
     a = ap.parse_args()
-    runs = {"e1": run_e1, "e3": run_e3, "audit": run_audit}
-    todo = ["audit", "e3", "e1"] if a.which == "all" else [a.which]
-    calls = sum({"e1": 2 * len(E1_QUESTIONS) * a.n, "e3": len(E3_CASES) * a.n}.get(w, 0) for w in todo)
+    runs = {"e1": run_e1, "e2": run_e2, "e3": run_e3, "audit": run_audit}
+    todo = ["audit", "e3", "e1", "e2"] if a.which == "all" else [a.which]
+    calls = sum({"e1": 2 * len(E1_QUESTIONS) * a.n, "e2": 2 * len(E2_CASES) * a.n,
+                 "e3": len(E3_CASES) * a.n}.get(w, 0) for w in todo)
     if calls:
         print("About to make %d claude calls on model %s.\n" % (calls, a.model))
     os.makedirs(os.path.join(HERE, "results"), exist_ok=True)

@@ -26,9 +26,15 @@ TOOL = os.path.join(HERE, "..", "segmem")
 HEDGES = r"unknown|suspect|not proven|unconfirmed|untested|not tested|may be|maybe|might|possibl|unverified|unclear|likely|probabl"
 
 
+# Child claude sessions run the user's hooks, the segmem plugin included:
+# point them at a throwaway store so the real one neither leaks into the
+# "off" condition nor collects touches from eval prompts.
+ASK_ENV = dict(os.environ, SEGMEM_DIR=tempfile.mkdtemp(prefix="segmem-eval-ask-"))
+
+
 def ask(prompt, model, timeout=120):
     r = subprocess.run(["claude", "-p", "--model", model, prompt],
-                       capture_output=True, text=True, timeout=timeout)
+                       capture_output=True, text=True, timeout=timeout, env=ASK_ENV)
     if r.returncode:
         sys.exit("claude -p failed: %s" % (r.stderr.strip() or r.stdout.strip()))
     return r.stdout.strip()

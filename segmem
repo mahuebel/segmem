@@ -13,7 +13,8 @@ Kinds, and what wake does with each:
   people      who someone is                           names only; recall by name
 
 Touches are telemetry, not memory: who got mentioned, recalled, or tagged,
-pressing on the people dossiers. Wake never prints them as facts.
+pressing on the people dossiers and procedural facts. Wake never prints
+them as facts.
 """
 import os
 import re
@@ -28,6 +29,7 @@ WAKE_EPISODIC = 64      # lines of project episodic cover
 WAKE_EPISODIC_GLOBAL = 16
 PROMOTE_MIN = 3         # see should_promote()
 STALE_MIN = 6           # weighted touches before a dossier is under pressure
+PROC_STALE_MIN = 12     # same, per procedural note; hub entities accrue fast
 TOUCH_WEIGHT = {"note": 3, "recall": 2, "prompt": 1}
 
 ME = os.path.abspath(sys.argv[0])
@@ -303,6 +305,43 @@ def dossier_pressure(c):
     return sorted(out, key=lambda r: (-r[1], r[0]))
 
 
+def note_clock(c, row):
+    """When procedural note #id last met the evidence: its own write, or a
+    later explicit review (touch by id)."""
+    r = c.execute("SELECT MAX(ts) FROM touches WHERE kind='review' AND entity=?",
+                  ("#%d" % row["id"],)).fetchone()
+    return max(row["ts"], r[0] or "")
+
+
+def note_pressure(c, scopes):
+    """Weighted touches per live procedural note since its clock, heaviest
+    first. Yields (row, pressure, counts, since, reviewed, kept): reviewed
+    means it survived an earlier cycle; kept means the agent chose memory
+    over the repo, so export is not suggested again."""
+    out = []
+    for row in live(c, "procedural", scopes):
+        ents = sorted(entity_set(row))
+        if not ents:
+            continue
+        since = note_clock(c, row)
+        n = dict(c.execute(
+            "SELECT kind, COUNT(*) FROM touches WHERE entity IN (%s) AND ts>=? "
+            "AND kind IN ('note','recall','prompt') GROUP BY kind"
+            % ",".join("?" * len(ents)), (*ents, since)))
+        p = sum(TOUCH_WEIGHT[k] * v for k, v in n.items())
+        if not p:
+            continue
+        r = c.execute("SELECT COUNT(*), COALESCE(SUM(session='keep'), 0) FROM touches "
+                      "WHERE kind='review' AND entity=?", ("#%d" % row["id"],)).fetchone()
+        out.append((row, p, n, since, r[0] > 0, r[1] > 0))
+    return sorted(out, key=lambda t: (-t[1], t[0]["id"]))
+
+
+def repo_home(row):
+    return ("~/.claude/CLAUDE.md" if row["scope"] == GLOBAL
+            else "README, CLAUDE.md, or the file it governs")
+
+
 def fmt_counts(n):
     return ", ".join("%d %s%s" % (n[k], k, "" if n[k] == 1 else "s")
                      for k in ("note", "recall", "prompt") if n.get(k))
@@ -521,33 +560,68 @@ def cmd_recall(c, args):
 
 
 def cmd_touch(c, args):
-    if len(args) != 1:
-        die("usage: %s touch <entity>   (dossier reviewed, unchanged; resets pressure)" % ME)
-    e = args[0].strip().lower()
+    opts, pos = flags(args)
+    if len(pos) != 1:
+        die("usage: %s touch <entity|id> [--keep]   (reviewed, unchanged; resets pressure)" % ME)
+    if pos[0].isdigit():
+        row = c.execute("SELECT * FROM memories WHERE id=? AND %s" % LIVE,
+                        (int(pos[0]),)).fetchone()
+        if not row or row["kind"] != "procedural":
+            die("No live procedural note #%s." % pos[0])
+        # 'keep' rides in the free-text session column: the touches CHECK
+        # constraint predates it, and a table rebuild isn't worth one flag.
+        touch(c, ["#%d" % row["id"]], "review", "keep" if "keep" in opts else "")
+        print('Reviewed #%d unchanged: "%s"%s' % (
+            row["id"], row["text"],
+            "; kept in memory, export will not be suggested again." if "keep" in opts
+            else ". The next real change still needs a supersede."))
+        return
+    if "keep" in opts:
+        die("--keep applies to a procedural note id.")
+    e = pos[0].strip().lower()
     if e not in dossier_clock(c):
-        die("No people note tags %s." % args[0])
+        die("No people note tags %s." % pos[0])
+    prow = None
+    for r in c.execute("SELECT * FROM memories WHERE kind='people' AND %s ORDER BY id" % LIVE):
+        if e in entity_set(r):
+            prow = r
     touch(c, [e], "review")
-    print("Reviewed %s. The next real change still needs a supersede." % e)
+    print('Reviewed %s unchanged: "%s". The next real change still needs a supersede.'
+          % (e, prow["text"]))
 
 
 def cmd_stale(c, args):
     opts, _ = flags(args)
-    lim = int(opts.get("min", STALE_MIN))
-    due = [r for r in dossier_pressure(c) if r[1] >= lim]
+    dmin = int(opts.get("min", STALE_MIN))
+    pmin = int(opts.get("min", PROC_STALE_MIN))
+    due = [r for r in dossier_pressure(c) if r[1] >= dmin]
+    pdue = [r for r in note_pressure(c, [project(), GLOBAL]) if r[1] >= pmin]
     if "hook" in opts:
-        return stale_hook(c, due)
-    if not due:
-        print("No dossier under pressure (threshold %d)." % lim)
+        return stale_hook(c, due, pdue)
+    if not due and not pdue:
+        print("No dossier under pressure (threshold %d)." % dmin)
         return
     for e, p, n, since in due:
         print("%s: pressure %d (%s) since %s. Supersede its people note or: %s touch %s"
               % (e, p, fmt_counts(n), since[:10], ME, e))
+    for row, p, n, since, reviewed, kept in pdue:
+        if reviewed and not kept:
+            print('#%d stable and hot: pressure %d (%s) since %s: "%s". Its home is the '
+                  "repo: write it into %s and supersede #%d with a pointer, or: "
+                  "%s touch %d --keep"
+                  % (row["id"], p, fmt_counts(n), since[:10], row["text"],
+                     repo_home(row), row["id"], ME, row["id"]))
+        else:
+            print('#%d procedural: pressure %d (%s) since %s: "%s". Verify against the '
+                  "repo, then supersede or: %s touch %d"
+                  % (row["id"], p, fmt_counts(n), since[:10], row["text"], ME, row["id"]))
 
 
-def stale_hook(c, due):
-    """Claude Code Stop hook: when a dossier is under pressure, block the stop
-    once per entity and session so a live agent reviews it. stop_hook_active
-    means this stop is already the result of a block: let it through."""
+def stale_hook(c, due, pdue):
+    """Claude Code Stop hook: when a dossier or a procedural fact is under
+    pressure, block the stop once per subject and session so a live agent
+    reviews it. stop_hook_active means this stop is already the result of a
+    block: let it through."""
     import json
     try:
         data = json.load(sys.stdin)
@@ -559,15 +633,32 @@ def stale_hook(c, due):
     nagged = {e for (e,) in c.execute(
         "SELECT DISTINCT entity FROM touches WHERE kind='nag' AND session=?", (sid,))}
     due = [r for r in due if r[0] not in nagged]
-    if not due:
+    pdue = [r for r in pdue if "#%d" % r[0]["id"] not in nagged]
+    if not due and not pdue:
         return
-    touch(c, [e for e, _, _, _ in due], "nag", sid)
-    names = "; ".join("%s (%s since %s)" % (e, fmt_counts(n), since[:10])
-                      for e, p, n, since in due)
-    print(json.dumps({"decision": "block", "reason":
-        "Dossiers under pressure: %s. For each: supersede the people note with what "
-        "changed, or confirm it unchanged with `%s touch <entity>`. Keep hedges as "
-        "hedges when you supersede." % (names, ME)}))
+    touch(c, [e for e, _, _, _ in due] + ["#%d" % r[0]["id"] for r in pdue], "nag", sid)
+    parts = []
+    if due:
+        names = "; ".join("%s (%s since %s)" % (e, fmt_counts(n), since[:10])
+                          for e, p, n, since in due)
+        parts.append("Dossiers under pressure: %s. For each: supersede the people note "
+                     "with what changed, or confirm it unchanged with `%s touch <entity>`."
+                     % (names, ME))
+    verify = [r for r in pdue if not (r[4] and not r[5])]
+    export = [r for r in pdue if r[4] and not r[5]]
+    if verify:
+        parts.append("Procedural facts under pressure: %s. Verify each against the repo, "
+                     "then supersede what changed or confirm with `%s touch <id>`."
+                     % ("; ".join('#%d \"%s\"' % (r[0]["id"], r[0]["text"][:60])
+                                  for r in verify), ME))
+    if export:
+        parts.append("Stable and hot, home is the repo: %s. Write each into README or "
+                     "CLAUDE.md (~/.claude/CLAUDE.md for global facts), supersede the note "
+                     "with a pointer, or keep it in memory with `%s touch <id> --keep`."
+                     % ("; ".join('#%d \"%s\"' % (r[0]["id"], r[0]["text"][:60])
+                                  for r in export), ME))
+    parts.append("Keep hedges as hedges when you supersede.")
+    print(json.dumps({"decision": "block", "reason": " ".join(parts)}))
 
 
 def cmd_promote(c, args):
@@ -619,6 +710,18 @@ def cmd_wake(c, args):
         for r in rows:
             if r["id"] not in conflicted:
                 out.append("#%d %s (%s)" % (r["id"], r["text"], short(r["scope"])))
+        if kind == "procedural":
+            for row, p2, n2, since, reviewed, kept in note_pressure(c, scopes):
+                if p2 < PROC_STALE_MIN:
+                    continue
+                if reviewed and not kept:
+                    out.append("#%d is stable and hot (%s since %s): its home is the repo; "
+                               "write it there and supersede with a pointer, or: %s touch %d --keep"
+                               % (row["id"], fmt_counts(n2), since[:10], ME, row["id"]))
+                else:
+                    out.append("#%d under pressure (%s since %s): verify against the repo, "
+                               "then supersede or: %s touch %d"
+                               % (row["id"], fmt_counts(n2), since[:10], ME, row["id"]))
 
     people = live(c, "people", scopes)
     if people:
@@ -815,7 +918,7 @@ def cmd_mcp(c, args):
             if method == "initialize":
                 result = {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
                           "capabilities": {"tools": {}},
-                          "serverInfo": {"name": "segmem", "version": "0.2.0"}}
+                          "serverInfo": {"name": "segmem", "version": "0.3.0"}}
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
@@ -1054,6 +1157,13 @@ When `note` suggests a tag spelling, use it next time; never re-note.
 If `note` asks for a compression, do it before your next action.
 When a person was a subject this session, not a mention: before you finish,
 supersede their people note or confirm it unchanged with `{me} touch <name>`.
+When wake or a stop flags a fact under pressure, check the claim against the
+repo before answering: supersede what changed, confirm what held with
+`{me} touch <id>`. When segmem calls a fact stable and hot, its home is the
+repo: write it into README, CLAUDE.md, or the file it governs
+(~/.claude/CLAUDE.md for a global fact), supersede the note with a pointer to
+where it landed, and reserve `{me} touch <id> --keep` for a fact the repo
+cannot hold.
 
 When a prompt names a person, component, branch, issue, or past decision:
 `{me} recall <words>` first. It searches every scope and kind. A
@@ -1073,7 +1183,7 @@ Hooks (recommended): merge into ~/.claude/settings.json (Claude Code) or save
 as ~/.codex/hooks.json (Codex CLI). SessionStart makes wake run on every start
 and resume without relying on the agent; UserPromptSubmit searches every
 prompt for names, #issues, and paths; Stop nags once per session when a
-people note has fallen behind the evidence.
+people note or a procedural fact has fallen behind the evidence.
 
 {{"hooks": {{
   "SessionStart": [{{"hooks": [{{"type": "command", "command": "{me} wake"}}]}}],

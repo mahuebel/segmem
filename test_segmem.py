@@ -249,6 +249,74 @@ class Segmem(unittest.TestCase):
         self.assertIn("dossier from", w)
         self.assertIn("touch alice", w)
 
+    def test_procedural_pressure_and_touch_by_id(self):
+        run("note", "procedural", "uses npm, the Lambda runtime needs it", "--entities=pkg")
+        self.assertNotIn("#1", run("stale"))
+        # own tag 3 + three notes at 3 = 12 meets the procedural threshold
+        for i in range(3):
+            run("note", "episodic", "bundler event %d" % i, "--entities=pkg")
+        out = run("stale")
+        self.assertIn("#1 procedural", out)
+        self.assertIn("Verify against the repo", out)
+        self.assertIn("touch 1", out)
+        # soft cost: touch echoes the exact claim being confirmed
+        out = run("touch", "1")
+        self.assertIn("uses npm, the Lambda runtime needs it", out)
+        self.assertNotIn("#1", run("stale"))
+
+    def test_export_on_second_cycle_and_keep(self):
+        run("note", "procedural", "uses npm, the Lambda runtime needs it", "--entities=pkg")
+        for i in range(3):
+            run("note", "episodic", "bundler event %d" % i, "--entities=pkg")
+        run("touch", "1")
+        # a confirmed fact under pressure again is stable and hot: export
+        for i in range(4):
+            run("note", "episodic", "more bundler %d" % i, "--entities=pkg")
+        out = run("stale")
+        self.assertIn("stable and hot", out)
+        self.assertIn("touch 1 --keep", out)
+        out = run("touch", "1", "--keep")
+        self.assertIn("kept in memory", out)
+        # after keep: pressure returns as verify, never as export
+        for i in range(4):
+            run("note", "episodic", "later bundler %d" % i, "--entities=pkg")
+        out = run("stale")
+        self.assertIn("#1", out)
+        self.assertNotIn("stable and hot", out)
+
+    def test_touch_id_rejects_non_procedural(self):
+        run("note", "episodic", "an event")
+        self.assertIn("No live procedural note", run("touch", "1", check=False))
+        self.assertIn("--keep applies", run("touch", "alice", "--keep", check=False))
+
+    def test_stop_hook_covers_procedural_once(self):
+        import json
+        run("note", "procedural", "uses npm, the Lambda runtime needs it", "--entities=pkg")
+        for i in range(3):
+            run("note", "episodic", "bundler event %d" % i, "--entities=pkg")
+        out = run("stale", "--hook", stdin=json.dumps({"session_id": "s1"}))
+        self.assertIn('"decision": "block"', out)
+        self.assertIn("#1", out)
+        self.assertEqual("", run("stale", "--hook", stdin=json.dumps({"session_id": "s1"})))
+        run("touch", "1")
+        self.assertEqual("", run("stale", "--hook", stdin=json.dumps({"session_id": "s2"})))
+
+    def test_wake_flags_hot_procedural(self):
+        run("note", "procedural", "uses npm, the Lambda runtime needs it", "--entities=pkg")
+        self.assertNotIn("under pressure", run("wake"))
+        for i in range(3):
+            run("note", "episodic", "bundler event %d" % i, "--entities=pkg")
+        w = run("wake")
+        self.assertIn("under pressure", w)
+        self.assertIn("touch 1", w)
+
+    def test_other_project_procedural_stays_quiet(self):
+        run("note", "procedural", "uses npm here", "--entities=pkg", project="/p/beta")
+        for i in range(3):
+            run("note", "episodic", "beta event %d" % i, "--entities=pkg", project="/p/beta")
+        self.assertIn("#1", run("stale", project="/p/beta"))
+        self.assertNotIn("#1", run("stale", project="/p/alpha"))
+
     def test_note_warns_on_scope_mismatch(self):
         run("note", "episodic", "vp sync notes", "--entities=hr-hub", project="/p/hr-hub")
         out = run("note", "episodic", "more vp sync", "--entities=hr-hub", project="/p/armory")

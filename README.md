@@ -135,14 +135,15 @@ three is a preference.
 
 ## Pressure
 
-A people note is a claim under test, and the store tracks the evidence
+A stored claim is a claim under test, and the store tracks the evidence
 arriving against it. Every time an entity is tagged in a new note (weight 3),
 served by `recall` (2), or mentioned in a prompt (1), that's a touch. Touches
 are telemetry, not memory: `wake` never prints them as facts.
 
-Only a people note or an explicit review resets the clock; an episodic note
-*about* a person raises pressure on their dossier, it never relieves it. When
-the weighted touches since the last revision reach the threshold (6):
+**People dossiers.** Only a people note or an explicit review resets the
+clock; an episodic note *about* a person raises pressure on their dossier, it
+never relieves it. When the weighted touches since the last revision reach
+the threshold (6):
 
 - `segmem stale` lists the dossiers under pressure, with counts and dates.
 - `wake` flags them under the people list: `alice: dossier from 2026-08-24,
@@ -151,9 +152,26 @@ the weighted touches since the last revision reach the threshold (6):
   and one instruction: supersede each dossier with what changed, or confirm
   it unchanged with `segmem touch <name>`.
 
+**Procedural facts.** The same clock runs per note, against the touches on
+its entities, with a higher threshold (12), because busy components accrue
+touches fast. The first time a note comes under pressure, the verdict is
+verify: check the claim against the repo, then supersede what changed or
+confirm with `segmem touch <id>`, which prints the exact claim back so a
+blind reset is at least a visible one.
+
+A confirmed fact that comes under pressure *again* has proven two things:
+it's stable, and it's load-bearing. The verdict changes to export: its home
+is the repo. Write it into README, CLAUDE.md, or the file it governs
+(`~/.claude/CLAUDE.md` for a global fact), then supersede the note with a
+pointer to where it landed. Memory is the staging ground, not the archive; a
+fact everyone should see belongs where everyone looks. `segmem touch <id>
+--keep` is the escape for a fact the repo can't hold (private context,
+another team's repo); it stops export suggestions while verify cycles
+continue. segmem never writes the repo itself: the agent does, and decides.
+
 `touch` is the honest way out: it records "reviewed, no change needed"
 without writing a fake supersede that would pollute history. Nothing ever
-rewrites a people note without an agent deciding to.
+rewrites a note without an agent deciding to.
 
 ## Commands
 
@@ -166,8 +184,8 @@ rewrites a people note without an agent deciding to.
 | `segmem promote <id>` | lift a project fact to global, if three projects agree |
 | `segmem forget <id>` | delete a misfiled note; episodic only when newest |
 | `segmem forget <lo>-<hi>` | drop a bad summary; it's rebuilt on request |
-| `segmem stale [--min=n] [--hook]` | list people notes under evidence pressure |
-| `segmem touch <entity>` | dossier reviewed, unchanged; resets its pressure |
+| `segmem stale [--min=n] [--hook]` | list people notes and procedural facts under evidence pressure |
+| `segmem touch <entity\|id> [--keep]` | claim reviewed, unchanged; resets its pressure; `--keep` marks a procedural fact memory-resident |
 | `segmem hook` | the prompt hook; reads JSON on stdin |
 | `segmem html [file] [--no-open]` | write a self-contained page that shows the store, and open it |
 | `segmem mcp` | run as an MCP server over stdio |
@@ -225,7 +243,8 @@ The `init` output includes this block. For Claude Code, merge it into
   `<segmem-recall>` block. No identifiers or no hits means no output. It never
   blocks a prompt.
 - `Stop` runs `stale --hook`, which interrupts the agent when a people note
-  has fallen behind the evidence, once per entity and session, and never
+  or a procedural fact has fallen behind the evidence, once per subject and
+  session, and never
   twice in a row: a stop caused by its own block passes through.
 
 ## Seeing what it knows
@@ -305,3 +324,8 @@ python3 test_segmem.py
 The shape of the history window is an exponential histogram: Datar, Gionis,
 Indyk, and Motwani, "Maintaining stream statistics over sliding windows,"
 SIAM Journal on Computing, 2002.
+
+The repo exit for stable, hot facts follows the compile-experience-into-
+artifacts argument in Tang, Rashtchian, Ferng, Tomkins, Juan, and Vu,
+"WikiSkill: Compiling Agent Experience into Persistent Knowledge for Skill
+Evolution," 2026 (arXiv:2608.27454).

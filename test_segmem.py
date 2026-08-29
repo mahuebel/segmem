@@ -5,13 +5,38 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(HERE, "segmem")
 
 
-def run(*args, project="/p/alpha", check=True, stdin=None):
+def run(*args, project="/p/alpha", check=True, stdin=None, org=None):
     env = dict(os.environ, SEGMEM_DIR=run.dir, SEGMEM_PROJECT=project)
+    if org:
+        env["SEGMEM_ORG_DIR"] = org
     r = subprocess.run([sys.executable, TOOL, *args], capture_output=True, text=True,
                        env=env, input=stdin)
     if check and r.returncode:
         raise AssertionError(r.stderr + r.stdout)
     return r.stdout + r.stderr
+
+
+def org_repo(facts=(), candidates=()):
+    """A real knowledge repo in a tmpdir: fact files, git init, one commit."""
+    d = tempfile.mkdtemp()
+    for sub in ("facts", "candidates"):
+        os.makedirs(os.path.join(d, sub))
+    for sub, items in (("facts", facts), ("candidates", candidates)):
+        for slug, entities, text in items:
+            open(os.path.join(d, sub, slug + ".md"), "w").write(
+                "---\nkind: procedural\nscope: org\nentities: %s\n"
+                "witnesses: alice 2026-08-01 kerf\n---\n%s\n" % (entities, text))
+    subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=d, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "init"], cwd=d, check=True, capture_output=True)
+    return d
+
+
+def org_commit(d, msg="more"):
+    subprocess.run(["git", "add", "-A"], cwd=d, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", msg], cwd=d, check=True, capture_output=True)
 
 
 class Segmem(unittest.TestCase):
@@ -316,6 +341,74 @@ class Segmem(unittest.TestCase):
             run("note", "episodic", "beta event %d" % i, "--entities=pkg", project="/p/beta")
         self.assertIn("#1", run("stale", project="/p/beta"))
         self.assertNotIn("#1", run("stale", project="/p/alpha"))
+
+    def test_org_recall_and_hook(self):
+        import json
+        d = org_repo(facts=[("aws-lambda-bundler", "lambda-runtime",
+                             "The lambda-runtime bundler breaks on symlinked node_modules")])
+        run("note", "procedural", "unrelated local fact", "--entities=misc")
+        out = run("recall", "bundler", org=d)
+        self.assertIn("org:aws-lambda-bundler", out)
+        self.assertIn("(org)", out)
+        out = run("hook", org=d,
+                  stdin=json.dumps({"prompt": "why does lambda-runtime fail?"}))
+        self.assertIn("<segmem-recall>", out)
+        self.assertIn("org:aws-lambda-bundler", out)
+        # unset org dir: the same query finds nothing
+        self.assertIn("No match", run("recall", "bundler"))
+
+    def test_org_reindex_on_head_change(self):
+        d = org_repo(facts=[("first-fact", "alpha-comp", "alpha-comp uses X")])
+        self.assertIn("first-fact", run("recall", "alpha-comp", org=d))
+        open(os.path.join(d, "facts", "second-fact.md"), "w").write(
+            "---\nkind: procedural\nscope: org\nentities: beta-comp\n---\nbeta-comp uses Y\n")
+        org_commit(d)
+        self.assertIn("second-fact", run("recall", "beta-comp", org=d))
+
+    def test_wake_org_summary_conflict_and_cosign(self):
+        d = org_repo(facts=[("pkg-standard", "pkg", "org standard is pnpm everywhere")],
+                     candidates=[("npm-lambda", "bundler",
+                                  "uses npm, the Lambda runtime needs it")])
+        run("note", "procedural", "uses npm, the Lambda runtime needs it", "--entities=pkg")
+        w = run("wake", org=d)
+        self.assertIn("Org layer: 1 facts (1 candidates)", w)
+        self.assertIn("org:pkg-standard", w)
+        self.assertIn("open an issue", w)
+        self.assertIn("matches candidate npm-lambda", w)
+        self.assertIn("co-sign", w)
+        # without the org dir, wake is silent about the layer
+        self.assertNotIn("Org layer", run("wake"))
+
+    def test_contribute_prints_file_and_gates(self):
+        run("note", "procedural", "uses npm, the Lambda runtime needs it", "--entities=pkg")
+        out = run("contribute", "1")
+        self.assertIn("candidates/pkg-uses-npm", out)
+        self.assertIn("kind: procedural", out)
+        self.assertIn("gh pr create", out)
+        self.assertIn("uses npm, the Lambda runtime needs it", out)
+        run("note", "people", "Alice owns deploys", "--entities=alice")
+        run("note", "procedural", "ask alice before infra changes", "--entities=alice")
+        out = run("contribute", "3", check=False)
+        self.assertIn("names a person", out)
+        out = run("contribute", "2", check=False)
+        self.assertIn("No live procedural", out)
+
+    def test_contribute_redirects_to_cosign(self):
+        d = org_repo(candidates=[("npm-lambda", "pkg",
+                                  "uses npm, the Lambda runtime needs it")])
+        run("note", "procedural", "uses npm, the Lambda runtime needs it", "--entities=pkg")
+        out = run("contribute", "1", org=d)
+        self.assertIn("Co-sign", out)
+        self.assertIn("npm-lambda", out)
+        self.assertNotIn("gh pr create --title", out)
+
+    def test_org_init_scaffold(self):
+        base = tempfile.mkdtemp()
+        kb = os.path.join(base, "kb")
+        run("org-init", kb)
+        for f in ("README.md", "CODEOWNERS", "facts/knowledge-repo.md", "candidates"):
+            self.assertTrue(os.path.exists(os.path.join(kb, f)), f)
+        self.assertIn("Not empty", run("org-init", kb, check=False))
 
     def test_note_warns_on_scope_mismatch(self):
         run("note", "episodic", "vp sync notes", "--entities=hr-hub", project="/p/hr-hub")

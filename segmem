@@ -337,14 +337,130 @@ def note_pressure(c, scopes):
     return sorted(out, key=lambda t: (-t[1], t[0]["id"]))
 
 
-def repo_home(row):
-    return ("~/.claude/CLAUDE.md" if row["scope"] == GLOBAL
-            else "README, CLAUDE.md, or the file it governs")
+def form_ladder(row):
+    """The export target, strongest form first: knowledge compiled into
+    enforcement needs no reader at all (WikiSkill, arXiv:2608.27454)."""
+    if row["scope"] == GLOBAL:
+        return "~/.claude/CLAUDE.md, or a personal skill"
+    return ("the repo, strongest form that fits: enforcement (a config, a "
+            "CI check, a lint rule), a skill, CLAUDE.md, then docs")
 
 
 def fmt_counts(n):
     return ", ".join("%d %s%s" % (n[k], k, "" if n[k] == 1 else "s")
                      for k in ("note", "recall", "prompt") if n.get(k))
+
+
+# ---------------------------------------------------------------- org layer
+# Altitude 2 (ARCHITECTURE.md): a cloned knowledge repo of one-fact-per-file
+# markdown, indexed read-only into a local cache. Never loaded whole at
+# wake: recall and the prompt hook pull from it; wake surfaces only the
+# summary line, conflicts, and co-sign nudges.
+
+def org_dir():
+    d = os.environ.get("SEGMEM_ORG_DIR")
+    return os.path.abspath(os.path.expanduser(d)) if d else None
+
+
+def org_head(d):
+    try:
+        return subprocess.check_output(["git", "-C", d, "rev-parse", "HEAD"],
+                                       text=True, stderr=subprocess.DEVNULL).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ""
+
+
+def parse_fact(path):
+    """A fact file: --- fences, key: value lines, body is the claim."""
+    try:
+        raw = open(path, encoding="utf-8").read()
+    except OSError:
+        return None
+    m = re.match(r"---\s*\n(.*?)\n---\s*\n(.*)", raw, re.S)
+    if not m:
+        return None
+    meta = {}
+    for line in m.group(1).splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            meta[k.strip().lower()] = v.strip()
+    text = " ".join(m.group(2).split())
+    if not text:
+        return None
+    return {"kind": meta.get("kind", "procedural"), "scope": meta.get("scope", "org"),
+            "entities": meta.get("entities", ""), "witnesses": meta.get("witnesses", ""),
+            "supersedes": meta.get("supersedes", ""), "text": text}
+
+
+def org_connect():
+    """The cache for SEGMEM_ORG_DIR, rebuilt when the repo's HEAD moves.
+    None when no org dir is configured. Read-only toward the repo."""
+    d = org_dir()
+    if not d or not os.path.isdir(d):
+        return None
+    import hashlib
+    cache = os.path.join(os.path.dirname(db_path()),
+                         "org-%s.db" % hashlib.sha1(d.encode()).hexdigest()[:12])
+    oc = sqlite3.connect(cache, timeout=10)
+    oc.row_factory = sqlite3.Row
+    oc.executescript("""
+CREATE TABLE IF NOT EXISTS org_facts (
+  slug TEXT PRIMARY KEY, status TEXT, kind TEXT, scope TEXT,
+  entities TEXT, witnesses TEXT, supersedes TEXT, text TEXT, path TEXT);
+CREATE VIRTUAL TABLE IF NOT EXISTS org_fts USING fts5(slug UNINDEXED, text, entities);
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+""")
+    head = org_head(d)
+    cur = oc.execute("SELECT v FROM meta WHERE k='head'").fetchone()
+    if cur is None or cur[0] != head or head == "":
+        with oc:
+            oc.execute("DELETE FROM org_facts")
+            oc.execute("DELETE FROM org_fts")
+            for status, sub in (("fact", "facts"), ("candidate", "candidates")):
+                folder = os.path.join(d, sub)
+                names = sorted(os.listdir(folder)) if os.path.isdir(folder) else []
+                for name in names:
+                    if not name.endswith(".md"):
+                        continue
+                    f = parse_fact(os.path.join(folder, name))
+                    if not f:
+                        continue
+                    slug = name[:-3]
+                    oc.execute("INSERT OR REPLACE INTO org_facts VALUES (?,?,?,?,?,?,?,?,?)",
+                               (slug, status, f["kind"], f["scope"], f["entities"],
+                                f["witnesses"], f["supersedes"], f["text"],
+                                os.path.join(sub, name)))
+                    oc.execute("INSERT INTO org_fts(slug, text, entities) VALUES (?,?,?)",
+                               (slug, f["text"], f["entities"]))
+            oc.execute("INSERT OR REPLACE INTO meta VALUES ('head', ?)", (head,))
+    return oc
+
+
+def org_live(oc):
+    dead = {r[0] for r in oc.execute(
+        "SELECT supersedes FROM org_facts WHERE supersedes != ''")}
+    return [r for r in oc.execute("SELECT * FROM org_facts ORDER BY slug")
+            if r["slug"] not in dead]
+
+
+def org_search(oc, q, limit):
+    dead = {r[0] for r in oc.execute(
+        "SELECT supersedes FROM org_facts WHERE supersedes != ''")}
+    try:
+        rows = oc.execute(
+            "SELECT f.* FROM org_fts JOIN org_facts f ON f.slug = org_fts.slug "
+            "WHERE org_fts MATCH ? ORDER BY rank LIMIT ?",
+            (q, limit + len(dead))).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [r for r in rows if r["slug"] not in dead][:limit]
+
+
+def org_line(r, path=True):
+    tags = " [%s]" % r["entities"] if r["entities"] else ""
+    cand = " [candidate]" if r["status"] == "candidate" else ""
+    tail = " (%s)" % r["path"] if path else ""
+    return "org:%s (org)%s%s: %s%s" % (r["slug"], tags, cand, r["text"], tail)
 
 
 # ---------------------------------------------------------------- commands
@@ -547,7 +663,9 @@ def cmd_recall(c, args):
             rows = c.execute(sql, (q,)).fetchall()
         except sqlite3.OperationalError as e:
             die("Bad query: %s" % e)
-    if not rows:
+    oc = org_connect()
+    orows = org_search(oc, q, HOOK_MAX) if oc else []
+    if not rows and not orows:
         print("No match.")
         return
     dead = {r[0] for r in c.execute("SELECT supersedes FROM memories WHERE supersedes IS NOT NULL")}
@@ -556,6 +674,8 @@ def cmd_recall(c, args):
         tags = " [%s]" % r["entities"] if r["entities"] else ""
         print("#%d %s %s %s%s%s: %s" % (r["id"], r["ts"][:10], r["kind"], short(r["scope"]),
                                         tags, flag, r["text"]))
+    for r in orows:
+        print(org_line(r))
     touch(c, {e for r in rows for e in entity_set(r)}, "recall")
 
 
@@ -606,11 +726,10 @@ def cmd_stale(c, args):
               % (e, p, fmt_counts(n), since[:10], ME, e))
     for row, p, n, since, reviewed, kept in pdue:
         if reviewed and not kept:
-            print('#%d stable and hot: pressure %d (%s) since %s: "%s". Its home is the '
-                  "repo: write it into %s and supersede #%d with a pointer, or: "
-                  "%s touch %d --keep"
+            print('#%d stable and hot: pressure %d (%s) since %s: "%s". Compile it '
+                  "into %s. Then supersede #%d with a pointer, or: %s touch %d --keep"
                   % (row["id"], p, fmt_counts(n), since[:10], row["text"],
-                     repo_home(row), row["id"], ME, row["id"]))
+                     form_ladder(row), row["id"], ME, row["id"]))
         else:
             print('#%d procedural: pressure %d (%s) since %s: "%s". Verify against the '
                   "repo, then supersede or: %s touch %d"
@@ -652,9 +771,11 @@ def stale_hook(c, due, pdue):
                      % ("; ".join('#%d \"%s\"' % (r[0]["id"], r[0]["text"][:60])
                                   for r in verify), ME))
     if export:
-        parts.append("Stable and hot, home is the repo: %s. Write each into README or "
-                     "CLAUDE.md (~/.claude/CLAUDE.md for global facts), supersede the note "
-                     "with a pointer, or keep it in memory with `%s touch <id> --keep`."
+        parts.append("Stable and hot, compile into the repo: %s. Strongest form that "
+                     "fits: enforcement (a config, a CI check, a lint rule), a skill, "
+                     "CLAUDE.md, then docs (~/.claude/CLAUDE.md for global facts). "
+                     "Supersede each note with a pointer, or keep it in memory with "
+                     "`%s touch <id> --keep`."
                      % ("; ".join('#%d \"%s\"' % (r[0]["id"], r[0]["text"][:60])
                                   for r in export), ME))
     parts.append("Keep hedges as hedges when you supersede.")
@@ -686,6 +807,117 @@ def _other_scopes(c, scope):
         "SELECT DISTINCT scope FROM memories WHERE scope NOT IN (?,?)", (scope, GLOBAL))]
 
 
+def cmd_contribute(c, args):
+    """Print the org-repo candidate for a procedural fact: the file, its
+    path, and the commands to open the PR. segmem never writes the repo."""
+    if len(args) != 1 or not args[0].isdigit():
+        die("usage: %s contribute <id>   (procedural facts only)" % ME)
+    row = c.execute("SELECT * FROM memories WHERE id=? AND %s" % LIVE,
+                    (int(args[0]),)).fetchone()
+    if not row or row["kind"] != "procedural":
+        die("No live procedural note #%s. Identity, people, and raw episodic "
+            "notes never leave the device; a decision exits as an ADR in its "
+            "project repo." % args[0])
+    people = {e for (ents,) in c.execute("SELECT entities FROM memories WHERE kind='people'")
+              for e in ents.lower().split(",") if e.strip()}
+    named = entity_set(row) & people
+    if named:
+        die("Not contributable: entity %s names a person. Facts about people "
+            "never leave the device." % ", ".join(sorted(named)))
+    try:
+        who = subprocess.check_output(["git", "config", "user.name"],
+                                      text=True, stderr=subprocess.DEVNULL).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        who = "unknown"
+    today = c.execute("SELECT date('now')").fetchone()[0]
+    witness = "%s %s %s" % (who, today, short(row["scope"]))
+    oc = org_connect()
+    if oc:
+        for r in oc.execute("SELECT * FROM org_facts"):
+            if norm(r["text"]) == norm(row["text"]):
+                if r["status"] == "fact":
+                    print("Already in the org layer: %s. Nothing to contribute." % r["path"])
+                else:
+                    print("Candidate %s already carries this claim. Co-sign it: in a PR, "
+                          "append to the witnesses line of %s:\n  ; %s"
+                          % (r["slug"], r["path"], witness))
+                return
+    ents = [e.strip() for e in row["entities"].split(",") if e.strip()]
+    slug = "-".join(([ents[0].lower()] if ents else [])
+                    + norm(row["text"]).split()[:4])[:60].strip("-")
+    d = org_dir() or "<knowledge-repo>"
+    print("""Candidate for the org layer. Review it, then run the commands.
+
+cd %s
+git switch -c fact/%s
+cat > candidates/%s.md <<'FACT'
+---
+kind: procedural
+scope: org
+entities: %s
+witnesses: %s
+---
+%s
+FACT
+git add candidates/%s.md && git commit -m "candidate: %s"
+gh pr create --title "candidate: %s" --body "First witness: %s (%s). Merges to facts/ at %d witnesses."
+
+Then supersede #%d locally with a pointer once it merges.""" % (
+        d, slug, slug, ", ".join(ents), witness, row["text"], slug, slug,
+        slug, who, short(row["scope"]), PROMOTE_MIN, row["id"]))
+
+
+def cmd_org_init(c, args):
+    """Scaffold a knowledge repo: the witnessing convention, ready to git
+    init. Explicitly user-invoked, the one place segmem writes files."""
+    if len(args) != 1:
+        die("usage: %s org-init <dir>   (scaffold a knowledge repo)" % ME)
+    d = os.path.abspath(os.path.expanduser(args[0]))
+    if os.path.isdir(d) and os.listdir(d):
+        die("Not empty: %s" % d)
+    os.makedirs(os.path.join(d, "facts"), exist_ok=True)
+    os.makedirs(os.path.join(d, "candidates"), exist_ok=True)
+    open(os.path.join(d, "README.md"), "w").write("""\
+# Knowledge repo
+
+One fact per file. `candidates/` holds claims with fewer than three
+witnesses; a candidate merges to `facts/` when three independent stores
+co-sign, a witness line each. CODEOWNERS names the human on the other end
+of every staleness signal: when someone's local memory contradicts a fact
+here, they open an issue on the fact's file, and its owner decides.
+
+File format:
+
+    ---
+    kind: procedural
+    scope: org
+    entities: aws, lambda
+    witnesses: alice 2026-08-12 kerf; bob 2026-08-20 bearing
+    supersedes: old-slug
+    ---
+    The claim, one line, under 280 bytes.
+
+Facts are claims from when they were written. Supersede, never edit;
+delete only misfiles. Never facts about people.
+""")
+    open(os.path.join(d, "CODEOWNERS"), "w").write("""\
+# The named human on the other end of the staleness signal.
+# facts/aws-*.md @platform-team
+* @OWNER
+""")
+    open(os.path.join(d, "facts", "knowledge-repo.md"), "w").write("""\
+---
+kind: procedural
+scope: org
+entities: knowledge-repo
+witnesses: segmem %s org-init
+---
+This repo holds org facts; candidates merge at three witnesses. See README.
+""" % c.execute("SELECT date('now')").fetchone()[0])
+    print("Scaffolded %s.\nNext:\n  cd %s && git init && git add -A && "
+          "git commit -m 'org: init'\n  export SEGMEM_ORG_DIR=%s" % (d, d, d))
+
+
 def cmd_wake(c, args):
     p = project()
     scopes = [GLOBAL] if p == GLOBAL else [GLOBAL, p]
@@ -715,13 +947,42 @@ def cmd_wake(c, args):
                 if p2 < PROC_STALE_MIN:
                     continue
                 if reviewed and not kept:
-                    out.append("#%d is stable and hot (%s since %s): its home is the repo; "
-                               "write it there and supersede with a pointer, or: %s touch %d --keep"
+                    out.append("#%d is stable and hot (%s since %s): compile it into the repo "
+                               "(enforce > skill > CLAUDE.md > docs) and supersede with a "
+                               "pointer, or: %s touch %d --keep"
                                % (row["id"], fmt_counts(n2), since[:10], ME, row["id"]))
                 else:
                     out.append("#%d under pressure (%s since %s): verify against the repo, "
                                "then supersede or: %s touch %d"
                                % (row["id"], fmt_counts(n2), since[:10], ME, row["id"]))
+
+    oc = org_connect()
+    if oc:
+        ofacts = org_live(oc)
+        n_cand = sum(1 for r in ofacts if r["status"] == "candidate")
+        head = (oc.execute("SELECT v FROM meta WHERE k='head'").fetchone() or [""])[0]
+        out.append("\n### Org layer: %d facts (%d candidates)%s; recall searches them."
+                   % (len(ofacts) - n_cand, n_cand, " @ %s" % head[:7] if head else ""))
+        loc = live(c, "identity", scopes) + live(c, "procedural", scopes)
+        for of in ofacts:
+            oe = {e.strip().lower() for e in of["entities"].split(",") if e.strip()}
+            if of["status"] == "fact":
+                # The contradiction report: a nearer fact beating an org fact
+                # is the org layer's staleness signal (ARCHITECTURE.md).
+                for lr in loc:
+                    if oe & entity_set(lr):
+                        out.append("org:%s %s (org) OVERRIDDEN by #%d %s (%s); if the "
+                                   "org fact is wrong, open an issue on %s"
+                                   % (of["slug"], of["text"], lr["id"], lr["text"],
+                                      short(lr["scope"]), of["path"]))
+                        break
+            else:
+                for lr in loc:
+                    if lr["kind"] == "procedural" and norm(lr["text"]) == norm(of["text"]):
+                        out.append("your #%d matches candidate %s: co-sign it (add a "
+                                   "witness line to %s via PR)"
+                                   % (lr["id"], of["slug"], of["path"]))
+                        break
 
     people = live(c, "people", scopes)
     if people:
@@ -824,11 +1085,15 @@ def cmd_hook(c, args):
             "ORDER BY rank LIMIT ?" % LIVE, (q, GLOBAL, p, HOOK_MAX)).fetchall()
     except sqlite3.OperationalError:
         return
-    if not rows:
+    oc = org_connect()
+    orows = org_search(oc, q, HOOK_MAX - len(rows)) if oc and len(rows) < HOOK_MAX else []
+    if not rows and not orows:
         return
     print("<segmem-recall>")
     for r in rows:
         print("#%d %s %s %s: %s" % (r["id"], r["ts"][:10], r["kind"], short(r["scope"]), r["text"]))
+    for r in orows:
+        print(org_line(r, path=False))
     print("</segmem-recall>")
 
 
@@ -918,7 +1183,7 @@ def cmd_mcp(c, args):
             if method == "initialize":
                 result = {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
                           "capabilities": {"tools": {}},
-                          "serverInfo": {"name": "segmem", "version": "0.3.0"}}
+                          "serverInfo": {"name": "segmem", "version": "0.4.0"}}
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
@@ -1159,11 +1424,18 @@ When a person was a subject this session, not a mention: before you finish,
 supersede their people note or confirm it unchanged with `{me} touch <name>`.
 When wake or a stop flags a fact under pressure, check the claim against the
 repo before answering: supersede what changed, confirm what held with
-`{me} touch <id>`. When segmem calls a fact stable and hot, its home is the
-repo: write it into README, CLAUDE.md, or the file it governs
-(~/.claude/CLAUDE.md for a global fact), supersede the note with a pointer to
-where it landed, and reserve `{me} touch <id> --keep` for a fact the repo
-cannot hold.
+`{me} touch <id>`. When segmem calls a fact stable and hot, compile it into
+the repo in the strongest form that fits: enforcement first (a config, a CI
+check, a lint rule), then a skill, then CLAUDE.md, then docs
+(~/.claude/CLAUDE.md for a global fact). Supersede the note with a pointer
+to where it landed, and reserve `{me} touch <id> --keep` for a fact the
+repo cannot hold.
+An org fact (marked `(org)` in recall) is a colleague's claim: verify it
+like any memory. A local fact that OVERRIDES an org fact is the org layer's
+staleness signal: offer to open an issue on the org fact's file. A local
+fact matching a candidate: offer to co-sign it. The only path upward is
+`{me} contribute <id>`; it prints commands, and you run them only with the
+user's approval.
 
 When a prompt names a person, component, branch, issue, or past decision:
 `{me} recall <words>` first. It searches every scope and kind. A
@@ -1213,7 +1485,8 @@ def main():
             "forget": cmd_forget, "promote": cmd_promote, "init": cmd_init,
             "project": cmd_project, "hook": cmd_hook, "mcp": cmd_mcp,
             "html": cmd_html, "stale": cmd_stale, "touch": cmd_touch,
-            "prompt": cmd_prompt}
+            "prompt": cmd_prompt, "contribute": cmd_contribute,
+            "org-init": cmd_org_init}
     if len(sys.argv) < 2 or sys.argv[1] not in cmds:
         die("usage: %s <%s> ..." % (ME, "|".join(cmds)))
     cmds[sys.argv[1]](connect(), sys.argv[2:])

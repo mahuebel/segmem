@@ -133,6 +133,30 @@ entity tag), wake prints `OVERRIDDEN` with both.
 same statement is live in three projects. One observation is a convention;
 three is a preference.
 
+## Altitudes
+
+Memory is a supply chain, not an archive; ARCHITECTURE.md holds the full
+design. A fact lives at the narrowest altitude whose audience covers
+everyone who needs it: the device (this store), the project repo (where the
+export verdict sends stable, hot facts, strongest form first: enforcement,
+a skill, CLAUDE.md, then docs), and an org layer for the cross-project
+residue.
+
+The org layer is a cloned knowledge repo of one-fact-per-file markdown.
+Point `SEGMEM_ORG_DIR` at it and segmem indexes it read-only, reindexing
+when its git HEAD moves. `recall` and the prompt hook search it, hits
+marked `(org)`. Wake never loads it whole; it surfaces three things only:
+one summary line, conflicts (a local fact overriding an org fact, which is
+the org layer's staleness signal: open an issue on the fact's file), and
+co-sign nudges when a local fact matches an open candidate.
+
+Upward writes are always a PR a human approves. `segmem contribute <id>`
+prints the candidate file and the commands; facts tagged with a person, and
+every identity, people, or raw episodic note, never leave the device.
+`segmem org-init <dir>` scaffolds a new knowledge repo with the witnessing
+convention: candidates merge to facts at three witnesses, and CODEOWNERS
+names the human on the other end of every staleness signal.
+
 ## Pressure
 
 A stored claim is a claim under test, and the store tracks the evidence
@@ -186,6 +210,8 @@ rewrites a note without an agent deciding to.
 | `segmem forget <lo>-<hi>` | drop a bad summary; it's rebuilt on request |
 | `segmem stale [--min=n] [--hook]` | list people notes and procedural facts under evidence pressure |
 | `segmem touch <entity\|id> [--keep]` | claim reviewed, unchanged; resets its pressure; `--keep` marks a procedural fact memory-resident |
+| `segmem contribute <id>` | print the org-repo candidate for a procedural fact, and the PR commands |
+| `segmem org-init <dir>` | scaffold a knowledge repo with the witnessing convention |
 | `segmem hook` | the prompt hook; reads JSON on stdin |
 | `segmem html [file] [--no-open]` | write a self-contained page that shows the store, and open it |
 | `segmem mcp` | run as an MCP server over stdio |
@@ -306,8 +332,10 @@ parallel sessions can write without a lock file.
 | `summaries` | the episodic tree, keyed by `(kind, scope, lo, hi)` |
 | `touches` | usage telemetry: mentions, recalls, and tags pressing on dossiers |
 
-Set `SEGMEM_DIR` to keep the database elsewhere (a synced folder works) and
-`SEGMEM_PROJECT` to force a scope key.
+Set `SEGMEM_DIR` to keep the database elsewhere (a synced folder works),
+`SEGMEM_PROJECT` to force a scope key, and `SEGMEM_ORG_DIR` to a cloned
+knowledge repo to enable the org layer (indexed read-only into
+`org-<hash>.db` beside the main database).
 
 To inspect the database by hand, go through Python (`python3 -c "import
 sqlite3; ..."`): the stock macOS `sqlite3` CLI is built without FTS5 and

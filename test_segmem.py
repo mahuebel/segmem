@@ -200,6 +200,13 @@ class Segmem(unittest.TestCase):
             self.assertEqual(hits["facets"]["entity"], {"pkg": 1})
             self.assertEqual(json.loads(get("/api/search?q=&kind=procedural"))["total"], 2)
             self.assertEqual(json.loads(get("/api/search?q=mem-op"))["total"], 0)  # no FTS crash
+            spine = json.loads(get("/api/spine"))
+            self.assertEqual([r[0] for r in spine], [1, 2, 3])
+            self.assertEqual(spine[0][1:3], ["procedural", "global"])
+            ov = json.loads(get("/api/overview"))
+            self.assertEqual((ov["live"], ov["superseded"], ov["overrides"]), (3, 0, 1))
+            self.assertEqual(ov["due"]["/p/alpha"]["pending"], 0)   # nothing due under budget
+            self.assertGreater(ov["wake"]["/p/alpha"]["tokens"], 0)
             # Browsing presses on nothing: no recall touches were written.
             self.assertNotIn("recall", run("stale", "--min=1"))
             page = get("/")

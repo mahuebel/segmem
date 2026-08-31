@@ -1183,7 +1183,7 @@ def cmd_mcp(c, args):
             if method == "initialize":
                 result = {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
                           "capabilities": {"tools": {}},
-                          "serverInfo": {"name": "segmem", "version": "0.5.0"}}
+                          "serverInfo": {"name": "segmem", "version": "0.6.0"}}
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
@@ -1593,6 +1593,86 @@ def serve_state(c, scope, lock):
             "budget": WAKE_EPISODIC, "db": db_path()}
 
 
+def store_key(c):
+    """Cheap change key for caches; PRAGMA data_version is per connection."""
+    return tuple(c.execute("SELECT (SELECT COUNT(*) FROM memories), (SELECT MAX(ts) FROM memories), "
+                           "(SELECT COUNT(*) FROM touches), (SELECT COUNT(*) FROM summaries)").fetchone())
+
+
+def serve_spine(c):
+    """Every memory as one compact row, id order: the header strip and the
+    client-side matrix and day strip are all drawn from this."""
+    dead = {r[0] for r in c.execute("SELECT supersedes FROM memories WHERE supersedes IS NOT NULL")}
+    return [[r["id"], r["kind"], r["scope"], r["ts"], r["id"] in dead, bool(r["entities"].strip())]
+            for r in c.execute("SELECT id, kind, scope, ts, entities FROM memories ORDER BY id")]
+
+
+OVERVIEW_CACHE = {}
+
+
+def serve_overview(c, lock):
+    """What the store holds and what needs a hand. Runs the real wake once per
+    scope for the cost bars, so it is cached on the store key."""
+    key = store_key(c)
+    if OVERVIEW_CACHE.get("key") == key:
+        return OVERVIEW_CACHE["data"]
+    scopes = [r[0] for r in c.execute("SELECT DISTINCT scope FROM memories ORDER BY scope='global' DESC, scope")]
+    dead = {r[0] for r in c.execute("SELECT supersedes FROM memories WHERE supersedes IS NOT NULL")}
+    rows = c.execute("SELECT * FROM memories ORDER BY id").fetchall()
+    live_rows = [r for r in rows if r["id"] not in dead]
+
+    groups = {}
+    for r in live_rows:
+        groups.setdefault(norm(r["text"]), []).append(r)
+    dups = [[m["id"] for m in g] for g in groups.values() if len({m["scope"] for m in g}) > 1]
+
+    # Each scope judged as its own wake would see it: pending() sizes the
+    # budget from the current project, so set that project per scope.
+    due, wake_cost = {}, {}
+    for sc in scopes:
+        with lock:
+            old = os.environ.get("SEGMEM_PROJECT")
+            os.environ["SEGMEM_PROJECT"] = sc
+            try:
+                out = capture(cmd_wake, [])
+                T = stream_len(c, "episodic", sc)
+                if T:
+                    due[sc] = {"T": T, "budget": budget_for(sc),
+                               "pending": len(pending(c, "episodic", sc, T))}
+            finally:
+                if old is None:
+                    os.environ.pop("SEGMEM_PROJECT", None)
+                else:
+                    os.environ["SEGMEM_PROJECT"] = old
+        wake_cost[sc] = {"tokens": -(-len(out.encode()) // 4), "lines": out.count("\n") + 1}
+
+    hot, pressed = [], []
+    for row, p, n, since, reviewed, kept in note_pressure(c, scopes):
+        if p < PROC_STALE_MIN or kept:
+            continue
+        (hot if reviewed else pressed).append(
+            {"id": row["id"], "scope": row["scope"], "text": row["text"], "pressure": p, "since": since[:10]})
+    dossiers = [{"entity": e, "pressure": p, "since": since[:10]}
+                for e, p, n, since in dossier_pressure(c) if p >= STALE_MIN]
+
+    overrides = 0
+    for kind in ("identity", "procedural"):
+        kr = [r for r in live_rows if r["kind"] == kind]
+        glob = [r for r in kr if r["scope"] == GLOBAL]
+        for pr in (r for r in kr if r["scope"] != GLOBAL):
+            overrides += sum(1 for g in glob if entity_set(pr) & entity_set(g))
+
+    data = {"total": len(rows), "live": len(live_rows), "superseded": len(dead),
+            "summaries": c.execute("SELECT COUNT(*) FROM summaries").fetchone()[0],
+            "scopes": scopes, "tags": len(known_tags(c)),
+            "untagged": [r["id"] for r in live_rows if not r["entities"].strip()],
+            "duplicates": dups, "due": due, "wake": wake_cost,
+            "hot": hot, "pressed": pressed, "dossiers": dossiers, "overrides": overrides,
+            "thresholds": {"procedural": PROC_STALE_MIN, "people": STALE_MIN}}
+    OVERVIEW_CACHE.update(key=key, data=data)
+    return data
+
+
 def cmd_serve(c, args):
     import json, threading, time, webbrowser
     from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -1636,6 +1716,10 @@ def cmd_serve(c, args):
                     data = serve_search(db, q.get("q", ""), f)
                 elif name == "feed":
                     data = serve_feed(db)
+                elif name == "spine":
+                    data = serve_spine(db)
+                elif name == "overview":
+                    data = serve_overview(db, lock)
                 else:
                     data = None
             finally:
@@ -1688,135 +1772,271 @@ def cmd_serve(c, args):
         srv.server_close()
 
 
-SERVE_PAGE = r"""<!doctype html><meta charset="utf-8"><title>segmem</title>
+SERVE_PAGE = r"""<!doctype html><html lang="en"><meta charset="utf-8"><title>segmem</title>
 <meta name="viewport" content="width=device-width">
 <style>
-:root{--bg:#fff;--fg:#1a1a1a;--mut:#6b6b6b;--line:#e3e3e3;--acc:#2a62d9;--warn:#b7521a;--fill:#dbe6fb;--card:#f7f7f8;--ok:#3a9a5b;--mark:#fff3b0}
-@media(prefers-color-scheme:dark){:root{--bg:#131416;--fg:#e8e8e8;--mut:#9a9a9a;--line:#2c2e33;--acc:#7aa2f7;--warn:#e6a06b;--fill:#23314f;--card:#1b1d21;--ok:#7fbf8a;--mark:#4a4320}}
-*{box-sizing:border-box}html,body{height:100%}body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.5 ui-sans-serif,system-ui,sans-serif;display:flex;flex-direction:column}
-code,.mono,#wake,.gut{font-family:ui-monospace,Menlo,Consolas,monospace}
-header{display:flex;align-items:center;gap:16px;padding:0 20px;height:46px;border-bottom:1px solid var(--line);flex-shrink:0}
-header h1{font-size:14px;margin:0}header .mut{font-size:12px}
-nav{display:flex;gap:4px}nav button{background:none;border:1px solid transparent;color:var(--mut);padding:5px 10px;border-radius:6px;cursor:pointer;font:inherit}
-nav button.on{color:var(--fg);border-color:var(--line);background:var(--card)}
-#live{margin-left:auto;display:flex;align-items:center;gap:8px;color:var(--mut);font-size:12px}#live i{width:8px;height:8px;border-radius:50%;background:var(--mut);display:inline-block}
-#live.on i{background:var(--ok);animation:pulse 1.6s ease-in-out infinite}@keyframes pulse{50%{opacity:.35}}
+/* Tokens: warm paper by day, ink by night. Four fixed kind hues carry meaning
+   on every view; the accent is for chrome and one-hue charts only. */
+:root{color-scheme:light;--bg:#f4f1ea;--surface:#fbf9f5;--surface-2:#ece8df;--line:#d9d3c7;--line-2:#c4bdad;--ink:#1a1917;--ink-2:#55524a;--mute:#8a867c;--accent:#a55e00;--accent-ink:#fff8ec;
+--k-identity:#a55e00;--k-procedural:#008c60;--k-episodic:#3370c7;--k-people:#b0457b;--soft:22;--shadow:0 1px 0 #ffffff80 inset,0 8px 24px -16px #1a191766}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){color-scheme:dark;--bg:#0f1216;--surface:#151920;--surface-2:#1c212a;--line:#2a313c;--line-2:#3a4351;--ink:#e9e6df;--ink-2:#a9a597;--mute:#6f6d66;--accent:#c38323;--accent-ink:#14100a;
+--k-identity:#c38323;--k-procedural:#15ab83;--k-episodic:#5e93e1;--k-people:#cd6e9a;--shadow:0 1px 0 #ffffff0a inset,0 12px 32px -20px #000000cc}}
+:root[data-theme=dark]{color-scheme:dark;--bg:#0f1216;--surface:#151920;--surface-2:#1c212a;--line:#2a313c;--line-2:#3a4351;--ink:#e9e6df;--ink-2:#a9a597;--mute:#6f6d66;--accent:#c38323;--accent-ink:#14100a;
+--k-identity:#c38323;--k-procedural:#15ab83;--k-episodic:#5e93e1;--k-people:#cd6e9a;--shadow:0 1px 0 #ffffff0a inset,0 12px 32px -20px #000000cc}
+*{box-sizing:border-box}html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 "IBM Plex Sans",ui-sans-serif,system-ui,sans-serif;font-feature-settings:"tnum" 1;-webkit-font-smoothing:antialiased;display:flex;flex-direction:column}
+body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;background-image:radial-gradient(1200px 600px at 10% -10%,color-mix(in oklab,var(--accent) 9%,transparent),transparent 60%),repeating-linear-gradient(0deg,transparent 0 27px,color-mix(in oklab,var(--line) 45%,transparent) 27px 28px);mask-image:linear-gradient(to bottom,#000 0,#000 40%,transparent 100%)}
+header,main{position:relative;z-index:1}
+.display,h1,h2,h3{font-family:"Instrument Serif","Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;font-weight:400;letter-spacing:-.01em}
+code,pre,.mono,#wake,.gut{font-family:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
+.eyebrow{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--mute)}
+.num{font-variant-numeric:tabular-nums}.mut{color:var(--mute)}.ink2{color:var(--ink-2)}.acc{color:var(--accent)}
+.dead{color:var(--mute);text-decoration:line-through;text-decoration-color:color-mix(in oklab,var(--mute) 60%,transparent)}
+.k-identity{color:var(--k-identity)}.k-procedural{color:var(--k-procedural)}.k-episodic{color:var(--k-episodic)}.k-people{color:var(--k-people)}
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow)}
+.panel>.ph{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;padding:14px 16px 0}.panel>.ph h2{margin:2px 0 0;font-size:20px;line-height:1.1}.panel>.ph .r{font-size:12px;color:var(--mute);padding-bottom:2px}
+.panel>.pb{padding:12px 16px 16px}
+.btn,button.chip,button.cp{font:inherit;font-size:12px;border:1px solid var(--line);background:var(--surface);color:var(--ink-2);border-radius:6px;padding:4px 10px;cursor:pointer}
+.btn:hover,button.chip:hover,button.cp:hover{border-color:var(--line-2);background:var(--surface-2);color:var(--ink)}
+button.chip.on{background:var(--accent);color:var(--accent-ink);border-color:transparent}
+.k{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:0 8px;font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:11px;line-height:18px;color:var(--ink-2);white-space:nowrap}
+.k i{width:7px;height:7px;border-radius:50%;display:inline-block;background:currentColor}
+.k.identity i{background:var(--k-identity)}.k.procedural i{background:var(--k-procedural)}.k.episodic i{background:var(--k-episodic)}.k.people i{background:var(--k-people)}
+mark{background:color-mix(in oklab,var(--accent) 30%,transparent);color:inherit;border-radius:2px;padding:0 1px}
+a.ent,.ent{color:var(--accent);cursor:pointer;text-decoration:none}a.ent:hover,.ent:hover{text-decoration:underline}
+.tag{display:inline-block;font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:11.5px;border:1px solid var(--line);background:color-mix(in oklab,var(--surface-2) 60%,transparent);color:var(--ink-2);border-radius:4px;padding:0 6px;line-height:18px;cursor:pointer;text-decoration:none}.tag:hover{color:var(--ink);border-color:var(--line-2)}
+input{font:inherit;color:inherit;background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:6px 9px}
+:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+*{scrollbar-width:thin;scrollbar-color:var(--line-2) transparent}
+@keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.rise>*{animation:rise .5s cubic-bezier(.2,.7,.2,1) both}.rise>*:nth-child(2){animation-delay:.05s}.rise>*:nth-child(3){animation-delay:.1s}.rise>*:nth-child(4){animation-delay:.15s}.rise>*:nth-child(n+5){animation-delay:.2s}
+@media(prefers-reduced-motion:reduce){.rise>*{animation:none}}
+/* header */
+header{position:sticky;top:0;z-index:30;border-bottom:1px solid var(--line);background:color-mix(in oklab,var(--bg) 85%,transparent);backdrop-filter:blur(8px)}
+.hrow{max-width:1400px;margin:0 auto;padding:10px 20px 0;display:flex;align-items:baseline;gap:22px}
+.hrow h1{margin:0;font-size:26px;line-height:1}.hrow h1 b{color:var(--accent);font-weight:400}
+nav{display:flex;gap:2px}nav button{background:none;border:0;color:var(--ink-2);padding:4px 10px;border-radius:6px;cursor:pointer;font:inherit;font-size:13px}
+nav button:hover{color:var(--ink)}nav button.on{background:var(--surface-2);color:var(--ink)}nav button kbd{font:11px "IBM Plex Mono",ui-monospace,monospace;color:var(--mute);margin-left:4px}
+.hright{margin-left:auto;display:flex;align-items:center;gap:14px;font-size:12px;color:var(--mute)}
+#live{display:flex;align-items:center;gap:6px}#live i{width:8px;height:8px;border-radius:50%;background:var(--mute);display:inline-block}
+#live.on i{background:var(--k-procedural);box-shadow:0 0 0 3px color-mix(in oklab,var(--k-procedural) 25%,transparent)}
+#spine{max-width:1400px;margin:0 auto;padding:8px 20px 8px;display:block}#spine svg{display:block;width:100%;height:14px}#spine rect{cursor:pointer}
+main{flex:1;min-height:0;display:flex;flex-direction:column}
 section{display:none;flex:1;min-height:0;flex-direction:column}section.on{display:flex}
-.mut{color:var(--mut)}.warn{color:var(--warn)}.dead{opacity:.55;text-decoration:line-through}
-button.chip,button.cp{font:inherit;font-size:12px;padding:3px 10px;border:1px solid var(--line);background:var(--bg);color:var(--mut);border-radius:6px;cursor:pointer}
-button.chip.on{color:var(--fg);background:var(--fill);border-color:var(--acc)}
-.k{display:inline-block;padding:0 7px;border-radius:10px;font-size:11px;border:1px solid var(--line);background:var(--card)}
-.k.identity{border-color:var(--acc)}.k.procedural{border-color:var(--ok)}.k.episodic{border-color:var(--mut)}.k.people{border-color:#b05ab0}
+.wrap{max-width:1400px;width:100%;margin:0 auto;padding:18px 20px 28px}
+.vh{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:14px;margin-bottom:16px}.vh h2{margin:2px 0 0;font-size:34px;line-height:1}
+/* overview */
+.stats{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin-bottom:16px}
+.stat{padding:12px 16px}.stat .v{font-size:30px;line-height:1;margin-top:4px}.stat .s{font-size:12px;color:var(--mute);margin-top:6px}
+.g12{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:16px}.c7{grid-column:span 7}.c5{grid-column:span 5}.c12{grid-column:span 12}
+@media(max-width:1100px){.stats{grid-template-columns:repeat(3,minmax(0,1fr))}.c7,.c5{grid-column:span 12}}
+table.mx{border-collapse:separate;border-spacing:2px;width:100%}table.mx th{font-weight:400;text-align:right;padding:0 6px 4px}table.mx th:first-child{text-align:left}
+table.mx td{padding:0}table.mx td button{display:block;width:100%;height:32px;border:0;border-radius:3px;text-align:right;padding:0 8px;font:12.5px "IBM Plex Mono",ui-monospace,monospace;cursor:pointer;transition:transform .12s}table.mx td button:hover{transform:scale(1.03);box-shadow:0 0 0 1px var(--line-2)}
+table.mx td.t,table.mx tr.t td{text-align:right;padding:2px 6px;color:var(--ink-2);font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:12.5px}
+.days{display:flex;align-items:flex-end;gap:6px;height:210px;padding-top:22px;position:relative}.days .grid{position:absolute;left:0;right:0;border-top:1px dashed var(--line)}
+.day{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%;min-width:0}
+.day .bar{width:64%;display:flex;flex-direction:column-reverse;gap:2px}.day .bar i{display:block;border-radius:2px}
+.day .n{font:11px "IBM Plex Mono",ui-monospace,monospace;color:var(--ink-2);margin-bottom:4px}.day .d{font:10.5px "IBM Plex Mono",ui-monospace,monospace;color:var(--mute);margin-top:6px;white-space:nowrap}
+.wb{display:grid;grid-template-columns:120px 1fr 64px;align-items:center;gap:10px;margin:6px 0;cursor:pointer}.wb span:first-child{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:12px;color:var(--ink-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.wb:hover span:first-child{color:var(--ink)}
+.wb .tr{height:12px;background:var(--surface-2);border-radius:2px}.wb .tr i{display:block;height:100%;border-radius:2px;background:color-mix(in oklab,var(--accent) 75%,var(--surface))}.wb span:last-child{text-align:right;font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:12px;color:var(--ink-2)}
+ul.hy{list-style:none;margin:0;padding:0}ul.hy li{display:flex;justify-content:space-between;gap:16px;padding:10px 0;border-top:1px solid var(--line)}ul.hy li:first-child{border-top:0;padding-top:2px}
+ul.hy .lb{font-size:14px}ul.hy .sb{font-size:12px;color:var(--mute);margin-top:2px}ul.hy b{font-size:24px;line-height:1;color:var(--mute);flex-shrink:0}ul.hy b.warn{color:var(--k-identity)}
+ul.hy .ids{display:flex;flex-wrap:wrap;gap:6px 10px;margin-top:6px;font-size:12px}
+.due{display:grid;grid-template-columns:110px 1fr auto;align-items:center;gap:10px;font-size:12px;margin-top:6px}.due .tr{height:6px;border-radius:3px;background:var(--surface-2)}.due .tr i{display:block;height:100%;border-radius:3px;background:var(--k-episodic)}
+.legend{display:flex;gap:16px;font-size:12px;color:var(--ink-2)}.legend span{display:inline-flex;align-items:center;gap:6px;font-family:"IBM Plex Mono",ui-monospace,monospace}.legend i{width:10px;height:10px;border-radius:2px;display:inline-block}
 /* console */
-#scopes{display:flex;gap:6px;padding:10px 20px;border-bottom:1px solid var(--line);flex-wrap:wrap;align-items:center}
-.split{display:grid;grid-template-columns:3fr 2fr;flex:1;min-height:0}
-.wake{border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
-.ph{padding:10px 20px 8px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:baseline;flex-shrink:0}.ph b{font-weight:600}
-#wake{overflow:auto;padding:8px 0 14px;font-size:12.5px;line-height:1.55}
-#wake .hd{padding:10px 20px 2px;color:var(--mut)}#wake .pl{padding:2px 20px;color:var(--mut)}
-#wake .ln{padding:3px 20px;cursor:pointer;display:flex;gap:12px;white-space:pre-wrap;word-break:break-word}#wake .ln:hover{background:var(--card)}
-#wake .ln.on{background:var(--fill);box-shadow:inset 2px 0 var(--acc)}
-#wake .gut{color:var(--acc);flex-shrink:0;min-width:34px;text-align:right}#wake .tx{flex:1}#wake .rid{color:var(--mut);font-size:11px;flex-shrink:0}
-#wake .sum{color:var(--fg)}#wake .sum .gut{color:var(--mut)}
-#insp{overflow:auto;padding:12px 20px 20px;background:var(--card)}
-#insp h4{margin:16px 0 6px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);font-weight:500}
-#insp p{margin:4px 0}.fh{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}.ft{font-size:13.5px;line-height:1.6}
-.bar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;margin:4px 0}.bar i{display:block;height:100%;background:var(--acc)}.bar i.hot{background:var(--warn)}
-.cmd{display:flex;align-items:center;gap:10px;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin:6px 0}.cmd code{flex:1;font-size:12px;word-break:break-all}
-a.ent,.ent{color:var(--acc);cursor:pointer}a.ent:hover{text-decoration:underline}
-#insp .ln{cursor:pointer;padding:4px 0}#insp .ln:hover{color:var(--acc)}
-.ticker{height:38px;border-top:1px solid var(--line);display:flex;align-items:center;gap:22px;padding:0 20px;font-size:12px;white-space:nowrap;overflow:hidden;flex-shrink:0}
-.ticker .new{padding:0 6px;border-radius:3px;background:var(--fill);color:var(--acc);font-size:11px}
+#scopes{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.split{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:16px;min-height:0;flex:1}
+#wake{overflow:auto;max-height:calc(100vh - 300px);padding:6px 0 10px;line-height:1.6}
+#wake .hd{padding:10px 16px 2px;font-weight:500}#wake .pl{padding:2px 16px;color:var(--ink-2)}#wake .pl.awake{color:var(--accent)}
+#wake .ln{padding:3px 16px;cursor:pointer;display:flex;gap:12px;white-space:pre-wrap;word-break:break-word}#wake .ln:hover{background:var(--surface-2)}
+#wake .ln.on{background:color-mix(in oklab,var(--accent) 14%,transparent);box-shadow:inset 2px 0 var(--accent)}
+#wake .gut{color:var(--accent);flex-shrink:0;min-width:36px;text-align:right}#wake .tx{flex:1}#wake .rid{color:var(--mute);font-size:11px;flex-shrink:0}
+#wake .ov{background:var(--accent);color:var(--accent-ink);border-radius:3px;padding:0 4px}
+#insp{overflow:auto;max-height:calc(100vh - 300px)}#insp h4{margin:16px 0 6px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--mute);font-weight:400;font-family:"IBM Plex Mono",ui-monospace,monospace}
+#insp p{margin:4px 0}.fh{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}.fh .id{font-size:24px}.ft{font-size:15px;line-height:1.55}
+.bar{height:6px;background:var(--surface-2);border-radius:3px;overflow:hidden;margin:4px 0}.bar i{display:block;height:100%;background:var(--accent)}.bar i.hot{background:var(--k-identity)}
+.cmd{display:flex;align-items:flex-start;gap:10px;background:color-mix(in oklab,var(--bg) 60%,transparent);border:1px solid var(--line);border-radius:6px;padding:8px 10px;margin:6px 0}.cmd code{flex:1;color:var(--ink-2);word-break:break-all;white-space:pre-wrap}
+#insp .ln{cursor:pointer;padding:4px 0}#insp .ln:hover{color:var(--accent)}
+.ticker{display:flex;align-items:center;gap:22px;padding:10px 16px;font-size:12px;white-space:nowrap;overflow:hidden}.ticker .new{padding:0 6px;border-radius:3px;background:var(--accent);color:var(--accent-ink);font-size:11px}
 /* ledger */
-.qbar{display:flex;gap:12px;align-items:center;padding:12px 20px;border-bottom:1px solid var(--line);flex-shrink:0}
-#q{flex:1;font:inherit;font-family:ui-monospace,Menlo,monospace;font-size:14px;padding:8px 12px;border:1px solid var(--fg);border-radius:8px;background:var(--bg);color:var(--fg)}
-.ledger3{display:grid;grid-template-columns:220px 1fr 300px;flex:1;min-height:0}
-#facets{border-right:1px solid var(--line);padding:12px 14px;overflow:auto;font-size:12px}
-#facets h4{margin:12px 0 4px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);font-weight:500}#facets h4:first-child{margin-top:0}
-#facets .f{display:flex;justify-content:space-between;padding:1px 6px;margin:0 -6px;border-radius:4px;cursor:pointer}#facets .f:hover{background:var(--card)}#facets .f.on{background:var(--fill);color:var(--acc)}
-#facets .f span:last-child{color:var(--mut);font-variant-numeric:tabular-nums}
-#results{overflow:auto}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);vertical-align:top}
-th{color:var(--mut);font-weight:500;font-size:11px;position:sticky;top:0;background:var(--bg)}td.id,td.ts{color:var(--mut);white-space:nowrap;font-variant-numeric:tabular-nums}
-tr.r{cursor:pointer}tr.r:hover td{background:var(--card)}tr.r.on td{background:var(--card)}td.x{padding:4px 20px 14px 60px;background:var(--card)}
-td.x h4{margin:12px 0 4px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);font-weight:500}td.x p{margin:4px 0}
-mark{background:var(--mark);color:inherit}
-#feed{border-left:1px solid var(--line);overflow:auto;font-size:12px;background:var(--card)}
-#feed .fh2{padding:10px 14px;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center;font-weight:500}
-#feed .ev{padding:8px 14px;border-bottom:1px solid var(--line)}#feed .ev.new{background:var(--mark)}#feed .ev .ts{color:var(--mut);font-size:11px}
-.empty{padding:14px 20px;color:var(--mut)}
+.qbar{display:flex;gap:12px;align-items:center;margin-bottom:14px}
+#q{flex:1;font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:14px;padding:9px 12px;border-radius:8px}
+.ledger3{display:grid;grid-template-columns:220px minmax(0,1fr) 300px;gap:16px;min-height:0}
+#facets{font-size:12px}#facets h4{margin:14px 0 4px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--mute);font-weight:400;font-family:"IBM Plex Mono",ui-monospace,monospace}#facets h4:first-child{margin-top:0}
+#facets .f{display:flex;justify-content:space-between;padding:2px 6px;margin:0 -6px;border-radius:4px;cursor:pointer}#facets .f:hover{background:var(--surface-2)}#facets .f.on{background:var(--accent);color:var(--accent-ink)}#facets .f.on span{color:inherit}
+#facets .f span:last-child{color:var(--mute);font-family:"IBM Plex Mono",ui-monospace,monospace}
+#results{overflow:auto;max-height:calc(100vh - 260px)}table.rs{border-collapse:collapse;width:100%;table-layout:fixed}table.rs th:nth-child(1){width:60px}table.rs th:nth-child(2){width:62px}table.rs th:nth-child(3){width:118px}table.rs th:nth-child(4){width:130px}table.rs th:nth-child(5){width:44px}table.rs td{overflow-wrap:anywhere}table.rs th,table.rs td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+table.rs th{font-weight:400;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--mute);font-family:"IBM Plex Mono",ui-monospace,monospace;position:sticky;top:0;background:var(--surface)}
+table.rs th.tg{width:180px}td.tg div{display:flex;flex-wrap:wrap;gap:4px}td.id{color:var(--accent);font-family:"IBM Plex Mono",ui-monospace,monospace;white-space:nowrap}td.ts,td.sq{color:var(--mute);white-space:nowrap;font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:12px}
+tr.r{cursor:pointer}tr.r:hover td{background:var(--surface-2)}tr.r.on td{background:var(--surface-2)}td.x{padding:6px 20px 16px 56px;background:color-mix(in oklab,var(--surface-2) 60%,transparent)}
+td.x h4{margin:12px 0 4px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--mute);font-weight:400;font-family:"IBM Plex Mono",ui-monospace,monospace}td.x p{margin:4px 0}
+#feed{font-size:12px;overflow:auto;max-height:calc(100vh - 260px)}#feed .ev{padding:8px 16px;border-top:1px solid var(--line)}#feed .ev.new{background:color-mix(in oklab,var(--accent) 14%,transparent)}#feed .ev .ts{color:var(--mute);font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:11px}
+.empty{padding:20px;color:var(--mute);text-align:center}
 </style>
-<header><h1>segmem</h1><span class="mut" id="dbp"></span>
-<nav><button data-t="console" class="on">console</button><button data-t="ledger">ledger</button></nav>
-<span id="live"><i></i><span id="livetxt">connecting</span></span></header>
-<section id="console" class="on">
-  <div id="scopes"></div>
-  <div class="split">
-    <div class="wake"><div class="ph"><b>What the agent sees at wake</b><span class="mut">byte-identical to <code>segmem wake</code>; click a line</span></div><div id="wake"></div></div>
-    <div id="insp"><p class="mut">Select a line to see why it prints.</p></div>
+<header>
+  <div class="hrow">
+    <h1 class="display">seg<b>·</b>mem</h1>
+    <nav><button data-t="overview" class="on">overview<kbd>go</kbd></button><button data-t="console">console<kbd>gc</kbd></button><button data-t="ledger">ledger<kbd>gl</kbd></button></nav>
+    <div class="hright"><span class="mono num" id="hmeta"></span><span id="live"><i></i><span id="livetxt">connecting</span></span><button class="btn" id="theme" aria-label="toggle theme">◐</button></div>
   </div>
-  <div class="ticker" id="ticker"></div>
-</section>
-<section id="ledger">
-  <div class="qbar"><input id="q" placeholder="search every kind and scope (FTS5 syntax)" autocomplete="off"><span class="mut" id="qmeta"></span></div>
-  <div class="ledger3"><aside id="facets"></aside><div id="results"></div><aside id="feed"></aside></div>
-</section>
+  <div id="spine"></div>
+</header>
+<main>
+<section id="overview" class="on"><div class="wrap rise" id="ov"><p class="mut">loading</p></div></section>
+<section id="console"><div class="wrap rise" style="display:flex;flex-direction:column;gap:14px;flex:1;min-height:0">
+  <div class="vh"><div><div class="eyebrow">what the agent is told at session start</div><h2 class="display">Console</h2></div><div id="scopes"></div></div>
+  <div class="split">
+    <div class="panel"><div class="ph"><div><div class="eyebrow" id="wake-eb">segmem wake</div><h2>Output · <i>verbatim</i></h2></div><div class="r">click a line to see why it prints</div></div><div id="wake"></div></div>
+    <div class="panel"><div class="pb" id="insp"><p class="mut">Select a line.</p></div></div>
+  </div>
+  <div class="panel ticker" id="ticker"></div>
+</div></section>
+<section id="ledger"><div class="wrap rise" style="display:flex;flex-direction:column;flex:1;min-height:0">
+  <div class="vh"><div><div class="eyebrow">browse, filter, and search the store</div><h2 class="display">Ledger</h2></div><span class="mut" id="qmeta"></span></div>
+  <div class="qbar"><input id="q" placeholder="search text and tags  ( / )" autocomplete="off"></div>
+  <div class="ledger3"><aside id="facets"></aside><div class="panel" id="results"></div><aside class="panel" id="feed"></aside></div>
+</div></section>
+</main>
 <script>
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const KINDS = ['identity', 'procedural', 'episodic', 'people'];
 const short = s => s === 'global' ? 'global' : String(s).split('/').pop();
-const S = {tab: 'console', scope: null, sel: null, q: '', f: {}, writes: 0, me: 'segmem', open: [], newest: null};
+const slabel = s => s === 'global' ? '◎ global' : '▸ ' + short(s);
+const fmt = n => Number(n).toLocaleString();
+const S = {tab: 'overview', scope: null, sel: null, q: '', f: {}, writes: 0, me: 'segmem', open: [], newest: null, spine: []};
 const j = async u => (await fetch(u)).json();
-const fmtCounts = n => ['note','recall','prompt'].filter(k => n[k]).map(k => `${n[k]} ${k}${n[k] === 1 ? '' : 's'}`).join(', ') || 'no touches';
+const fmtCounts = n => ['note', 'recall', 'prompt'].filter(k => n[k]).map(k => `${n[k]} ${k}${n[k] === 1 ? '' : 's'}`).join(', ') || 'no touches';
+const rel = ts => { const m = Math.round((Date.now() - new Date(ts)) / 60000); return m < 1 ? 'now' : m < 60 ? m + 'm ago' : m < 1440 ? Math.round(m / 60) + 'h ago' : Math.round(m / 1440) + 'd ago'; };
+const localDay = ts => { const d = new Date(ts); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+const dayLabel = day => { const [y, m, d] = day.split('-').map(Number); return new Date(y, m - 1, d, 12).toLocaleDateString(undefined, {month: 'short', day: 'numeric'}); };
+
+// ---- theme
+const root = document.documentElement;
+try { const t = localStorage.getItem('segmem.theme'); if (t) root.dataset.theme = t; } catch (e) {}
+$('#theme').onclick = () => { const dark = root.dataset.theme === 'dark' || (!root.dataset.theme && matchMedia('(prefers-color-scheme: dark)').matches); root.dataset.theme = dark ? 'light' : 'dark'; try { localStorage.setItem('segmem.theme', root.dataset.theme); } catch (e) {} };
+
+// ---- spine: every memory as one tick, id order, kind hue, superseded hollow
+async function loadSpine() {
+  const sp = await j('/api/spine'); S.spine = sp;
+  const n = sp.length || 1, W = 1000, H = 14, w = Math.max(W / n - 0.5, 0.75);
+  $('#spine').innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="${n} memories">` + sp.map(([id, kind, scope, ts, dead], i) => {
+    const h = kind === 'episodic' ? H : kind === 'people' ? H * 0.55 : H * 0.8;
+    const dim = S.sel && S.sel !== id ? ' opacity=".35"' : '';
+    return `<rect x="${(i / n * W).toFixed(2)}" y="${H - h}" width="${w.toFixed(2)}" height="${h}" rx=".5" fill="${dead ? 'none' : `var(--k-${kind})`}" stroke="${dead ? `var(--k-${kind})` : 'none'}" stroke-width="${dead ? .6 : 0}"${dim} data-id="${id}"><title>#${id} ${kind} · ${short(scope)}${dead ? ' · superseded' : ''}</title></rect>`;
+  }).join('') + '</svg>';
+  const last = sp[sp.length - 1];
+  const scopes = new Set(sp.map(r => r[2]));
+  $('#hmeta').textContent = `${fmt(n)} memories · ${scopes.size} scopes${last ? ' · last ' + rel(last[3]) : ''}`;
+}
+
+// ---- overview
+// TODO(Mark): the stat row is yours. Six tiles, each {label, value(o, live), sub(o), tone}.
+// `o` is /api/overview, `live` the live spine rows. Tone: 'accent' | 'mute' | a kind name | ''.
+const STATS = [
+  {label: 'live memories', value: o => fmt(o.live), sub: o => `${fmt(o.total)} noted in all`, tone: 'accent'},
+  {label: 'under pressure', value: o => o.hot.length + o.pressed.length + o.dossiers.length, sub: o => `${o.hot.length} hot · ${o.pressed.length} to verify · ${o.dossiers.length} dossier${o.dossiers.length === 1 ? '' : 's'}`, tone: o => (o.hot.length + o.pressed.length + o.dossiers.length) ? 'identity' : 'mute'},
+  {label: 'superseded', value: o => fmt(o.superseded), sub: o => `${Math.round(100 * o.superseded / Math.max(o.total, 1))}% of the store`, tone: 'mute'},
+  {label: 'summaries', value: o => fmt(o.summaries), sub: o => o.summaries ? 'episodic blocks compressed' : 'nothing compressed yet'},
+  {label: 'scopes', value: o => o.scopes.length, sub: o => `global + ${Math.max(o.scopes.length - 1, 0)} projects`},
+  {label: 'untagged', value: o => `${Math.round(100 * o.untagged.length / Math.max(o.live, 1))}%`, sub: o => `${o.untagged.length} live facts carry no tag · ${o.tags} tags`, tone: o => o.untagged.length / Math.max(o.live, 1) > 0.2 ? 'identity' : ''},
+];
+async function loadOverview() {
+  const [o] = await Promise.all([j('/api/overview'), S.spine.length ? null : loadSpine()]);
+  const live = S.spine.filter(r => !r[4]);
+  const tone = t => typeof t === 'function' ? t(o) : (t || '');
+  const cls = t => t === 'accent' ? 'acc' : t === 'mute' ? 'mut' : t ? 'k-' + t : '';
+  let h = `<div class="vh"><div><div class="eyebrow">store · ${esc(S.db || '')}</div><h2 class="display">What the agent knows</h2></div>
+    <div class="legend">${KINDS.map(k => `<span><i style="background:var(--k-${k})"></i>${k}</span>`).join('')}</div></div>`;
+  h += `<div class="stats">` + STATS.map(s => `<div class="panel stat"><div class="eyebrow">${esc(s.label)}</div><div class="display num v ${cls(tone(s.tone))}">${s.value(o, live)}</div><div class="s">${s.sub ? s.sub(o) : ''}</div></div>`).join('') + `</div>`;
+  // matrix
+  const cell = {}; live.forEach(r => { cell[r[2] + ' ' + r[1]] = (cell[r[2] + ' ' + r[1]] || 0) + 1; });
+  const max = Math.max(1, ...Object.values(cell));
+  const fill = n => n ? `color-mix(in oklab, var(--accent) ${Math.round(18 + 72 * Math.sqrt(n / max))}%, var(--surface))` : 'transparent';
+  const inkc = n => n / max > 0.55 ? 'var(--accent-ink)' : 'var(--ink)';
+  const scopes = o.scopes;
+  h += `<div class="g12"><div class="panel c7"><div class="ph"><div><div class="eyebrow">kind × scope</div><h2>Where the facts live</h2></div><div class="r">live only · click a cell to browse</div></div><div class="pb"><table class="mx"><thead><tr><th class="eyebrow">scope</th>${KINDS.map(k => `<th class="mono k-${k}" style="font-size:11px">${k}</th>`).join('')}<th class="eyebrow">live</th></tr></thead><tbody>` +
+    scopes.map(s => `<tr><th class="mono ink2" style="font-size:12px;text-align:left;font-weight:400" title="${esc(s)}">${esc(slabel(s))}</th>${KINDS.map(k => { const n = cell[s + ' ' + k] || 0; return `<td><button data-mx="${esc(s)}|${k}" style="background:${fill(n)};color:${n ? inkc(n) : 'var(--mute)'}" title="${n} live ${k} in ${esc(short(s))}">${n || '·'}</button></td>`; }).join('')}<td class="t num">${KINDS.reduce((a, k) => a + (cell[s + ' ' + k] || 0), 0)}</td></tr>`).join('') +
+    `<tr class="t"><th class="eyebrow" style="text-align:left">live</th>${KINDS.map(k => `<td class="num k-${k}">${scopes.reduce((a, s) => a + (cell[s + ' ' + k] || 0), 0)}</td>`).join('')}<td class="num" style="color:var(--ink)">${o.live}</td></tr></tbody></table></div></div>`;
+  // day strip, local days
+  const days = {}; S.spine.forEach(r => { const d = localDay(r[3]); (days[d] = days[d] || {})[r[1]] = (days[d][r[1]] || 0) + 1; });
+  const dk = Object.keys(days).sort(); const dmax = Math.max(1, ...dk.map(d => KINDS.reduce((a, k) => a + (days[d][k] || 0), 0)));
+  h += `<div class="panel c5"><div class="ph"><div><div class="eyebrow">notes per day</div><h2>When they were written</h2></div><div class="r">${dk.length ? `${dayLabel(dk[0])} → ${dayLabel(dk[dk.length - 1])}` : ''}</div></div><div class="pb"><div class="days"><div class="grid" style="top:50%"></div><div class="grid" style="top:22px"></div>` +
+    dk.map(d => { const tot = KINDS.reduce((a, k) => a + (days[d][k] || 0), 0); return `<div class="day" title="${dayLabel(d)} · ${tot} notes"><div class="n">${tot}</div><div class="bar" style="height:${(tot / dmax * 160).toFixed(0)}px">${KINDS.filter(k => days[d][k]).map(k => `<i style="flex:${days[d][k]};background:var(--k-${k})"></i>`).join('')}</div><div class="d">${dayLabel(d)}</div></div>`; }).join('') + `</div></div></div>`;
+  // wake cost
+  const wk = Object.entries(o.wake).sort((a, b) => b[1].tokens - a[1].tokens); const wmax = Math.max(1, ...wk.map(([, w]) => w.tokens));
+  h += `<div class="panel c5"><div class="ph"><div><div class="eyebrow">wake cost</div><h2>What a session pays</h2></div><div class="r">≈ bytes ÷ 4 · from the real command</div></div><div class="pb">` +
+    wk.map(([s, w]) => `<div class="wb" data-s="${esc(s)}" title="${w.lines} lines; open in console"><span>${esc(slabel(s))}</span><span class="tr"><i style="width:${(w.tokens / wmax * 100).toFixed(1)}%"></i></span><span class="num">≈${fmt(w.tokens)}</span></div>`).join('') +
+    `<p class="mut" style="font-size:12px;margin:12px 0 0">Every project wake carries global identity and procedural facts, the people names, and its own episodic cover at budget ${S.budget || 64}.</p></div></div>`;
+  // what needs a hand
+  const idlist = xs => xs.map(x => `<a class="ent mono" data-id="${x.id}" title="${esc(x.text)}">#${x.id}</a> <span class="mut">${esc(short(x.scope))}</span>`).join(' ');
+  const due = Object.entries(o.due).sort((a, b) => b[1].T - a[1].T); const dueN = due.reduce((a, [, d]) => a + d.pending, 0);
+  h += `<div class="panel c7"><div class="ph"><div><div class="eyebrow">pressure and hygiene</div><h2>What needs a hand</h2></div></div><div class="pb"><ul class="hy">
+    <li><div><div class="lb">Stable and hot</div><div class="sb">reviewed once and still pressed on (≥ ${o.thresholds.procedural} weighted touches): compile into the repo, then supersede with a pointer</div>${o.hot.length ? `<div class="ids">${idlist(o.hot)}</div>` : ''}</div><b class="display num${o.hot.length ? ' warn' : ''}">${o.hot.length}</b></li>
+    <li><div><div class="lb">Under pressure</div><div class="sb">procedural facts the evidence keeps touching: verify against the repo, then supersede or touch</div>${o.pressed.length ? `<div class="ids">${idlist(o.pressed)}</div>` : ''}</div><b class="display num${o.pressed.length ? ' warn' : ''}">${o.pressed.length}</b></li>
+    <li><div><div class="lb">Dossiers behind the evidence</div><div class="sb">people mentioned ≥ ${o.thresholds.people} weighted times since their note: supersede it or touch the name</div>${o.dossiers.length ? `<div class="ids">${o.dossiers.map(d => `<a class="ent mono" data-e="${esc(d.entity)}">${esc(d.entity)}</a> <span class="mut">${d.pressure} since ${d.since}</span>`).join(' ')}</div>` : ''}</div><b class="display num${o.dossiers.length ? ' warn' : ''}">${o.dossiers.length}</b></li>
+    <li><div style="flex:1"><div class="lb">Compressions due</div><div class="sb">a nap is asked only when the wake cover would print a block that has no summary</div>${due.map(([s, d]) => `<div class="due"><a class="ent mono" data-s="${esc(s)}" style="color:var(--ink-2)">▸ ${esc(short(s))}</a><span class="tr"><i style="width:${Math.min(100, d.T / d.budget * 100).toFixed(0)}%"></i></span><span class="mono mut num">${d.T}/${d.budget}${d.T <= d.budget ? ` · first nap at note ${d.budget + 1}` : d.pending ? ` · ${d.pending} due` : ' · up to date'}</span></div>`).join('')}</div><b class="display num${dueN ? ' warn' : ''}">${dueN}</b></li>
+    <li><div><div class="lb">Untagged live facts</div><div class="sb">no --entities: invisible to overrides, promotion, pressure, and the prompt hook</div>${o.untagged.length ? `<div class="ids">${o.untagged.map(id => `<a class="ent mono" data-id="${id}">#${id}</a>`).join(' ')}</div>` : ''}</div><b class="display num${o.untagged.length ? ' warn' : ''}">${o.untagged.length}</b></li>
+    <li><div><div class="lb">Duplicates across scopes</div><div class="sb">same text live in two projects: the pattern promote looks for</div>${o.duplicates.length ? `<div class="ids">${o.duplicates.map(g => g.map(id => `<a class="ent mono" data-id="${id}">#${id}</a>`).join(' = ')).join(' · ')}</div>` : ''}</div><b class="display num">${o.duplicates.length}</b></li>
+    <li><div><div class="lb">Overrides</div><div class="sb">project facts that beat a global one on a shared tag; wake prints both</div></div><b class="display num">${o.overrides}</b></li>
+  </ul></div></div></div>`;
+  h += `<p class="mut" style="font-size:12px;margin-top:14px">Live by kind: ${KINDS.map(k => `<span class="mono k-${k}">${k}</span> ${live.filter(r => r[1] === k).length}`).join(' · ')}. Days in your zone; segmem stamps UTC.</p>`;
+  $('#ov').innerHTML = h;
+}
 
 // ---- console
 async function loadConsole() {
   const d = await j('/api/state' + (S.scope ? '?scope=' + encodeURIComponent(S.scope) : ''));
-  S.scope = d.scope; S.me = d.me;
-  $('#dbp').textContent = d.db;
-  $('#scopes').innerHTML = '<span class="mut">scope</span>' + d.scopes.map(s =>
-    `<button class="chip${s.scope === d.scope ? ' on' : ''}" data-s="${esc(s.scope)}">${esc(short(s.scope))} <span class="mut">${s.n}</span></button>`).join('') +
-    `<span class="mut" style="margin-left:auto">episodic budget ${d.budget}</span>`;
-  let sec = '';
+  S.scope = d.scope; S.me = d.me; S.db = d.db; S.budget = d.budget;
+  $('#scopes').innerHTML = d.scopes.map(s => `<button class="chip mono${s.scope === d.scope ? ' on' : ''}" data-s="${esc(s.scope)}">${esc(slabel(s.scope))} <span style="opacity:.7">${s.n}</span></button>`).join('');
+  $('#wake-eb').textContent = `SEGMEM_PROJECT=${short(d.scope)} segmem wake`;
+  let sec = '', kind = '';
   $('#wake').innerHTML = d.wake.split('\n').map(line => {
-    if (line.startsWith('#' + '#')) { sec = line; return `<div class="hd">${esc(line)}</div>`; }
+    if (line.startsWith('#' + '#')) {
+      sec = line; kind = /Identity/.test(line) ? 'identity' : /Procedural/.test(line) ? 'procedural' : /People/.test(line) ? 'people' : /Episodic/.test(line) ? 'episodic' : '';
+      return `<div class="hd ${kind ? 'k-' + kind : 'ink2'}">${esc(line)}</div>`;
+    }
     let m;
     if (sec.startsWith('### Episodic')) {
       const map = d.seq[(sec.match(/\((.*)\)/) || [])[1]] || {};
-      if ((m = line.match(/^#(\d+)-(\d+) /))) return `<div class="ln sum"><span class="gut">#${m[1]}-${m[2]}</span><span class="tx">${esc(line.slice(m[0].length))}</span><span class="rid">summary</span></div>`;
+      if ((m = line.match(/^#(\d+)-(\d+) /))) return `<div class="ln"><span class="gut mut">#${m[1]}-${m[2]}</span><span class="tx">${esc(line.slice(m[0].length))}</span><span class="rid">summary</span></div>`;
       if ((m = line.match(/^#(\d+) /))) { const id = map[m[1]]; return `<div class="ln${id === S.sel ? ' on' : ''}" data-id="${id}"><span class="gut">#${m[1]}</span><span class="tx">${esc(line.slice(m[0].length))}</span><span class="rid">id ${id}</span></div>`; }
     } else if (/^#\d+ /.test(line)) {
       const ids = [...line.matchAll(/#(\d+) /g)].map(x => +x[1]);
-      return `<div class="ln${ids.includes(S.sel) ? ' on' : ''}" data-id="${ids[0]}"><span class="tx">${esc(line)}</span></div>`;
+      const tx = esc(line).replace(/OVERRIDDEN/, '<span class="ov">OVERRIDDEN</span>').replace(/^#(\d+) /, '<span class="acc">#$1</span> ');
+      return `<div class="ln${ids.includes(S.sel) ? ' on' : ''}" data-id="${ids[0]}"><span class="tx">${tx}</span></div>`;
     }
-    return `<div class="pl">${esc(line)}</div>`;
+    return `<div class="pl${/^You are awake/.test(line) ? ' awake' : ''}">${esc(line)}</div>`;
   }).join('');
   if (S.sel) loadFact(S.sel);
 }
 async function loadFact(id) {
   S.sel = id;
   document.querySelectorAll('#wake .ln').forEach(el => el.classList.toggle('on', +el.dataset.id === id));
+  document.querySelectorAll('#spine rect').forEach(r => r.setAttribute('opacity', +r.dataset.id === id ? '1' : '.35'));
   const f = await j('/api/fact?id=' + id);
   $('#insp').innerHTML = f.error ? `<p class="mut">No memory #${id}.</p>` : factHTML(f);
 }
 function factHTML(f) {
   const me = S.me, ents = f.entities_list;
   const cmd = c => `<div class="cmd"><code>${esc(c)}</code><button class="cp" data-c="${esc(c)}">copy</button></div>`;
-  let h = `<div class="fh"><b>#${f.id}</b><span class="k ${f.kind}">${f.kind}</span><span class="mut">${esc(short(f.scope))} · ${f.ts.slice(0, 10)} · seq ${f.seq} of ${f.total_in_stream}${f.dead ? ' · superseded' : ''}</span></div>
-    <p class="ft${f.dead ? ' dead' : ''}">${esc(f.text)}</p>`;
-  h += `<h4>Why it prints</h4><p>${esc(f.why)}</p>`;
-  if (ents.length) h += `<p class="mut">Entities: ${ents.map(e => `<a class="ent" data-e="${esc(e)}">${esc(e)}</a>`).join(', ')}</p>`;
-  if (f.conflicts.length) h += `<h4>Shares a subject with</h4>` + f.conflicts.map(c => `<div class="ln" data-id="${c.id}">#${c.id} ${esc(c.text)} <span class="mut">(${esc(short(c.scope))})</span></div>`).join('');
+  let h = `<div class="fh"><span class="display id">#${f.id}</span><span class="k ${f.kind}"><i></i>${f.kind}</span><span class="mono mut" style="font-size:11.5px">${esc(slabel(f.scope))} · ${f.ts.slice(0, 10)} · seq ${f.seq} of ${f.total_in_stream}${f.dead ? ' · superseded' : ''}</span></div>
+    <p class="ft${f.dead ? ' dead' : ''}" style="margin-top:10px">${esc(f.text)}</p>`;
+  h += `<h4>Why it prints</h4><p class="ink2">${esc(f.why)}</p>`;
+  if (ents.length) h += `<p style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">${ents.map(e => `<a class="tag" data-e="${esc(e)}">${esc(e)}</a>`).join('')}</p>`;
+  if (f.conflicts.length) h += `<h4>Shares a subject with</h4>` + f.conflicts.map(c => `<div class="ln" data-id="${c.id}"><span class="acc mono">#${c.id}</span> ${esc(c.text)} <span class="mut">(${esc(short(c.scope))})</span></div>`).join('');
   if (f.threshold) {
     const pct = Math.min(100, 100 * f.pressure / f.threshold);
     h += `<h4>Pressure</h4><div class="bar"><i style="width:${pct}%"${f.hot ? ' class="hot"' : ''}></i></div>
-      <p class="mut">${f.pressure} / ${f.threshold} · ${fmtCounts(f.touches)} since ${f.since.slice(0, 10)}${f.last_touch ? ' · last ' + f.last_touch.slice(0, 16).replace('T', ' ') : ''}</p>
-      <p${f.hot ? ' class="warn"' : ''}>${esc(f.verdict)}</p>`;
+      <p class="mut mono" style="font-size:11.5px">${f.pressure} / ${f.threshold} · ${fmtCounts(f.touches)} since ${f.since.slice(0, 10)}${f.last_touch ? ' · last ' + f.last_touch.slice(0, 16).replace('T', ' ') : ''}</p>
+      <p${f.hot ? ' class="k-identity"' : ''}>${esc(f.verdict)}</p>`;
   } else if (ents.length) {
     h += `<h4>Touches</h4><p class="mut">${fmtCounts(f.touches)} since it was written; episodic notes carry no pressure.</p>`;
   }
   if (f.ladder) h += `<h4>Form ladder</h4><p class="mut">Export target: ${esc(f.ladder)}.</p>`;
-  h += `<h4>History</h4><p class="mut">${f.replaces ? `Replaces <a class="ent" data-id="${f.replaces.id}">#${f.replaces.id}</a> (${f.replaces.ts.slice(0, 10)}). ` : ''}${f.superseded_by ? `Superseded by <a class="ent" data-id="${f.superseded_by.id}">#${f.superseded_by.id}</a> (${f.superseded_by.ts.slice(0, 10)}).` : 'Live; superseded by nothing.'}</p>`;
-  h += `<h4>Commands</h4>`;
+  h += `<h4>History</h4><p class="mut">${f.replaces ? `Replaces <a class="ent mono" data-id="${f.replaces.id}">#${f.replaces.id}</a> (${f.replaces.ts.slice(0, 10)}). ` : ''}${f.superseded_by ? `Superseded by <a class="ent mono" data-id="${f.superseded_by.id}">#${f.superseded_by.id}</a> (${f.superseded_by.ts.slice(0, 10)}).` : 'Live; superseded by nothing.'}</p>`;
+  h += `<h4>Commands · copy, never run from here</h4>`;
   if (f.kind === 'procedural' && !f.dead) h += cmd(`${me} touch ${f.id}`) + (f.hot ? cmd(`${me} touch ${f.id} --keep`) : '');
   if (!f.dead) h += cmd(`${me} note ${f.kind} "…" --supersedes=${f.id}${ents.length ? ' --entities=' + ents.join(',') : ''}`);
   if (ents.length) h += cmd(`${me} recall ${ents[0]}`);
@@ -1828,32 +2048,27 @@ let qTimer;
 async function loadLedger() {
   const p = new URLSearchParams({q: S.q, ...S.f});
   const d = await j('/api/search?' + p);
-  $('#qmeta').textContent = d.error ? d.error : `${d.total} hit${d.total === 1 ? '' : 's'} · ${d.ms} ms${d.total > d.rows.length ? ' · showing ' + d.rows.length : ''}`;
+  $('#qmeta').textContent = d.error ? d.error : `${fmt(d.total)} hit${d.total === 1 ? '' : 's'} · ${d.ms} ms${d.total > d.rows.length ? ' · showing ' + d.rows.length : ''}`;
   const fac = (key, obj, label) => `<h4>${label}</h4>` + (Object.keys(obj).length ? Object.entries(obj).map(([k, n]) =>
-    `<div class="f${S.f[key] === k ? ' on' : ''}" data-fk="${key}" data-fv="${esc(k)}"><span>${esc(key === 'scope' ? short(k) : k)}</span><span>${n}</span></div>`).join('') : '<div class="mut">none</div>');
-  $('#facets').innerHTML = fac('kind', d.facets.kind || {}, 'Kind') + fac('scope', d.facets.scope || {}, 'Scope') + fac('entity', d.facets.entity || {}, 'Entities in results') +
-    `<h4>Superseded</h4><div class="f${S.f.dead === '1' ? ' on' : ''}" data-fk="dead" data-fv="1"><span>show superseded rows</span><span></span></div>` +
-    (Object.keys(S.f).length ? `<h4>&nbsp;</h4><div class="f" data-clear="1"><span>clear filters</span><span></span></div>` : '');
+    `<div class="f${S.f[key] === k ? ' on' : ''}" data-fk="${key}" data-fv="${esc(k)}"><span>${key === 'kind' ? `<span class="k ${k}"><i></i>${k}</span>` : esc(key === 'scope' ? slabel(k) : k)}</span><span>${n}</span></div>`).join('') : '<div class="mut">none</div>');
+  $('#facets').innerHTML = fac('kind', d.facets.kind || {}, 'Kind') + fac('scope', d.facets.scope || {}, 'Scope') + fac('entity', d.facets.entity || {}, 'Tags in results') +
+    `<h4>State</h4><div class="f${S.f.dead === '1' ? ' on' : ''}" data-fk="dead" data-fv="1"><span>show superseded</span><span></span></div>` +
+    (Object.keys(S.f).length ? `<div class="f" data-clear="1" style="margin-top:10px;color:var(--accent)"><span>clear filters</span><span></span></div>` : '');
   const terms = S.q.split(/\s+/).filter(t => t && !/^(AND|OR|NOT)$/.test(t)).map(t => t.replace(/^"|"$/g, ''));
   const hl = s => { let h = esc(s); for (const t of terms) { const re = new RegExp('(' + t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'ig'); h = h.replace(re, '<mark>$1</mark>'); } return h; };
   if (!d.rows.length) { $('#results').innerHTML = `<div class="empty">${d.error ? '' : 'No match.'}</div>`; return; }
-  $('#results').innerHTML = `<table><thead><tr><th>#</th><th>when</th><th>kind</th><th>scope</th><th>entities</th><th>text</th></tr></thead><tbody>` +
-    d.rows.map(r => `<tr class="r${S.open.includes(r.id) ? ' on' : ''}" data-row="${r.id}"><td class="id">${r.id}</td><td class="ts">${r.ts.slice(5, 10)}</td><td><span class="k ${r.kind}">${r.kind}</span></td><td class="mut">${esc(short(r.scope))}</td><td>${r.entities.split(',').filter(Boolean).map(e => `<a class="ent" data-e="${esc(e.trim())}">${esc(e.trim())}</a>`).join(', ')}</td><td class="${r.dead ? 'dead' : ''}">${hl(r.text)}</td></tr>` +
-      (S.open.includes(r.id) ? `<tr><td class="x" colspan="6" id="x${r.id}"><span class="mut">loading</span></td></tr>` : '')).join('') + '</tbody></table>';
+  $('#results').innerHTML = `<table class="rs"><thead><tr><th>#</th><th>when</th><th>kind</th><th>scope</th><th>seq</th><th class="tg">tags</th><th>text</th></tr></thead><tbody>` +
+    d.rows.map(r => `<tr class="r${S.open.includes(r.id) ? ' on' : ''}" data-row="${r.id}"><td class="id">#${r.id}</td><td class="ts">${r.ts.slice(5, 10)}</td><td><span class="k ${r.kind}${r.dead ? ' dead' : ''}"><i></i>${r.kind}</span></td><td class="mono ink2" style="font-size:12px">${esc(slabel(r.scope))}</td><td class="sq">${r.seq}</td><td class="tg"><div>${r.entities.split(',').filter(x => x.trim()).map(e => `<a class="tag" data-e="${esc(e.trim())}">${esc(e.trim())}</a>`).join('')}</div></td><td class="${r.dead ? 'dead' : ''}">${hl(r.text)}</td></tr>` +
+      (S.open.includes(r.id) ? `<tr><td class="x" colspan="7" id="x${r.id}"><span class="mut">loading</span></td></tr>` : '')).join('') + '</tbody></table>';
   for (const id of S.open) { const cell = $('#x' + id); if (cell) j('/api/fact?id=' + id).then(f => { cell.innerHTML = factHTML(f); }); }
 }
 async function loadFeed() {
   const ev = await j('/api/feed');
-  const line = (e, i) => {
-    const ts = e.ts.slice(11, 19);
-    const isNew = S.newest && e.ts > S.newest;
-    const body = e.ev === 'touch'
-      ? `${esc(e.b)} touched <a class="ent" data-e="${esc(e.a)}">${esc(e.a)}</a>${e.d ? ` <span class="mut">· session ${esc(e.d.slice(0, 4))}</span>` : ''}`
-      : `note <a class="ent" data-id="${e.id}">#${e.id}</a> ${esc(e.b)} · ${esc(short(e.d))}${e.sup ? ` supersedes #${e.sup}` : ''}${e.a ? ` · <span class="mut">${esc(e.a)}</span>` : ''}`;
-    return `<div class="ev${isNew ? ' new' : ''}"><div class="ts">${ts}</div><div>${body}</div></div>`;
-  };
-  $('#feed').innerHTML = `<div class="fh2">Live<span class="mut" style="margin-left:auto;font-weight:400">${ev.length} newest</span></div>` + ev.map(line).join('');
-  $('#ticker').innerHTML = `<span class="mut">events</span>` + ev.slice(0, 4).map((e, i) => `<span>${e.ts.slice(11, 19)} ${e.ev === 'touch' ? `${esc(e.b)} touched <a class="ent" data-e="${esc(e.a)}">${esc(e.a)}</a>` : `note <a class="ent" data-id="${e.id}">#${e.id}</a> ${esc(e.b)} ${esc(short(e.d))}`}${S.newest && e.ts > S.newest ? ' <span class="new">new</span>' : ''}</span>`).join('');
+  const body = e => e.ev === 'touch'
+    ? `${esc(e.b)} touched <a class="ent" data-e="${esc(e.a)}">${esc(e.a)}</a>${e.d ? ` <span class="mut">· session ${esc(e.d.slice(0, 4))}</span>` : ''}`
+    : `note <a class="ent mono" data-id="${e.id}">#${e.id}</a> <span class="k-${esc(e.b)}">${esc(e.b)}</span> · ${esc(short(e.d))}${e.sup ? ` supersedes #${e.sup}` : ''}${e.a ? ` · <span class="mut">${esc(e.a)}</span>` : ''}`;
+  $('#feed').innerHTML = `<div class="ph" style="padding-bottom:10px"><div><div class="eyebrow">live</div><h2>As it lands</h2></div><div class="r">${ev.length} newest</div></div>` + ev.map(e => `<div class="ev${S.newest && e.ts > S.newest ? ' new' : ''}"><div class="ts">${e.ts.slice(11, 19)}</div><div>${body(e)}</div></div>`).join('');
+  $('#ticker').innerHTML = `<span class="eyebrow">events</span>` + ev.slice(0, 4).map(e => `<span><span class="mono mut">${e.ts.slice(11, 19)}</span> ${body(e)}${S.newest && e.ts > S.newest ? ' <span class="new">new</span>' : ''}</span>`).join('');
   if (!S.newest) S.newest = ev.length ? ev[0].ts : '';
 }
 
@@ -1862,32 +2077,39 @@ function live(txt, on) { $('#livetxt').textContent = txt; $('#live').classList.t
 const es = new EventSource('/api/events');
 es.onopen = () => live('live', true);
 es.onerror = () => live('reconnecting', false);
-es.onmessage = () => { S.writes++; live(`live · ${S.writes} write${S.writes === 1 ? '' : 's'} since open`, true); refresh(); };
-function refresh() { (S.tab === 'console' ? loadConsole() : loadLedger()); loadFeed(); }
-
-// ---- events
-document.addEventListener('click', e => {
-  const t = e.target.closest('[data-t],[data-s],[data-id],[data-e],[data-fk],[data-clear],[data-row],.cp');
-  if (!t) return;
-  if (t.matches('.cp')) { navigator.clipboard.writeText(t.dataset.c).then(() => { t.textContent = 'copied'; setTimeout(() => t.textContent = 'copy', 1200); }); return; }
-  if (t.dataset.t) { setTab(t.dataset.t); return; }
-  if (t.dataset.s) { S.scope = t.dataset.s; S.sel = null; $('#insp').innerHTML = '<p class="mut">Select a line to see why it prints.</p>'; loadConsole(); return; }
-  if (t.dataset.e !== undefined) { S.f = {entity: t.dataset.e}; S.q = ''; $('#q').value = ''; setTab('ledger'); return; }
-  if (t.dataset.fk) { const k = t.dataset.fk, v = t.dataset.fv; if (S.f[k] === v) delete S.f[k]; else S.f[k] = v; loadLedger(); return; }
-  if (t.dataset.clear) { S.f = {}; loadLedger(); return; }
-  if (t.dataset.row) { const id = +t.dataset.row; S.open = S.open.includes(id) ? S.open.filter(x => x !== id) : [...S.open, id]; loadLedger(); return; }
-  if (t.dataset.id) { const id = +t.dataset.id; if (S.tab === 'ledger' && !t.closest('#feed') && !t.closest('td.x')) { if (!S.open.includes(id)) S.open.push(id); loadLedger(); } else { setTab('console'); loadFact(id); } }
-});
+es.onmessage = () => { S.writes++; live(`live · ${S.writes} write${S.writes === 1 ? '' : 's'}`, true); S.spine = []; refresh(); };
+function refresh() { loadSpine().then(() => { if (S.tab === 'overview') loadOverview(); }); if (S.tab === 'console') loadConsole(); if (S.tab === 'ledger') loadLedger(); loadFeed(); }
 function setTab(tab) {
   S.tab = tab;
   document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.t === tab));
   document.querySelectorAll('section').forEach(s => s.classList.toggle('on', s.id === tab));
-  refresh();
-  if (tab === 'ledger') $('#q').focus();
+  if (tab === 'overview') loadOverview(); if (tab === 'console') loadConsole(); if (tab === 'ledger') { loadLedger(); $('#q').focus(); }
 }
+
+// ---- events
+document.addEventListener('click', e => {
+  const t = e.target.closest('[data-t],[data-mx],[data-s],[data-id],[data-e],[data-fk],[data-clear],[data-row],.cp');
+  if (!t) return;
+  if (t.matches('.cp')) { navigator.clipboard.writeText(t.dataset.c).then(() => { t.textContent = 'copied'; setTimeout(() => t.textContent = 'copy', 1200); }); return; }
+  if (t.dataset.t) { setTab(t.dataset.t); return; }
+  if (t.dataset.mx) { const [s, k] = t.dataset.mx.split('|'); S.f = {scope: s, kind: k}; S.q = ''; $('#q').value = ''; setTab('ledger'); return; }
+  if (t.dataset.s) { S.scope = t.dataset.s; S.sel = null; $('#insp').innerHTML = '<p class="mut">Select a line.</p>'; setTab('console'); return; }
+  if (t.dataset.e !== undefined) { S.f = {entity: t.dataset.e}; S.q = ''; $('#q').value = ''; setTab('ledger'); return; }
+  if (t.dataset.fk) { const k = t.dataset.fk, v = t.dataset.fv; if (S.f[k] === v) delete S.f[k]; else S.f[k] = v; loadLedger(); return; }
+  if (t.dataset.clear) { S.f = {}; loadLedger(); return; }
+  if (t.dataset.row) { const id = +t.dataset.row; S.open = S.open.includes(id) ? S.open.filter(x => x !== id) : [...S.open, id]; loadLedger(); return; }
+  if (t.dataset.id) { const id = +t.dataset.id; if (S.tab === 'ledger' && !t.closest('#feed') && !t.closest('td.x') && !t.closest('#spine')) { if (!S.open.includes(id)) S.open.push(id); loadLedger(); } else { S.sel = id; setTab('console'); } }
+});
+let gKey = false;
+document.addEventListener('keydown', e => {
+  const t = e.target; if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) { if (e.key === 'Escape') t.blur(); return; }
+  if (e.key === '/') { e.preventDefault(); setTab('ledger'); return; }
+  if (e.key === 'g') { gKey = true; setTimeout(() => gKey = false, 800); return; }
+  if (gKey) { const m = {o: 'overview', c: 'console', l: 'ledger'}[e.key]; if (m) setTab(m); gKey = false; }
+});
 $('#q').addEventListener('input', e => { S.q = e.target.value; clearTimeout(qTimer); qTimer = setTimeout(loadLedger, 200); });
 $('#q').addEventListener('keydown', e => { if (e.key === 'Enter') { clearTimeout(qTimer); S.q = e.target.value; loadLedger(); } });
-refresh();
+j('/api/state').then(d => { S.scope = d.scope; S.me = d.me; S.db = d.db; S.budget = d.budget; }).then(refresh);
 </script>
 """
 

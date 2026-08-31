@@ -284,8 +284,16 @@ opens a live page at `http://127.0.0.1:7878/`. It runs in the foreground
 while you look and stops on Ctrl-C; nothing in the hooks depends on it, so
 the no-daemon promise holds. Stdlib only, loopback only, read-only: every
 route is a `SELECT`, and searching from the page never writes a touch, so
-browsing doesn't press on a fact. Two tabs:
+browsing doesn't press on a fact. A spine across the top shows every memory
+as one tick in id order, colored by kind, superseded ones hollow. Three tabs,
+reachable with `g` then `o`, `c`, or `l`; `/` jumps to search:
 
+- **overview**: what the store holds and what needs a hand. Live count,
+  pressure, superseded, summaries, scopes, untagged; a kind × scope matrix
+  (click a cell to browse it); notes per day; what each scope's wake costs
+  in tokens, from the real command; and the hygiene list: facts that are
+  stable and hot or under pressure, dossiers behind the evidence,
+  compressions due per scope, untagged facts, duplicates, overrides.
 - **console**: what the agent sees at wake, byte for byte, for any scope.
   Click a line and the right pane explains why it prints: overrides,
   touches and pressure since its last review, the verdict `stale` would

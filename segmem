@@ -993,8 +993,8 @@ def cmd_wake(c, args):
                     names.setdefault(e.strip().lower(), e.strip())
         out.append("\n### People known: %s" % ", ".join(names[k] for k in sorted(names)))
         out.append("Run `%s recall <name>` before acting on or about them." % ME)
-        for e, p, n, since in dossier_pressure(c):
-            if p >= STALE_MIN and e in names:
+        for e, pe, n, since in dossier_pressure(c):  # not p: that is the project
+            if pe >= STALE_MIN and e in names:
                 out.append("%s: dossier from %s, %s since. Supersede it or, if unchanged: "
                            "%s touch %s" % (names[e], since[:10], fmt_counts(n), ME, e))
 
@@ -1183,7 +1183,7 @@ def cmd_mcp(c, args):
             if method == "initialize":
                 result = {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
                           "capabilities": {"tools": {}},
-                          "serverInfo": {"name": "segmem", "version": "0.4.0"}}
+                          "serverInfo": {"name": "segmem", "version": "0.5.0"}}
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
@@ -1400,6 +1400,498 @@ def cmd_html(c, args):
         subprocess.run(["open", out], check=False)
 
 
+# ---------------------------------------------------------------- serve
+# A live page over the store: stdlib http.server, loopback only, foreground
+# (Ctrl-C stops it). Read-only: every route is a SELECT, and search skips the
+# touch() that recall performs, so browsing never presses on a fact. Nothing
+# in the hot path depends on it, so the no-daemon promise holds.
+
+SERVE_PORT = 7878
+
+
+def parse_query(q):
+    """Split a ledger query into (fts_terms, filters).
+
+    TODO(Mark): the chip grammar is yours. Today the whole string goes to
+    FTS5 and filters arrive only from facet clicks (?kind= ?scope= ?entity=).
+    Decide what a typed `scope:kerf`, `kind:procedural`, `since:7d`, or
+    `superseded:yes` should mean, and return them in `filters` under the
+    keys serve_search() already reads: kind, scope (full path or short
+    name), entity, since (ISO date prefix, so "7d" needs converting), dead
+    ("1" shows superseded rows). Words that are not chips stay in the FTS
+    string; an empty FTS string lists newest first.
+    """
+    return q.strip(), {}
+
+
+def fts_rows(c, sql, terms, params):
+    """Run an FTS5 MATCH, retrying with quoted terms as recall does."""
+    try:
+        return c.execute(sql, (terms, *params)).fetchall()
+    except sqlite3.OperationalError:
+        quoted = " ".join(t if t in ("OR", "AND", "NOT") else '"%s"' % t.replace('"', '""')
+                          for t in terms.split())
+        return c.execute(sql, (quoted, *params)).fetchall()
+
+
+def serve_search(c, q, f):
+    import time
+    t0 = time.time()
+    terms, chips = parse_query(q)
+    f = {**f, **chips}
+    where, params = [], []
+    if f.get("kind"):
+        where.append("m.kind=?")
+        params.append(f["kind"])
+    if f.get("scope"):
+        where.append("(m.scope=? OR m.scope LIKE ?)")
+        params.extend((f["scope"], "%/" + f["scope"]))
+    if f.get("entity"):
+        where.append("(','||lower(m.entities)||',') LIKE ?")
+        params.append("%%,%s,%%" % f["entity"].lower())
+    if f.get("since"):
+        where.append("m.ts>=?")
+        params.append(f["since"])
+    if f.get("dead") != "1":
+        where.append("m.id NOT IN (SELECT supersedes FROM memories WHERE supersedes IS NOT NULL)")
+    tail = "".join(" AND " + w for w in where)
+    if terms:
+        sql = ("SELECT m.* FROM memories_fts x JOIN memories m ON m.id=x.rowid "
+               "WHERE memories_fts MATCH ?%s ORDER BY rank" % tail)
+        try:
+            rows = fts_rows(c, sql, terms, params)
+        except sqlite3.OperationalError as e:
+            return {"error": "Bad query: %s" % e, "rows": [], "total": 0, "facets": {}, "ms": 0}
+    else:
+        rows = c.execute("SELECT m.* FROM memories m WHERE 1%s ORDER BY m.id DESC" % tail,
+                         params).fetchall()
+    dead = {r[0] for r in c.execute("SELECT supersedes FROM memories WHERE supersedes IS NOT NULL")}
+    facets = {"kind": {}, "scope": {}, "entity": {}}
+    for r in rows:
+        facets["kind"][r["kind"]] = facets["kind"].get(r["kind"], 0) + 1
+        facets["scope"][r["scope"]] = facets["scope"].get(r["scope"], 0) + 1
+        for e in entity_set(r):
+            facets["entity"][e] = facets["entity"].get(e, 0) + 1
+    facets["entity"] = dict(sorted(facets["entity"].items(), key=lambda kv: (-kv[1], kv[0]))[:14])
+    out = [dict(r, dead=r["id"] in dead) for r in rows[:200]]
+    return {"rows": out, "total": len(rows), "facets": facets, "filters": f,
+            "ms": round((time.time() - t0) * 1000, 1)}
+
+
+def serve_fact(c, rid):
+    """One memory with everything the inspector shows: touches and pressure
+    since its clock, the verdict wake would print, overrides, history."""
+    row = c.execute("SELECT * FROM memories WHERE id=?", (rid,)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    ents = sorted(entity_set(row))
+    d["entities_list"] = ents
+    nxt = c.execute("SELECT id, ts, text FROM memories WHERE supersedes=?", (rid,)).fetchone()
+    d["superseded_by"] = dict(nxt) if nxt else None
+    d["dead"] = nxt is not None
+    prev = None
+    if row["supersedes"]:
+        prev = c.execute("SELECT id, ts, text FROM memories WHERE id=?", (row["supersedes"],)).fetchone()
+    d["replaces"] = dict(prev) if prev else None
+    d["total_in_stream"] = stream_len(c, row["kind"], row["scope"])
+
+    since = note_clock(c, row) if row["kind"] == "procedural" else row["ts"]
+    n, last = {}, None
+    if ents:
+        n = dict(c.execute(
+            "SELECT kind, COUNT(*) FROM touches WHERE entity IN (%s) AND ts>=? "
+            "AND kind IN ('note','recall','prompt') GROUP BY kind"
+            % ",".join("?" * len(ents)), (*ents, since)))
+        last = c.execute("SELECT MAX(ts) FROM touches WHERE entity IN (%s)"
+                         % ",".join("?" * len(ents)), ents).fetchone()[0]
+    d.update(touches=n, since=since, last_touch=last,
+             pressure=sum(TOUCH_WEIGHT[k] * v for k, v in n.items()))
+    r = c.execute("SELECT COUNT(*), COALESCE(SUM(session='keep'), 0) FROM touches "
+                  "WHERE kind='review' AND entity=?", ("#%d" % rid,)).fetchone()
+    reviewed, kept = r[0] > 0, r[1] > 0
+    d["threshold"] = d["verdict"] = d["ladder"] = None
+    d["hot"] = False
+    if row["kind"] == "procedural":
+        d["threshold"] = PROC_STALE_MIN
+        d["ladder"] = form_ladder(row)
+        if kept:
+            d["verdict"] = "Kept: you chose memory over the repo, so export is not suggested again."
+        elif d["pressure"] >= PROC_STALE_MIN and reviewed:
+            d["hot"] = True
+            d["verdict"] = ("Stable and hot: reviewed once and still pressed on. Compile it into "
+                            "the repo and supersede with a pointer, or touch --keep.")
+        elif d["pressure"] >= PROC_STALE_MIN:
+            d["hot"] = True
+            d["verdict"] = "Under pressure: verify against the repo, then supersede or touch."
+        else:
+            d["verdict"] = "Quiet: below the threshold since its last review."
+    elif row["kind"] == "people":
+        d["threshold"] = STALE_MIN
+        d["hot"] = d["pressure"] >= STALE_MIN
+        d["verdict"] = ("Dossier under pressure: supersede it or touch the name."
+                        if d["hot"] else "Dossier current.")
+
+    # Same-kind live facts in another scope that share a subject: the
+    # OVERRIDDEN pairs wake prints, seen from either side.
+    d["conflicts"] = []
+    if row["kind"] in ("identity", "procedural") and ents:
+        for o in c.execute("SELECT * FROM memories WHERE kind=? AND scope<>? AND %s" % LIVE,
+                           (row["kind"], row["scope"])):
+            if entity_set(o) & set(ents):
+                d["conflicts"].append({"id": o["id"], "scope": o["scope"], "text": o["text"]})
+    if d["dead"]:
+        d["why"] = "It does not print: superseded by #%d." % nxt["id"]
+    elif row["kind"] == "episodic":
+        d["why"] = ("Episodic seq %d of %d in %s. It prints while the wake cover keeps it as a "
+                    "leaf; once a nap folds it into a summary, the summary prints instead."
+                    % (row["seq"], d["total_in_stream"], short(row["scope"])))
+    elif row["kind"] == "people":
+        d["why"] = "People notes never print whole; wake lists the name, recall returns the text."
+    elif d["conflicts"] and row["scope"] == GLOBAL:
+        d["why"] = ("Global fact. In %s it is OVERRIDDEN by #%d, and wake shows both so the agent "
+                    "sees why." % (", ".join(short(x["scope"]) for x in d["conflicts"]),
+                                   d["conflicts"][0]["id"]))
+    elif d["conflicts"]:
+        d["why"] = ("Live in %s and overrides #%d (%s) on a shared subject; wake prints the pair."
+                    % (short(row["scope"]), d["conflicts"][0]["id"], short(d["conflicts"][0]["scope"])))
+    else:
+        d["why"] = ("Live in %s; no fact in another scope shares a subject, so nothing overrides it."
+                    % short(row["scope"]))
+    return d
+
+
+def serve_feed(c, limit=40):
+    rows = c.execute(
+        "SELECT ts, 'touch' AS ev, entity AS a, kind AS b, session AS d, NULL AS id, NULL AS sup "
+        "FROM touches UNION ALL "
+        "SELECT ts, 'note', entities, kind, scope, id, supersedes FROM memories "
+        "ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def serve_state(c, scope, lock):
+    scopes = [{"scope": r[0], "n": r[1]} for r in
+              c.execute("SELECT scope, COUNT(*) FROM memories GROUP BY scope ORDER BY 2 DESC")]
+    if not scope:
+        scope = project()
+    with lock:  # cmd_wake reads the scope from the environment
+        old = os.environ.get("SEGMEM_PROJECT")
+        os.environ["SEGMEM_PROJECT"] = scope
+        try:
+            wake = capture(cmd_wake, [])
+        finally:
+            if old is None:
+                os.environ.pop("SEGMEM_PROJECT", None)
+            else:
+                os.environ["SEGMEM_PROJECT"] = old
+    seq = {}
+    for r in c.execute("SELECT scope, seq, id FROM memories WHERE kind='episodic' "
+                       "AND scope IN (?, ?)", (scope, GLOBAL)):
+        seq.setdefault(short(r[0]), {})[str(r[1])] = r[2]
+    return {"scope": scope, "scopes": scopes, "wake": wake, "seq": seq, "me": ME,
+            "budget": WAKE_EPISODIC, "db": db_path()}
+
+
+def cmd_serve(c, args):
+    import json, threading, time, webbrowser
+    from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+    from urllib.parse import urlparse, parse_qs
+    opts, pos = flags(args)
+    port = int(opts.get("port", SERVE_PORT))
+    c.close()
+    lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def reply(self, code, body, ctype="application/json"):
+            data = body if isinstance(body, bytes) else body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype + "; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            u = urlparse(self.path)
+            q = {k: v[0] for k, v in parse_qs(u.query).items()}
+            if u.path == "/":
+                return self.reply(200, SERVE_PAGE, "text/html")
+            if u.path == "/api/events":
+                return self.events()
+            if not u.path.startswith("/api/"):
+                return self.reply(404, "not found", "text/plain")
+            db = connect()
+            try:
+                name = u.path[5:]
+                if name == "state":
+                    data = serve_state(db, q.get("scope"), lock)
+                elif name == "fact":
+                    data = serve_fact(db, int(q.get("id", 0)))
+                elif name == "search":
+                    f = {k: q[k] for k in ("kind", "scope", "entity", "since", "dead") if k in q}
+                    data = serve_search(db, q.get("q", ""), f)
+                elif name == "feed":
+                    data = serve_feed(db)
+                else:
+                    data = None
+            finally:
+                db.close()
+            if data is None:
+                return self.reply(404, '{"error": "not found"}')
+            self.reply(200, json.dumps(data))
+
+        def events(self):
+            """Server-sent events: one line per commit by any other
+            connection, detected through PRAGMA data_version."""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            db = connect()
+            v = db.execute("PRAGMA data_version").fetchone()[0]
+            beat = 0
+            try:
+                self.wfile.write(b": open\n\n")
+                self.wfile.flush()
+                while True:
+                    time.sleep(0.5)
+                    v2 = db.execute("PRAGMA data_version").fetchone()[0]
+                    if v2 != v:
+                        v = v2
+                        self.wfile.write(b'data: {"v": %d}\n\n' % v)
+                    else:
+                        beat += 1
+                        if beat % 30:
+                            continue
+                        self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            finally:
+                db.close()
+
+    ThreadingHTTPServer.daemon_threads = True
+    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = "http://127.0.0.1:%d/" % port
+    print("segmem serve: %s (Ctrl-C to stop)" % url, flush=True)
+    if "no-open" not in opts:
+        webbrowser.open(url)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+
+
+SERVE_PAGE = r"""<!doctype html><meta charset="utf-8"><title>segmem</title>
+<meta name="viewport" content="width=device-width">
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--mut:#6b6b6b;--line:#e3e3e3;--acc:#2a62d9;--warn:#b7521a;--fill:#dbe6fb;--card:#f7f7f8;--ok:#3a9a5b;--mark:#fff3b0}
+@media(prefers-color-scheme:dark){:root{--bg:#131416;--fg:#e8e8e8;--mut:#9a9a9a;--line:#2c2e33;--acc:#7aa2f7;--warn:#e6a06b;--fill:#23314f;--card:#1b1d21;--ok:#7fbf8a;--mark:#4a4320}}
+*{box-sizing:border-box}html,body{height:100%}body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.5 ui-sans-serif,system-ui,sans-serif;display:flex;flex-direction:column}
+code,.mono,#wake,.gut{font-family:ui-monospace,Menlo,Consolas,monospace}
+header{display:flex;align-items:center;gap:16px;padding:0 20px;height:46px;border-bottom:1px solid var(--line);flex-shrink:0}
+header h1{font-size:14px;margin:0}header .mut{font-size:12px}
+nav{display:flex;gap:4px}nav button{background:none;border:1px solid transparent;color:var(--mut);padding:5px 10px;border-radius:6px;cursor:pointer;font:inherit}
+nav button.on{color:var(--fg);border-color:var(--line);background:var(--card)}
+#live{margin-left:auto;display:flex;align-items:center;gap:8px;color:var(--mut);font-size:12px}#live i{width:8px;height:8px;border-radius:50%;background:var(--mut);display:inline-block}
+#live.on i{background:var(--ok);animation:pulse 1.6s ease-in-out infinite}@keyframes pulse{50%{opacity:.35}}
+section{display:none;flex:1;min-height:0;flex-direction:column}section.on{display:flex}
+.mut{color:var(--mut)}.warn{color:var(--warn)}.dead{opacity:.55;text-decoration:line-through}
+button.chip,button.cp{font:inherit;font-size:12px;padding:3px 10px;border:1px solid var(--line);background:var(--bg);color:var(--mut);border-radius:6px;cursor:pointer}
+button.chip.on{color:var(--fg);background:var(--fill);border-color:var(--acc)}
+.k{display:inline-block;padding:0 7px;border-radius:10px;font-size:11px;border:1px solid var(--line);background:var(--card)}
+.k.identity{border-color:var(--acc)}.k.procedural{border-color:var(--ok)}.k.episodic{border-color:var(--mut)}.k.people{border-color:#b05ab0}
+/* console */
+#scopes{display:flex;gap:6px;padding:10px 20px;border-bottom:1px solid var(--line);flex-wrap:wrap;align-items:center}
+.split{display:grid;grid-template-columns:3fr 2fr;flex:1;min-height:0}
+.wake{border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+.ph{padding:10px 20px 8px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:baseline;flex-shrink:0}.ph b{font-weight:600}
+#wake{overflow:auto;padding:8px 0 14px;font-size:12.5px;line-height:1.55}
+#wake .hd{padding:10px 20px 2px;color:var(--mut)}#wake .pl{padding:2px 20px;color:var(--mut)}
+#wake .ln{padding:3px 20px;cursor:pointer;display:flex;gap:12px;white-space:pre-wrap;word-break:break-word}#wake .ln:hover{background:var(--card)}
+#wake .ln.on{background:var(--fill);box-shadow:inset 2px 0 var(--acc)}
+#wake .gut{color:var(--acc);flex-shrink:0;min-width:34px;text-align:right}#wake .tx{flex:1}#wake .rid{color:var(--mut);font-size:11px;flex-shrink:0}
+#wake .sum{color:var(--fg)}#wake .sum .gut{color:var(--mut)}
+#insp{overflow:auto;padding:12px 20px 20px;background:var(--card)}
+#insp h4{margin:16px 0 6px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);font-weight:500}
+#insp p{margin:4px 0}.fh{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}.ft{font-size:13.5px;line-height:1.6}
+.bar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;margin:4px 0}.bar i{display:block;height:100%;background:var(--acc)}.bar i.hot{background:var(--warn)}
+.cmd{display:flex;align-items:center;gap:10px;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin:6px 0}.cmd code{flex:1;font-size:12px;word-break:break-all}
+a.ent,.ent{color:var(--acc);cursor:pointer}a.ent:hover{text-decoration:underline}
+#insp .ln{cursor:pointer;padding:4px 0}#insp .ln:hover{color:var(--acc)}
+.ticker{height:38px;border-top:1px solid var(--line);display:flex;align-items:center;gap:22px;padding:0 20px;font-size:12px;white-space:nowrap;overflow:hidden;flex-shrink:0}
+.ticker .new{padding:0 6px;border-radius:3px;background:var(--fill);color:var(--acc);font-size:11px}
+/* ledger */
+.qbar{display:flex;gap:12px;align-items:center;padding:12px 20px;border-bottom:1px solid var(--line);flex-shrink:0}
+#q{flex:1;font:inherit;font-family:ui-monospace,Menlo,monospace;font-size:14px;padding:8px 12px;border:1px solid var(--fg);border-radius:8px;background:var(--bg);color:var(--fg)}
+.ledger3{display:grid;grid-template-columns:220px 1fr 300px;flex:1;min-height:0}
+#facets{border-right:1px solid var(--line);padding:12px 14px;overflow:auto;font-size:12px}
+#facets h4{margin:12px 0 4px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);font-weight:500}#facets h4:first-child{margin-top:0}
+#facets .f{display:flex;justify-content:space-between;padding:1px 6px;margin:0 -6px;border-radius:4px;cursor:pointer}#facets .f:hover{background:var(--card)}#facets .f.on{background:var(--fill);color:var(--acc)}
+#facets .f span:last-child{color:var(--mut);font-variant-numeric:tabular-nums}
+#results{overflow:auto}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mut);font-weight:500;font-size:11px;position:sticky;top:0;background:var(--bg)}td.id,td.ts{color:var(--mut);white-space:nowrap;font-variant-numeric:tabular-nums}
+tr.r{cursor:pointer}tr.r:hover td{background:var(--card)}tr.r.on td{background:var(--card)}td.x{padding:4px 20px 14px 60px;background:var(--card)}
+td.x h4{margin:12px 0 4px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);font-weight:500}td.x p{margin:4px 0}
+mark{background:var(--mark);color:inherit}
+#feed{border-left:1px solid var(--line);overflow:auto;font-size:12px;background:var(--card)}
+#feed .fh2{padding:10px 14px;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center;font-weight:500}
+#feed .ev{padding:8px 14px;border-bottom:1px solid var(--line)}#feed .ev.new{background:var(--mark)}#feed .ev .ts{color:var(--mut);font-size:11px}
+.empty{padding:14px 20px;color:var(--mut)}
+</style>
+<header><h1>segmem</h1><span class="mut" id="dbp"></span>
+<nav><button data-t="console" class="on">console</button><button data-t="ledger">ledger</button></nav>
+<span id="live"><i></i><span id="livetxt">connecting</span></span></header>
+<section id="console" class="on">
+  <div id="scopes"></div>
+  <div class="split">
+    <div class="wake"><div class="ph"><b>What the agent sees at wake</b><span class="mut">byte-identical to <code>segmem wake</code>; click a line</span></div><div id="wake"></div></div>
+    <div id="insp"><p class="mut">Select a line to see why it prints.</p></div>
+  </div>
+  <div class="ticker" id="ticker"></div>
+</section>
+<section id="ledger">
+  <div class="qbar"><input id="q" placeholder="search every kind and scope (FTS5 syntax)" autocomplete="off"><span class="mut" id="qmeta"></span></div>
+  <div class="ledger3"><aside id="facets"></aside><div id="results"></div><aside id="feed"></aside></div>
+</section>
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const short = s => s === 'global' ? 'global' : String(s).split('/').pop();
+const S = {tab: 'console', scope: null, sel: null, q: '', f: {}, writes: 0, me: 'segmem', open: [], newest: null};
+const j = async u => (await fetch(u)).json();
+const fmtCounts = n => ['note','recall','prompt'].filter(k => n[k]).map(k => `${n[k]} ${k}${n[k] === 1 ? '' : 's'}`).join(', ') || 'no touches';
+
+// ---- console
+async function loadConsole() {
+  const d = await j('/api/state' + (S.scope ? '?scope=' + encodeURIComponent(S.scope) : ''));
+  S.scope = d.scope; S.me = d.me;
+  $('#dbp').textContent = d.db;
+  $('#scopes').innerHTML = '<span class="mut">scope</span>' + d.scopes.map(s =>
+    `<button class="chip${s.scope === d.scope ? ' on' : ''}" data-s="${esc(s.scope)}">${esc(short(s.scope))} <span class="mut">${s.n}</span></button>`).join('') +
+    `<span class="mut" style="margin-left:auto">episodic budget ${d.budget}</span>`;
+  let sec = '';
+  $('#wake').innerHTML = d.wake.split('\n').map(line => {
+    if (line.startsWith('#' + '#')) { sec = line; return `<div class="hd">${esc(line)}</div>`; }
+    let m;
+    if (sec.startsWith('### Episodic')) {
+      const map = d.seq[(sec.match(/\((.*)\)/) || [])[1]] || {};
+      if ((m = line.match(/^#(\d+)-(\d+) /))) return `<div class="ln sum"><span class="gut">#${m[1]}-${m[2]}</span><span class="tx">${esc(line.slice(m[0].length))}</span><span class="rid">summary</span></div>`;
+      if ((m = line.match(/^#(\d+) /))) { const id = map[m[1]]; return `<div class="ln${id === S.sel ? ' on' : ''}" data-id="${id}"><span class="gut">#${m[1]}</span><span class="tx">${esc(line.slice(m[0].length))}</span><span class="rid">id ${id}</span></div>`; }
+    } else if (/^#\d+ /.test(line)) {
+      const ids = [...line.matchAll(/#(\d+) /g)].map(x => +x[1]);
+      return `<div class="ln${ids.includes(S.sel) ? ' on' : ''}" data-id="${ids[0]}"><span class="tx">${esc(line)}</span></div>`;
+    }
+    return `<div class="pl">${esc(line)}</div>`;
+  }).join('');
+  if (S.sel) loadFact(S.sel);
+}
+async function loadFact(id) {
+  S.sel = id;
+  document.querySelectorAll('#wake .ln').forEach(el => el.classList.toggle('on', +el.dataset.id === id));
+  const f = await j('/api/fact?id=' + id);
+  $('#insp').innerHTML = f.error ? `<p class="mut">No memory #${id}.</p>` : factHTML(f);
+}
+function factHTML(f) {
+  const me = S.me, ents = f.entities_list;
+  const cmd = c => `<div class="cmd"><code>${esc(c)}</code><button class="cp" data-c="${esc(c)}">copy</button></div>`;
+  let h = `<div class="fh"><b>#${f.id}</b><span class="k ${f.kind}">${f.kind}</span><span class="mut">${esc(short(f.scope))} · ${f.ts.slice(0, 10)} · seq ${f.seq} of ${f.total_in_stream}${f.dead ? ' · superseded' : ''}</span></div>
+    <p class="ft${f.dead ? ' dead' : ''}">${esc(f.text)}</p>`;
+  h += `<h4>Why it prints</h4><p>${esc(f.why)}</p>`;
+  if (ents.length) h += `<p class="mut">Entities: ${ents.map(e => `<a class="ent" data-e="${esc(e)}">${esc(e)}</a>`).join(', ')}</p>`;
+  if (f.conflicts.length) h += `<h4>Shares a subject with</h4>` + f.conflicts.map(c => `<div class="ln" data-id="${c.id}">#${c.id} ${esc(c.text)} <span class="mut">(${esc(short(c.scope))})</span></div>`).join('');
+  if (f.threshold) {
+    const pct = Math.min(100, 100 * f.pressure / f.threshold);
+    h += `<h4>Pressure</h4><div class="bar"><i style="width:${pct}%"${f.hot ? ' class="hot"' : ''}></i></div>
+      <p class="mut">${f.pressure} / ${f.threshold} · ${fmtCounts(f.touches)} since ${f.since.slice(0, 10)}${f.last_touch ? ' · last ' + f.last_touch.slice(0, 16).replace('T', ' ') : ''}</p>
+      <p${f.hot ? ' class="warn"' : ''}>${esc(f.verdict)}</p>`;
+  } else if (ents.length) {
+    h += `<h4>Touches</h4><p class="mut">${fmtCounts(f.touches)} since it was written; episodic notes carry no pressure.</p>`;
+  }
+  if (f.ladder) h += `<h4>Form ladder</h4><p class="mut">Export target: ${esc(f.ladder)}.</p>`;
+  h += `<h4>History</h4><p class="mut">${f.replaces ? `Replaces <a class="ent" data-id="${f.replaces.id}">#${f.replaces.id}</a> (${f.replaces.ts.slice(0, 10)}). ` : ''}${f.superseded_by ? `Superseded by <a class="ent" data-id="${f.superseded_by.id}">#${f.superseded_by.id}</a> (${f.superseded_by.ts.slice(0, 10)}).` : 'Live; superseded by nothing.'}</p>`;
+  h += `<h4>Commands</h4>`;
+  if (f.kind === 'procedural' && !f.dead) h += cmd(`${me} touch ${f.id}`) + (f.hot ? cmd(`${me} touch ${f.id} --keep`) : '');
+  if (!f.dead) h += cmd(`${me} note ${f.kind} "…" --supersedes=${f.id}${ents.length ? ' --entities=' + ents.join(',') : ''}`);
+  if (ents.length) h += cmd(`${me} recall ${ents[0]}`);
+  return h;
+}
+
+// ---- ledger
+let qTimer;
+async function loadLedger() {
+  const p = new URLSearchParams({q: S.q, ...S.f});
+  const d = await j('/api/search?' + p);
+  $('#qmeta').textContent = d.error ? d.error : `${d.total} hit${d.total === 1 ? '' : 's'} · ${d.ms} ms${d.total > d.rows.length ? ' · showing ' + d.rows.length : ''}`;
+  const fac = (key, obj, label) => `<h4>${label}</h4>` + (Object.keys(obj).length ? Object.entries(obj).map(([k, n]) =>
+    `<div class="f${S.f[key] === k ? ' on' : ''}" data-fk="${key}" data-fv="${esc(k)}"><span>${esc(key === 'scope' ? short(k) : k)}</span><span>${n}</span></div>`).join('') : '<div class="mut">none</div>');
+  $('#facets').innerHTML = fac('kind', d.facets.kind || {}, 'Kind') + fac('scope', d.facets.scope || {}, 'Scope') + fac('entity', d.facets.entity || {}, 'Entities in results') +
+    `<h4>Superseded</h4><div class="f${S.f.dead === '1' ? ' on' : ''}" data-fk="dead" data-fv="1"><span>show superseded rows</span><span></span></div>` +
+    (Object.keys(S.f).length ? `<h4>&nbsp;</h4><div class="f" data-clear="1"><span>clear filters</span><span></span></div>` : '');
+  const terms = S.q.split(/\s+/).filter(t => t && !/^(AND|OR|NOT)$/.test(t)).map(t => t.replace(/^"|"$/g, ''));
+  const hl = s => { let h = esc(s); for (const t of terms) { const re = new RegExp('(' + t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'ig'); h = h.replace(re, '<mark>$1</mark>'); } return h; };
+  if (!d.rows.length) { $('#results').innerHTML = `<div class="empty">${d.error ? '' : 'No match.'}</div>`; return; }
+  $('#results').innerHTML = `<table><thead><tr><th>#</th><th>when</th><th>kind</th><th>scope</th><th>entities</th><th>text</th></tr></thead><tbody>` +
+    d.rows.map(r => `<tr class="r${S.open.includes(r.id) ? ' on' : ''}" data-row="${r.id}"><td class="id">${r.id}</td><td class="ts">${r.ts.slice(5, 10)}</td><td><span class="k ${r.kind}">${r.kind}</span></td><td class="mut">${esc(short(r.scope))}</td><td>${r.entities.split(',').filter(Boolean).map(e => `<a class="ent" data-e="${esc(e.trim())}">${esc(e.trim())}</a>`).join(', ')}</td><td class="${r.dead ? 'dead' : ''}">${hl(r.text)}</td></tr>` +
+      (S.open.includes(r.id) ? `<tr><td class="x" colspan="6" id="x${r.id}"><span class="mut">loading</span></td></tr>` : '')).join('') + '</tbody></table>';
+  for (const id of S.open) { const cell = $('#x' + id); if (cell) j('/api/fact?id=' + id).then(f => { cell.innerHTML = factHTML(f); }); }
+}
+async function loadFeed() {
+  const ev = await j('/api/feed');
+  const line = (e, i) => {
+    const ts = e.ts.slice(11, 19);
+    const isNew = S.newest && e.ts > S.newest;
+    const body = e.ev === 'touch'
+      ? `${esc(e.b)} touched <a class="ent" data-e="${esc(e.a)}">${esc(e.a)}</a>${e.d ? ` <span class="mut">· session ${esc(e.d.slice(0, 4))}</span>` : ''}`
+      : `note <a class="ent" data-id="${e.id}">#${e.id}</a> ${esc(e.b)} · ${esc(short(e.d))}${e.sup ? ` supersedes #${e.sup}` : ''}${e.a ? ` · <span class="mut">${esc(e.a)}</span>` : ''}`;
+    return `<div class="ev${isNew ? ' new' : ''}"><div class="ts">${ts}</div><div>${body}</div></div>`;
+  };
+  $('#feed').innerHTML = `<div class="fh2">Live<span class="mut" style="margin-left:auto;font-weight:400">${ev.length} newest</span></div>` + ev.map(line).join('');
+  $('#ticker').innerHTML = `<span class="mut">events</span>` + ev.slice(0, 4).map((e, i) => `<span>${e.ts.slice(11, 19)} ${e.ev === 'touch' ? `${esc(e.b)} touched <a class="ent" data-e="${esc(e.a)}">${esc(e.a)}</a>` : `note <a class="ent" data-id="${e.id}">#${e.id}</a> ${esc(e.b)} ${esc(short(e.d))}`}${S.newest && e.ts > S.newest ? ' <span class="new">new</span>' : ''}</span>`).join('');
+  if (!S.newest) S.newest = ev.length ? ev[0].ts : '';
+}
+
+// ---- live
+function live(txt, on) { $('#livetxt').textContent = txt; $('#live').classList.toggle('on', !!on); }
+const es = new EventSource('/api/events');
+es.onopen = () => live('live', true);
+es.onerror = () => live('reconnecting', false);
+es.onmessage = () => { S.writes++; live(`live · ${S.writes} write${S.writes === 1 ? '' : 's'} since open`, true); refresh(); };
+function refresh() { (S.tab === 'console' ? loadConsole() : loadLedger()); loadFeed(); }
+
+// ---- events
+document.addEventListener('click', e => {
+  const t = e.target.closest('[data-t],[data-s],[data-id],[data-e],[data-fk],[data-clear],[data-row],.cp');
+  if (!t) return;
+  if (t.matches('.cp')) { navigator.clipboard.writeText(t.dataset.c).then(() => { t.textContent = 'copied'; setTimeout(() => t.textContent = 'copy', 1200); }); return; }
+  if (t.dataset.t) { setTab(t.dataset.t); return; }
+  if (t.dataset.s) { S.scope = t.dataset.s; S.sel = null; $('#insp').innerHTML = '<p class="mut">Select a line to see why it prints.</p>'; loadConsole(); return; }
+  if (t.dataset.e !== undefined) { S.f = {entity: t.dataset.e}; S.q = ''; $('#q').value = ''; setTab('ledger'); return; }
+  if (t.dataset.fk) { const k = t.dataset.fk, v = t.dataset.fv; if (S.f[k] === v) delete S.f[k]; else S.f[k] = v; loadLedger(); return; }
+  if (t.dataset.clear) { S.f = {}; loadLedger(); return; }
+  if (t.dataset.row) { const id = +t.dataset.row; S.open = S.open.includes(id) ? S.open.filter(x => x !== id) : [...S.open, id]; loadLedger(); return; }
+  if (t.dataset.id) { const id = +t.dataset.id; if (S.tab === 'ledger' && !t.closest('#feed') && !t.closest('td.x')) { if (!S.open.includes(id)) S.open.push(id); loadLedger(); } else { setTab('console'); loadFact(id); } }
+});
+function setTab(tab) {
+  S.tab = tab;
+  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.t === tab));
+  document.querySelectorAll('section').forEach(s => s.classList.toggle('on', s.id === tab));
+  refresh();
+  if (tab === 'ledger') $('#q').focus();
+}
+$('#q').addEventListener('input', e => { S.q = e.target.value; clearTimeout(qTimer); qTimer = setTimeout(loadLedger, 200); });
+$('#q').addEventListener('keydown', e => { if (e.key === 'Enter') { clearTimeout(qTimer); S.q = e.target.value; loadLedger(); } });
+refresh();
+</script>
+"""
+
+
 PROMPT = """\
 ## Memory
 
@@ -1484,7 +1976,7 @@ def main():
     cmds = {"wake": cmd_wake, "note": cmd_note, "nap": cmd_nap, "recall": cmd_recall,
             "forget": cmd_forget, "promote": cmd_promote, "init": cmd_init,
             "project": cmd_project, "hook": cmd_hook, "mcp": cmd_mcp,
-            "html": cmd_html, "stale": cmd_stale, "touch": cmd_touch,
+            "html": cmd_html, "serve": cmd_serve, "stale": cmd_stale, "touch": cmd_touch,
             "prompt": cmd_prompt, "contribute": cmd_contribute,
             "org-init": cmd_org_init}
     if len(sys.argv) < 2 or sys.argv[1] not in cmds:

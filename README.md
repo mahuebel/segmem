@@ -213,7 +213,8 @@ rewrites a note without an agent deciding to.
 | `segmem contribute <id>` | print the org-repo candidate for a procedural fact, and the PR commands |
 | `segmem org-init <dir>` | scaffold a knowledge repo with the witnessing convention |
 | `segmem hook` | the prompt hook; reads JSON on stdin |
-| `segmem html [file] [--no-open]` | write a self-contained page that shows the store, and open it |
+| `segmem serve [--port=7878] [--no-open]` | serve a live page over the store on loopback; Ctrl-C stops it |
+| `segmem html [file] [--no-open]` | write a self-contained snapshot page of the store, and open it |
 | `segmem mcp` | run as an MCP server over stdio |
 | `segmem project` | print the scope key for the current directory |
 
@@ -276,11 +277,37 @@ The `init` output includes this block. For Claude Code, merge it into
 ## Seeing what it knows
 
 ```sh
+segmem serve
+```
+
+opens a live page at `http://127.0.0.1:7878/`. It runs in the foreground
+while you look and stops on Ctrl-C; nothing in the hooks depends on it, so
+the no-daemon promise holds. Stdlib only, loopback only, read-only: every
+route is a `SELECT`, and searching from the page never writes a touch, so
+browsing doesn't press on a fact. Two tabs:
+
+- **console**: what the agent sees at wake, byte for byte, for any scope.
+  Click a line and the right pane explains why it prints: overrides,
+  touches and pressure since its last review, the verdict `stale` would
+  give, the export target, its supersede history, and the commands to copy.
+  Episodic lines show the wake seq in the gutter and the global id at the
+  right, since `wake` numbers by seq and `recall` by id.
+- **ledger**: full-text search with the same FTS5 syntax as `recall`, facets
+  by kind, scope, and entity, an expandable row per hit, and a live feed of
+  touches and notes as they land.
+
+The page re-renders whenever any other connection commits: it holds one
+event stream and the server polls `PRAGMA data_version` twice a second.
+Where an action is implied it offers a command to copy; the CLI stays the
+only path that writes.
+
+```sh
 segmem html
 ```
 
 writes one self-contained HTML file (no libraries, no server, no network) to
-`~/.segmem/segmem.html` and opens it. Five views:
+`~/.segmem/segmem.html` and opens it: a snapshot you can send to someone.
+Five views:
 
 - **overview**: counts by kind and scope
 - **facts**: every memory, filtered by kind, scope, entity, or text, with

@@ -159,6 +159,65 @@ class Segmem(unittest.TestCase):
         self.assertEqual(replies[6]["error"]["code"], -32601)
         self.assertEqual(len(replies), 6)  # the notification got no reply
 
+    def test_wake_keeps_episodic_when_a_dossier_has_pressure(self):
+        # Regression: the people-pressure loop used to rebind the project
+        # variable, and the episodic section vanished for any store where a
+        # known person had been touched.
+        run("note", "people", "Alice owns deploys", "--entities=alice")
+        run("note", "episodic", "chose SQLite over DuckDB", "--entities=sqlite")
+        run("note", "episodic", "alice asked for a rollback plan", "--entities=alice")
+        w = run("wake")
+        self.assertIn("### Episodic (alpha)", w)
+        self.assertIn("chose SQLite", w)
+
+    def test_serve_is_live_and_read_only(self):
+        import json, socket, time, urllib.request
+        run("note", "procedural", "prefers pnpm", "--scope=global", "--entities=pkg")
+        run("note", "procedural", "uses npm for the Lambda runtime", "--entities=pkg")
+        run("note", "episodic", "chose SQLite over DuckDB", "--entities=sqlite")
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+        env = dict(os.environ, SEGMEM_DIR=run.dir, SEGMEM_PROJECT="/p/alpha")
+        srv = subprocess.Popen([sys.executable, TOOL, "serve", "--no-open", "--port=%d" % port],
+                               env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        base = "http://127.0.0.1:%d" % port
+        get = lambda path: urllib.request.urlopen(base + path, timeout=5).read().decode()
+        try:
+            for _ in range(50):
+                try:
+                    get("/api/state"); break
+                except OSError:
+                    time.sleep(0.1)
+            st = json.loads(get("/api/state"))
+            self.assertIn("OVERRIDDEN", st["wake"])          # byte-identical wake
+            self.assertEqual(st["seq"]["alpha"]["0"], 3)       # seq -> id map for episodic
+            self.assertEqual(st["scope"], "/p/alpha")
+            f = json.loads(get("/api/fact?id=1"))
+            self.assertEqual([c["id"] for c in f["conflicts"]], [2])
+            self.assertIn("OVERRIDDEN by #2", f["why"])
+            self.assertEqual(f["threshold"], 12)
+            hits = json.loads(get("/api/search?q=npm"))
+            self.assertEqual([r["id"] for r in hits["rows"]], [2])
+            self.assertEqual(hits["facets"]["entity"], {"pkg": 1})
+            self.assertEqual(json.loads(get("/api/search?q=&kind=procedural"))["total"], 2)
+            self.assertEqual(json.loads(get("/api/search?q=mem-op"))["total"], 0)  # no FTS crash
+            # Browsing presses on nothing: no recall touches were written.
+            self.assertNotIn("recall", run("stale", "--min=1"))
+            page = get("/")
+            self.assertIn("<title>segmem</title>", page)
+            self.assertNotIn("<script src=", page)
+            # A commit from another connection reaches the event stream.
+            es = urllib.request.urlopen(base + "/api/events", timeout=5)
+            self.assertEqual(es.readline().strip(), b": open")
+            run("note", "episodic", "second note")
+            line = b""
+            for _ in range(20):
+                line = es.readline().strip()
+                if line.startswith(b"data:"):
+                    break
+            self.assertTrue(line.startswith(b'data: {"v":'), line)
+        finally:
+            srv.terminate(); srv.wait(timeout=5)
+
     def test_html_is_self_contained(self):
         run("note", "identity", "prefers pnpm", "--entities=pkg")
         run("note", "procedural", "uses npm", "--entities=pkg")

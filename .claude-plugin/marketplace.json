@@ -6,13 +6,13 @@
   },
   "metadata": {
     "description": "Single-plugin marketplace distributing segmem, segmented scoped memory for coding agents",
-    "version": "0.4.0"
+    "version": "0.5.0"
   },
   "plugins": [
     {
       "name": "segmem",
       "description": "Long-term memory that knows the difference between who you are, how this repo works, and what happened on Tuesday. One Python file, SQLite, no daemon.",
-      "version": "0.4.0",
+      "version": "0.5.0",
       "source": "./",
       "author": {
         "name": "Mark Huebel",

@@ -285,8 +285,9 @@ while you look and stops on Ctrl-C; nothing in the hooks depends on it, so
 the no-daemon promise holds. Stdlib only, loopback only, read-only: every
 route is a `SELECT`, and searching from the page never writes a touch, so
 browsing doesn't press on a fact. A spine across the top shows every memory
-as one tick in id order, colored by kind, superseded ones hollow. Three tabs,
-reachable with `g` then `o`, `c`, or `l`; `/` jumps to search:
+as one tick in id order, colored by kind, superseded ones hollow. Seven tabs,
+reachable with `g` then a letter (`o` `c` `e` `h` `t` `n` `l`); `/` jumps to
+search:
 
 - **overview**: what the store holds and what needs a hand. Live count,
   pressure, superseded, summaries, scopes, untagged; a kind × scope matrix
@@ -303,6 +304,22 @@ reachable with `g` then `o`, `c`, or `l`; `/` jumps to search:
 - **ledger**: full-text search with the same FTS5 syntax as `recall`, facets
   by kind, scope, and entity, an expandable row per hit, and a live feed of
   touches and notes as they land.
+- **hook**: why recall did, or did not, fire. Type a prompt and see which
+  words the four rules keep (code spans, `#123`, path-like words,
+  capitalized words that are already tags), which they drop and why, the
+  FTS5 query, and the exact `<segmem-recall>` block the agent would get.
+  It runs `identifiers()` and the hook's query in-process without the touch,
+  so trying phrasings presses on nothing.
+- **tree**: how history decays. The episodic merge tree as an icicle, with
+  summarized blocks filled, the wake cover outlined, and the block `nap`
+  would ask for first dashed. Scrub the budget and the stream length to see
+  what wake looks like at 200 or 1,000 notes and where compressions land.
+- **entities**: what the store is about. A co-occurrence graph of tags (size
+  is facts, line is shared facts, tags that share nothing sit on the outer
+  ring), every tag with its kinds and scopes, and vocabulary hygiene:
+  near-duplicate spellings, name-like tags with no people record, untagged.
+- **lineage**: how a fact changed. Every supersede chain as a timeline with
+  word-level diffs between versions.
 
 The page re-renders whenever any other connection commits: it holds one
 event stream and the server polls `PRAGMA data_version` twice a second.

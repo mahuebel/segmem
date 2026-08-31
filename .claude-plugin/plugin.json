@@ -1,6 +1,6 @@
 {
   "name": "segmem",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Segmented, scoped memory for agents: one file, SQLite, no daemon. Wake at session start, recall on every prompt, staleness nag at stop.",
   "author": {
     "name": "Mark Huebel",

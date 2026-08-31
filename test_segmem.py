@@ -207,6 +207,24 @@ class Segmem(unittest.TestCase):
             self.assertEqual((ov["live"], ov["superseded"], ov["overrides"]), (3, 0, 1))
             self.assertEqual(ov["due"]["/p/alpha"]["pending"], 0)   # nothing due under budget
             self.assertGreater(ov["wake"]["/p/alpha"]["tokens"], 0)
+            hk = json.loads(get("/api/hook?" + urllib.parse.urlencode(
+                {"prompt": "why npm for the `Lambda` runtime, see #2 and Alice", "scope": "/p/alpha"})))
+            self.assertEqual(hk["identifiers"], ["Lambda"])
+            # "#2" is three bytes with the hash, so it falls under the min length; Alice is prose: no tag
+            self.assertEqual([(d["word"], d["why"]) for d in hk["dropped"]],
+                             [("#2", "too short"), ("Alice", "capitalized but not a tag: prose")])
+            self.assertIn("#2 ", hk["output"])
+            self.assertNotIn("#1 ", hk["output"])                          # project + global, ranked; Lambda hits #2 only
+            tr = json.loads(get("/api/tree?scope=/p/alpha&budget=1&T=4"))
+            self.assertEqual((tr["real_T"], tr["T"], len(tr["cover"])), (1, 4, 1))
+            self.assertEqual(tr["pending"], [[0, 2], [2, 4], [0, 4]])       # smallest first
+            en = json.loads(get("/api/entities"))
+            self.assertEqual(en["nodes"][0]["id"], "pkg")
+            self.assertEqual(en["nodes"][0]["n"], 2)
+            run("note", "procedural", "uses npm; the Lambda runtime needs it", "--entities=pkg", "--supersedes=2")
+            ch = json.loads(get("/api/chains"))["chains"]
+            self.assertEqual([v["id"] for v in ch[0]["versions"]], [2, 4])
+            self.assertIn(["+", "needs it"], [[op, t] for op, t in ch[0]["versions"][1]["diff"] if op == "+"])
             # Browsing presses on nothing: no recall touches were written.
             self.assertNotIn("recall", run("stale", "--min=1"))
             page = get("/")

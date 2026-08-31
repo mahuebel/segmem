@@ -1183,7 +1183,7 @@ def cmd_mcp(c, args):
             if method == "initialize":
                 result = {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
                           "capabilities": {"tools": {}},
-                          "serverInfo": {"name": "segmem", "version": "0.6.0"}}
+                          "serverInfo": {"name": "segmem", "version": "0.7.0"}}
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
@@ -1673,6 +1673,177 @@ def serve_overview(c, lock):
     return data
 
 
+def serve_hook(c, prompt, scope):
+    """The prompt hook, run in-process and without its touch(): the same
+    identifiers() and the same query, so the block is what the agent would
+    receive, and trying phrasings presses on nothing."""
+    tags = known_tags(c)
+    ids = identifiers(prompt, tags)
+    caps = re.findall(r"\b[A-Z][a-zA-Z0-9]{2,}\b", prompt)
+    rules = {"code": [t for tok in re.findall(r"`([^`]+)`", prompt) for t in tok.split()],
+             "issue": re.findall(r"#\d+", prompt),
+             "path": re.findall(r"[A-Za-z][\w./-]*[_/.-][\w./-]*", prompt),
+             "tag": [w for w in caps if w.lower() in tags]}
+    kept = {i.lower() for i in ids}
+    dropped, seen = [], set()
+    for words in rules.values():
+        for w in words:
+            k = w.strip("`.,;:()[]{}'\"").lower()
+            if k in seen or k in kept:
+                continue
+            seen.add(k)
+            dropped.append({"word": w, "why": "too short" if len(k) <= 2 else
+                            "stop word" if k in STOP else "dropped"})
+    for w in dict.fromkeys(caps):
+        if w.lower() not in tags and w.lower() not in kept:
+            lw = w.lower()
+            near = next((t for t in sorted(tags) if t.startswith(lw + "-") or t.endswith("-" + lw)
+                         or (len(lw) > 3 and lw in t)), None)
+            dropped.append({"word": w, "why": "capitalized but not a tag: prose",
+                            "near": tags[near] if near else None})
+    rows, orows, q = [], [], None
+    if ids:
+        q = " OR ".join('"%s"' % i.replace('"', '""') for i in ids)
+        try:
+            rows = c.execute(
+                "SELECT m.* FROM memories_fts f JOIN memories m ON m.id=f.rowid "
+                "WHERE memories_fts MATCH ? AND m.scope IN (?,?) AND %s "
+                "ORDER BY rank LIMIT ?" % LIVE, (q, GLOBAL, scope, HOOK_MAX)).fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+        oc = org_connect()
+        orows = org_search(oc, q, HOOK_MAX - len(rows)) if oc and len(rows) < HOOK_MAX else []
+    out = []
+    if rows or orows:
+        out.append("<segmem-recall>")
+        for r in rows:
+            out.append("#%d %s %s %s: %s" % (r["id"], r["ts"][:10], r["kind"], short(r["scope"]), r["text"]))
+        for r in orows:
+            out.append(org_line(r, path=False))
+        out.append("</segmem-recall>")
+    return {"identifiers": ids, "rules": rules, "dropped": dropped, "fts": q,
+            "output": "\n".join(out), "scope": scope, "hits": len(rows) + len(orows), "max": HOOK_MAX}
+
+
+def pending_at(c, scope, T, budget):
+    """pending() with an explicit budget instead of the cwd's. Same walk."""
+    need = []
+
+    def walk(lo, hi):
+        if hi - lo == 1 or summary(c, "episodic", scope, lo, hi) is not None:
+            return
+        mid = (lo + hi) // 2
+        walk(lo, mid)
+        walk(mid, hi)
+        need.append((lo, hi))
+
+    for lo, hi in cover(T, budget):
+        walk(lo, hi)
+    return sorted(set(need), key=lambda b: (b[1] - b[0], b[0]))
+
+
+def serve_tree(c, scope, budget, T):
+    real_T = stream_len(c, "episodic", scope)
+    T = max(T or real_T, real_T)
+    budget = max(1, budget or WAKE_EPISODIC)
+    sums = {(lo, hi): text for lo, hi, text in c.execute(
+        "SELECT lo, hi, text FROM summaries WHERE kind='episodic' AND scope=?", (scope,))}
+    leaves = [dict(r) for r in c.execute(
+        "SELECT id, seq, ts, entities, text FROM memories WHERE kind='episodic' AND scope=? ORDER BY seq",
+        (scope,))]
+    cov = [{"lo": lo, "hi": hi, "summary": sums.get((lo, hi)),
+            "span": span(c, scope, lo, min(hi, real_T)) if lo < real_T else ""}
+           for lo, hi in cover(T, budget)]
+    return {"scope": scope, "T": T, "real_T": real_T, "budget": budget, "cover": cov,
+            "pending": pending_at(c, scope, T, budget), "leaves": leaves,
+            "summaries": [{"lo": k[0], "hi": k[1], "text": v} for k, v in sorted(sums.items())]}
+
+
+def near_tags(tags):
+    """Tag pairs that probably mean one thing: close spelling (difflib >= 0.8,
+    the cutoff note's own hint uses) or one tag being a hyphen-delimited part
+    of another (`atlas` in `system-atlas`), which difflib misses."""
+    import difflib
+    keys = sorted(tags)
+    pairs, seen = [], set()
+
+    def add(a, b, why):
+        key = tuple(sorted((a, b)))
+        if key not in seen:
+            seen.add(key)
+            pairs.append({"a": tags[key[0]], "b": tags[key[1]], "why": why,
+                          "ratio": round(difflib.SequenceMatcher(None, *key).ratio(), 2)})
+
+    for k in keys:
+        for n in difflib.get_close_matches(k, [x for x in keys if x != k], n=3, cutoff=0.8):
+            add(k, n, "similar spelling")
+        for part in set(re.split(r"[-_./]", k)) - {k}:
+            if part in tags:
+                add(k, part, "%s is part of %s" % (part, k))
+    return pairs
+
+
+def serve_entities(c):
+    rows = [r for r in c.execute("SELECT * FROM memories WHERE %s ORDER BY id" % LIVE)]
+    people = {e for r in rows if r["kind"] == "people" for e in entity_set(r)}
+    tags = known_tags(c)
+    per, co = {}, {}
+    for r in rows:
+        es = sorted(entity_set(r))
+        for e in es:
+            d = per.setdefault(e, {"n": 0, "kinds": {}, "scopes": {}, "ids": []})
+            d["n"] += 1
+            d["kinds"][r["kind"]] = d["kinds"].get(r["kind"], 0) + 1
+            d["scopes"][short(r["scope"])] = d["scopes"].get(short(r["scope"]), 0) + 1
+            d["ids"].append(r["id"])
+        for i in range(len(es)):
+            for k in range(i + 1, len(es)):
+                co[(es[i], es[k])] = co.get((es[i], es[k]), 0) + 1
+    nodes = [dict(id=k, label=tags.get(k, k), person=k in people, **v)
+             for k, v in sorted(per.items(), key=lambda kv: -kv[1]["n"])]
+    edges = [{"a": a, "b": b, "n": n} for (a, b), n in sorted(co.items(), key=lambda kv: -kv[1])]
+    orphans = [t for t in tags.values() if re.fullmatch(r"[A-Z][a-z]+", t) and t.lower() not in people]
+    return {"nodes": nodes, "edges": edges, "near": near_tags(tags), "orphans": orphans,
+            "untagged": sum(1 for r in rows if not r["entities"].strip()), "live": len(rows)}
+
+
+def word_diff(a, b):
+    """Word-level diff as [op, text] segments: '=' kept, '-' removed, '+' added."""
+    import difflib
+    wa, wb = a.split(), b.split()
+    out = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, wa, wb).get_opcodes():
+        if tag == "equal":
+            out.append(["=", " ".join(wa[i1:i2])])
+        else:
+            if i2 > i1:
+                out.append(["-", " ".join(wa[i1:i2])])
+            if j2 > j1:
+                out.append(["+", " ".join(wb[j1:j2])])
+    return out
+
+
+def serve_chains(c):
+    rows = {r["id"]: dict(r) for r in c.execute("SELECT * FROM memories ORDER BY id")}
+    nxt = {r["supersedes"]: r["id"] for r in rows.values() if r["supersedes"]}
+    out = []
+    for h in [i for i, r in rows.items() if r["supersedes"] is None and i in nxt]:
+        chain, i = [], h
+        while i is not None:
+            chain.append(rows[i])
+            i = nxt.get(i)
+        for k in range(1, len(chain)):
+            d = word_diff(chain[k - 1]["text"], chain[k]["text"])
+            chain[k]["diff"] = d
+            chain[k]["added"] = sum(len(t.split()) for op, t in d if op == "+")
+            chain[k]["removed"] = sum(len(t.split()) for op, t in d if op == "-")
+        out.append({"head": h, "kind": rows[h]["kind"], "scope": rows[h]["scope"],
+                    "entities": sorted({e for m in chain for e in entity_set(m)}),
+                    "versions": chain})
+    out.sort(key=lambda ch: (-len(ch["versions"]), -ch["versions"][-1]["id"]))
+    return {"chains": out}
+
+
 def cmd_serve(c, args):
     import json, threading, time, webbrowser
     from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -1720,6 +1891,15 @@ def cmd_serve(c, args):
                     data = serve_spine(db)
                 elif name == "overview":
                     data = serve_overview(db, lock)
+                elif name == "hook":
+                    data = serve_hook(db, q.get("prompt", ""), q.get("scope") or project())
+                elif name == "tree":
+                    data = serve_tree(db, q.get("scope") or project(),
+                                      int(q.get("budget") or 0), int(q.get("T") or 0))
+                elif name == "entities":
+                    data = serve_entities(db)
+                elif name == "chains":
+                    data = serve_chains(db)
                 else:
                     data = None
             finally:
@@ -1877,7 +2057,7 @@ td.x h4{margin:12px 0 4px;font-size:11px;letter-spacing:.08em;text-transform:upp
 <header>
   <div class="hrow">
     <h1 class="display">seg<b>·</b>mem</h1>
-    <nav><button data-t="overview" class="on">overview<kbd>go</kbd></button><button data-t="console">console<kbd>gc</kbd></button><button data-t="ledger">ledger<kbd>gl</kbd></button></nav>
+    <nav><button data-t="overview" class="on">overview<kbd>go</kbd></button><button data-t="console">console<kbd>gc</kbd></button><button data-t="ledger">ledger<kbd>ge</kbd></button><button data-t="hook">hook<kbd>gh</kbd></button><button data-t="tree">tree<kbd>gt</kbd></button><button data-t="entities">entities<kbd>gn</kbd></button><button data-t="lineage">lineage<kbd>gl</kbd></button></nav>
     <div class="hright"><span class="mono num" id="hmeta"></span><span id="live"><i></i><span id="livetxt">connecting</span></span><button class="btn" id="theme" aria-label="toggle theme">◐</button></div>
   </div>
   <div id="spine"></div>
@@ -1897,6 +2077,10 @@ td.x h4{margin:12px 0 4px;font-size:11px;letter-spacing:.08em;text-transform:upp
   <div class="qbar"><input id="q" placeholder="search text and tags  ( / )" autocomplete="off"></div>
   <div class="ledger3"><aside id="facets"></aside><div class="panel" id="results"></div><aside class="panel" id="feed"></aside></div>
 </div></section>
+<section id="hook"><div class="wrap rise" id="hk"></div></section>
+<section id="tree"><div class="wrap rise" id="tr"></div></section>
+<section id="entities"><div class="wrap rise" id="en"></div></section>
+<section id="lineage"><div class="wrap rise" id="li"></div></section>
 </main>
 <script>
 const $ = s => document.querySelector(s);
@@ -1988,7 +2172,7 @@ async function loadOverview() {
 // ---- console
 async function loadConsole() {
   const d = await j('/api/state' + (S.scope ? '?scope=' + encodeURIComponent(S.scope) : ''));
-  S.scope = d.scope; S.me = d.me; S.db = d.db; S.budget = d.budget;
+  S.scope = d.scope; S.me = d.me; S.db = d.db; S.budget = d.budget; S.scopes = d.scopes;
   $('#scopes').innerHTML = d.scopes.map(s => `<button class="chip mono${s.scope === d.scope ? ' on' : ''}" data-s="${esc(s.scope)}">${esc(slabel(s.scope))} <span style="opacity:.7">${s.n}</span></button>`).join('');
   $('#wake-eb').textContent = `SEGMEM_PROJECT=${short(d.scope)} segmem wake`;
   let sec = '', kind = '';
@@ -2072,32 +2256,235 @@ async function loadFeed() {
   if (!S.newest) S.newest = ev.length ? ev[0].ts : '';
 }
 
+// ---- hook: why recall did, or did not, fire
+const HOOK_RULES = [['code', 'code span', 'every word inside `backticks`'], ['issue', '#issue', '# followed by digits'], ['path', 'path · snake · kebab', 'a word containing _ / . or -'], ['tag', 'capitalized known tag', 'a Capitalized word that is already a tag']];
+let hookTimer;
+function scopeChips(sel, attr, counts) { return (S.scopes || []).map(s => `<button class="chip mono${s.scope === sel ? ' on' : ''}" data-${attr}="${esc(s.scope)}">${esc(slabel(s.scope))} <span style="opacity:.7">${counts ? (counts[s.scope] || 0) : s.n}</span></button>`).join(''); }
+async function loadHook() {
+  const box = $('#hk');
+  if (!box.dataset.ready) {
+    box.dataset.ready = 1; S.hookScope = S.hookScope || S.scope;
+    box.innerHTML = `<div class="vh"><div><div class="eyebrow">why recall did, or did not, fire</div><h2 class="display">Hook</h2></div><div id="hk-scopes"></div></div>
+      <div class="g12"><div class="c7" style="display:flex;flex-direction:column;gap:16px">
+        <div class="panel"><div class="ph"><div><div class="eyebrow">a prompt, as you would type it</div></div><div class="r">runs as you type · presses on nothing</div></div><div class="pb"><textarea id="hk-p" rows="3" spellcheck="false" class="mono" style="width:100%;resize:vertical;padding:10px 12px;border-radius:6px;line-height:1.6">Fix the \`segmem hook\` recall for #150, see ARCHITECTURE.md and ask Mark</textarea><p id="hk-marked" style="margin:12px 0 0;padding:10px 12px;border:1px solid var(--line);border-radius:6px;background:color-mix(in oklab,var(--surface-2) 50%,transparent);line-height:1.6"></p></div></div>
+        <div class="panel"><div class="ph"><div><div class="eyebrow">four rules, one pass</div><h2>Identifiers</h2></div></div><div class="pb" id="hk-rules"></div></div>
+        <div class="panel"><div class="ph"><div><div class="eyebrow">what the agent receives</div><h2>&lt;segmem-recall&gt; <span class="ink2">block</span></h2></div><div class="r" id="hk-meta"></div></div><div class="pb" id="hk-out"></div></div>
+      </div><div class="c5" style="display:flex;flex-direction:column;gap:12px">
+        <div class="stats" style="grid-template-columns:1fr 1fr;margin:0" id="hk-stats"></div>
+        <div class="panel"><div class="pb"><div class="eyebrow">scope searched</div><p class="ink2" style="margin:6px 0 0;font-size:12.5px" id="hk-scope"></p></div></div>
+        <div class="panel"><div class="pb"><div class="eyebrow">phrasing that gets found</div><ul class="ink2" style="margin:6px 0 0;padding-left:18px;font-size:12.5px;line-height:1.6"><li>Put a name in <code>\`backticks\`</code>: every word inside counts.</li><li>Use the tag's stored spelling; hyphenate multiword names (<code>kerf-builder</code>).</li><li><code>#123</code> counts. Plain prose, and a capitalized word that is not yet a tag, never does.</li><li>The hook searches this project plus global only. Be in the right repo.</li></ul></div></div>
+        <div class="panel"><div class="pb"><div class="eyebrow">run it yourself</div><div id="hk-cmd"></div></div></div>
+      </div></div>`;
+    $('#hk-p').addEventListener('input', () => { clearTimeout(hookTimer); hookTimer = setTimeout(runHook, 300); });
+  }
+  $('#hk-scopes').innerHTML = scopeChips(S.hookScope, 'hs');
+  runHook();
+}
+async function runHook() {
+  const prompt = $('#hk-p').value;
+  const r = await j('/api/hook?' + new URLSearchParams({prompt, scope: S.hookScope}));
+  const ids = r.identifiers, idset = new Set(ids.map(x => x.toLowerCase()));
+  let marked = esc(prompt);
+  if (ids.length) { const re = new RegExp('(' + [...ids].sort((a, b) => b.length - a.length).map(x => esc(x).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')', 'g'); marked = marked.replace(re, '<mark>$1</mark>'); }
+  $('#hk-marked').innerHTML = marked || '<span class="mut">type a prompt</span>';
+  const strip = w => w.replace(/^[`.,;:()[\]{}'"]+|[`.,;:()[\]{}'"]+$/g, '').toLowerCase();
+  $('#hk-rules').innerHTML = `<div class="g12" style="gap:10px">` + HOOK_RULES.map(([k, label, how]) => `<div class="c3" style="grid-column:span 3;border:1px solid var(--line);border-radius:6px;padding:10px"><div class="eyebrow">${label}</div><div class="mut" style="font-size:11px;margin-top:2px">${how}</div><div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:8px">${r.rules[k].length ? r.rules[k].map(w => `<code style="padding:0 5px;border-radius:3px;${idset.has(strip(w)) ? 'background:color-mix(in oklab,var(--accent) 22%,transparent)' : 'background:var(--surface-2);color:var(--mute);text-decoration:line-through'}">${esc(w)}</code>`).join('') : '<span class="mut" style="font-size:12px">none</span>'}</div></div>`).join('') + `</div>
+    <div class="g12" style="margin-top:14px"><div class="c6" style="grid-column:span 6"><div class="eyebrow">kept · ${ids.length}</div>${ids.length ? `<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:6px">${ids.map(i => `<code style="padding:0 5px;border-radius:3px;background:color-mix(in oklab,var(--accent) 22%,transparent)">${esc(i)}</code>`).join('')}</div>` : '<p class="mut" style="font-size:12px">nothing worth looking up</p>'}${r.fts ? `<div class="eyebrow" style="margin-top:10px">FTS5 query</div><code class="ink2" style="display:block;margin-top:4px;padding:8px;border:1px solid var(--line);border-radius:6px;word-break:break-all">${esc(r.fts)}</code>` : ''}</div>
+    <div class="c6" style="grid-column:span 6"><div class="eyebrow">dropped · ${r.dropped.length}</div>${r.dropped.length ? `<ul style="margin:6px 0 0;padding:0;list-style:none;font-size:12.5px;line-height:1.7">${r.dropped.map(d => `<li><code>${esc(d.word)}</code> <span class="ink2">${esc(d.why)}</span>${d.near ? ` <span class="mut">· the tag is <a class="ent mono" data-e="${esc(d.near)}">${esc(d.near)}</a></span>` : ''}</li>`).join('')}</ul>` : '<p class="mut" style="font-size:12px">every candidate survived</p>'}</div></div>`;
+  $('#hk-meta').textContent = `${r.hits} hit${r.hits === 1 ? '' : 's'} of ${r.max}`;
+  $('#hk-out').innerHTML = r.output ? `<pre class="mono" style="margin:0;white-space:pre-wrap;word-break:break-word;padding:10px 12px;border:1px solid var(--line);border-radius:6px;background:color-mix(in oklab,var(--bg) 60%,transparent);line-height:1.6">${r.output.split('\n').map(l => { const m = /^#(\d+)(\s.*)$/.exec(l); return m ? `<a class="ent" data-id="${m[1]}">#${m[1]}</a>${esc(m[2])}` : `<span class="mut">${esc(l)}</span>`; }).join('\n')}</pre>`
+    : `<div class="empty" style="border:1px dashed var(--line-2);border-radius:8px"><div class="display" style="font-size:20px;color:var(--ink)">No output</div><p class="ink2" style="max-width:60ch;margin:8px auto 0;font-size:13px">${ids.length ? `The identifiers were searched in <b>${esc(short(S.hookScope))}</b> and global and nothing matched. Silence is the hook's normal answer; it never blocks a prompt.` : 'No identifier in the prompt: no code span, no #issue, no path-like word, no capitalized word that is already a tag. Plain prose is never searched.'}</p></div>`;
+  $('#hk-stats').innerHTML = `<div class="panel stat"><div class="eyebrow">identifiers</div><div class="display num v acc">${ids.length}</div></div><div class="panel stat"><div class="eyebrow">hits</div><div class="display num v">${r.hits}</div><div class="s">of ${r.max} max</div></div>`;
+  $('#hk-scope').innerHTML = `<span class="mono" style="color:var(--ink)">${esc(short(S.hookScope))}</span> plus <span class="mono" style="color:var(--ink)">global</span>. Live facts only; a superseded memory never comes back through the hook.`;
+  const sh = s => "'" + String(s).replace(/'/g, "'\\''") + "'";
+  const cmd = `printf '%s' ${sh(JSON.stringify({prompt}))} | SEGMEM_PROJECT=${sh(S.hookScope)} ${S.me} hook`;
+  $('#hk-cmd').innerHTML = `<div class="cmd" style="margin-top:6px"><code>${esc(cmd)}</code><button class="cp" data-c="${esc(cmd)}">copy</button></div>`;
+}
+
+// ---- tree: how history decays
+let treeTimer;
+const rootOf = T => { let r = 1; while (r < T) r *= 2; return r; };
+async function loadTree() {
+  const box = $('#tr');
+  const epi = {}; S.spine.forEach(r => { if (r[1] === 'episodic') epi[r[2]] = (epi[r[2]] || 0) + 1; });
+  const scopes = Object.entries(epi).sort((a, b) => b[1] - a[1]);
+  if (!scopes.length) { box.innerHTML = `<div class="empty">No episodic memories yet. The tree grows from decisions with their reasons, root causes, and handoffs.</div>`; return; }
+  if (!scopes.some(([s]) => s === S.treeScope)) { S.treeScope = scopes[0][0]; S.treeT = 0; }
+  const realT = epi[S.treeScope];
+  if (!S.treeBudget) S.treeBudget = S.budget || 64;
+  const T = Math.max(S.treeT || 0, realT), budget = S.treeBudget;
+  const t = await j('/api/tree?' + new URLSearchParams({scope: S.treeScope, budget, T}));
+  const root = rootOf(Math.max(t.T, 1));
+  const chip = (on, attr, val, label) => `<button class="chip mono${on ? ' on' : ''}" data-${attr}="${val}">${label}</button>`;
+  let h = `<div class="vh"><div><div class="eyebrow">tree · how history decays</div><h2 class="display">Episodic merge tree <span class="ink2">for ${esc(short(t.scope))}</span></h2>
+    <p class="ink2" style="max-width:76ch;margin:8px 0 0;font-size:13.5px">A block may be as wide as it is old, so each doubling of age gets about the same number of lines: the newest facts print verbatim, the oldest as one line each (Datar, Gionis, Indyk, Motwani, 2002). The outline shows what <code>wake</code> prints at this budget; dashed accent shows what <code>nap</code> would ask for first.</p></div>
+    <div id="tr-scopes" style="display:flex;gap:6px;flex-wrap:wrap">${scopes.map(([s, n]) => chip(s === S.treeScope, 'ts', esc(s), `${esc(short(s))} <span style="opacity:.7">${n}</span>`)).join('')}</div></div>`;
+  const stat = (l, v, s, tone) => `<div class="panel stat"><div class="eyebrow">${l}</div><div class="display num v ${tone || ''}">${v}</div><div class="s">${s}</div></div>`;
+  h += `<div class="stats">${stat('T · stream', fmt(t.T), t.T > t.real_T ? `${fmt(t.real_T)} real, ${fmt(t.T - t.real_T)} simulated` : 'real length', t.T > t.real_T ? 'acc' : '')}${stat('budget', budget, budget === (S.budget || 64) ? 'wake default' : `default ${S.budget || 64}`)}${stat('cover', t.cover.length, 'lines wake prints', 'k-episodic')}${stat('summarized', t.summaries.length, 'blocks with a line')}${stat('pending', t.pending.length, 'compressions due', t.pending.length ? 'acc' : '')}${stat('root', fmt(root), 'next power of two')}</div>`;
+  h += `<div class="panel" style="margin-bottom:16px"><div class="ph"><div><div class="eyebrow">scrub</div><h2>Budget and stream length</h2></div><div class="r">cover() ran on the server</div></div><div class="pb g12">
+    <div class="c6" style="grid-column:span 6"><div style="display:flex;justify-content:space-between;font-size:12px"><span class="eyebrow">wake budget</span><span class="mono num">${budget} lines</span></div><input type="range" id="tr-b" min="1" max="256" value="${budget}" style="width:100%;accent-color:var(--k-episodic);padding:0;border:0;background:none"><div style="display:flex;gap:4px;margin-top:6px">${[16, 64, 128, 256].map(b => chip(budget === b, 'tb', b, b + (b === 16 ? ' global' : b === 64 ? ' project' : ''))).join('')}</div></div>
+    <div class="c6" style="grid-column:span 6"><div style="display:flex;justify-content:space-between;font-size:12px"><span class="eyebrow">T · notes in the stream</span><span class="mono num">${T}${T > realT ? `<span class="acc"> (+${T - realT} simulated)</span>` : ''}</span></div><input type="range" id="tr-t" min="${realT || 1}" max="4096" value="${T}" style="width:100%;accent-color:var(--accent);padding:0;border:0;background:none"><div style="display:flex;gap:4px;margin-top:6px;flex-wrap:wrap">${chip(T <= realT, 'tt', realT, 'real · ' + realT)}${[[65, 'first nap'], [128, '128'], [256, '256'], [1024, '1024']].map(([v, l]) => chip(T === v, 'tt', v, l)).join('')}</div></div></div></div>`;
+  // icicle
+  const sums = new Map(t.summaries.map(s => [`${s.lo}-${s.hi}`, s.text])), cov = new Map(t.cover.map(b => [`${b.lo}-${b.hi}`, b])), pend = new Map(t.pending.map(([lo, hi], i) => [`${lo}-${hi}`, i])), leafBySeq = new Map(t.leaves.map(l => [l.seq, l]));
+  const W = 1000, RH = 22, RG = 3, levels = []; for (let s = root; s >= 1; s /= 2) levels.push(s);
+  const H = levels.length * (RH + RG), px = W / root;
+  let svg = `<svg viewBox="0 0 ${W} ${H}" style="display:block;width:100%;height:auto" role="img" aria-label="merge tree of ${t.T} episodic memories"><defs><pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" stroke="var(--line-2)" stroke-width="1" opacity=".5"></line></pattern></defs>`;
+  if (t.T < root) svg += `<rect x="${t.T * px}" y="0" width="${(root - t.T) * px}" height="${H}" fill="url(#hatch)" opacity=".35"></rect>`;
+  if (t.T > t.real_T) svg += `<line x1="${t.real_T * px}" x2="${t.real_T * px}" y1="0" y2="${H}" stroke="var(--accent)" stroke-dasharray="2 3" opacity=".8"></line>`;
+  svg += `<line x1="${t.T * px}" x2="${t.T * px}" y1="0" y2="${H}" stroke="var(--ink-2)" opacity=".7"></line>`;
+  levels.forEach((size, li) => {
+    const y = li * (RH + RG);
+    for (let lo = 0; lo < root; lo += size) {
+      const hi = lo + size, w = size * px - (size === root ? 0 : 1); if (w < 1) continue;
+      const k = `${lo}-${hi}`, future = lo >= t.T, isLeaf = size === 1, sum = sums.get(k), inCover = cov.has(k), pi = pend.get(k), leaf = isLeaf ? leafBySeq.get(lo) : null, simulated = isLeaf && !future && lo >= t.real_T;
+      let fill = 'var(--surface-2)'; if (future) fill = 'none'; else if (isLeaf) fill = leaf ? 'var(--surface)' : 'none'; else if (sum) fill = 'color-mix(in oklab, var(--k-episodic) 22%, transparent)';
+      const stroke = pi !== undefined ? 'var(--accent)' : inCover ? 'var(--k-episodic)' : 'var(--line)', sw = pi !== undefined ? (pi === 0 ? 2.5 : 1.5) : inCover ? 2 : 1, dash = pi !== undefined ? (pi === 0 ? '' : '4 3') : (future || simulated) ? '2 2' : '';
+      const title = isLeaf ? `#${lo}${leaf ? ` · id ${leaf.id} · ${leaf.ts.slice(0, 10)}\n${leaf.text}` : future ? ' · beyond T' : ' · simulated'}` : `#${lo}–${hi - 1} · ${size} memories${cov.get(k) && cov.get(k).span ? ' · ' + cov.get(k).span : ''}${inCover ? ' · in the wake cover' : ''}${pi !== undefined ? ` · pending compression${pi === 0 ? ' (next nap)' : ' #' + (pi + 1)}` : ''}\n${sum || (future ? '' : 'not summarized')}`;
+      svg += `<g${leaf ? ` data-id="${leaf.id}" data-tscope="1" style="cursor:pointer"` : ''}><rect x="${lo * px}" y="${y}" width="${w}" height="${RH}" rx="2" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"${dash ? ` stroke-dasharray="${dash}"` : ''} opacity="${future ? .35 : (!future && hi > t.T) ? .75 : 1}"><title>${esc(title)}</title></rect>`;
+      if (w > 40 && !future) svg += `<text x="${lo * px + 5}" y="${y + 15}" font-size="11" font-family="IBM Plex Mono, ui-monospace, monospace" fill="${inCover ? 'var(--ink)' : 'var(--mute)'}" pointer-events="none">${isLeaf ? '#' + lo : `#${lo}–${hi - 1}`}${sum && w > 120 ? `<tspan fill="var(--ink-2)"> ${esc(sum.slice(0, Math.floor(w / 7)))}</tspan>` : ''}</text>`;
+      svg += `</g>`;
+    }
+    svg += `<text x="${W - 4}" y="${y + 15}" font-size="10" font-family="IBM Plex Mono, ui-monospace, monospace" fill="var(--mute)" text-anchor="end" opacity=".8">${size === 1 ? 'raw' : '×' + size}</text>`;
+  });
+  svg += `</svg>`;
+  const sw = (f, s, d, wd, o) => `<svg width="18" height="12" style="vertical-align:middle"><rect x="1" y="1" width="16" height="10" rx="2" fill="${f || 'var(--surface-2)'}" stroke="${s || 'var(--line)'}" stroke-width="${wd || 1}"${d ? ` stroke-dasharray="${d}"` : ''}${o ? ` opacity="${o}"` : ''}></rect></svg>`;
+  h += `<div class="g12"><div class="c7" style="grid-column:span 8"><div class="panel"><div class="ph"><div><div class="eyebrow">icicle</div><h2>${fmt(t.T)} memories, ${t.cover.length} blocks in the cover</h2></div><div class="r" style="display:flex;gap:12px;flex-wrap:wrap">${sw('var(--surface)')} raw ${sw('color-mix(in oklab, var(--k-episodic) 22%, transparent)')} summarized ${sw(null, 'var(--k-episodic)', null, 2)} in the cover ${sw(null, 'var(--accent)', '4 3', 1.5)} pending ${sw('none', 'var(--line)', '2 2', 1, .5)} future</div></div><div class="pb">${svg}<p class="mut" style="font-size:11px;margin:8px 0 0">Seq runs left to right; the solid rule is the present (T). Hover a block for its dates and summary; click a real leaf to open it in the console.</p></div></div></div>
+    <div style="grid-column:span 4;display:flex;flex-direction:column;gap:16px">
+      <div class="panel"><div class="ph"><div><div class="eyebrow">wake preview</div><h2>Episodic section</h2></div><div class="r">${t.cover.length} lines</div></div><div class="pb"><pre class="mono" style="margin:0;max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-word;padding:10px 12px;border:1px solid var(--line);border-radius:6px;background:color-mix(in oklab,var(--bg) 60%,transparent);font-size:11.5px;line-height:1.6">### Episodic (${esc(short(t.scope))}), oldest first\n${t.cover.map(b => { if (b.hi - b.lo === 1) { const l = leafBySeq.get(b.lo); return l ? `<span class="mut">#${b.lo}</span> <span class="ink2">${l.ts.slice(0, 10)}</span> ${esc(l.text)}` : `<span class="mut">#${b.lo} ⟨future⟩</span>`; } return `<span class="k-episodic">#${b.lo}-${b.hi - 1}</span> <span class="ink2">${esc(b.span)}</span> ${b.summary ? esc(b.summary) : '<span class="acc">⟨missing summary⟩</span>'}`; }).join('\n')}</pre></div></div>
+      <div class="panel"><div class="ph"><div><div class="eyebrow">pending queue</div><h2>${t.pending.length ? `${t.pending.length} compression${t.pending.length === 1 ? '' : 's'} due` : 'Nothing due'}</h2></div><div class="r">nap order: smallest first</div></div><div class="pb">${t.pending.length ? `<ol style="margin:0;padding-left:20px;font-size:12.5px">${t.pending.slice(0, 12).map(([lo, hi], i) => `<li style="margin-bottom:8px"><span class="mono">#${lo}–${hi - 1}</span> <span class="mut">${hi - lo} memories${hi - lo === 2 ? ' · from two raw notes' : ' · from two summaries'}${lo >= t.real_T ? ' · simulated' : ''}</span><div class="cmd"><code>${esc(`${S.me} nap ${lo}-${hi - 1} "…"`)}</code><button class="cp" data-c="${esc(`${S.me} nap ${lo}-${hi - 1} "…"`)}">copy</button></div></li>`).join('')}${t.pending.length > 12 ? `<li class="mut">and ${t.pending.length - 12} more, each unlocked as the ones above land.</li>` : ''}</ol>` : `<p class="ink2" style="margin:0;font-size:13px">${t.T <= budget ? `The cover prints every block it needs. The first nap in this scope comes at note ${budget + 1}: the stream is at ${fmt(t.real_T)} and the budget is ${budget}.` : 'Every block the cover needs has a summary. Compression is requested only when wake would print the block, never ahead of time.'}</p>`}</div></div>
+    </div></div>`;
+  box.innerHTML = h;
+  $('#tr-b').addEventListener('input', e => { S.treeBudget = +e.target.value; clearTimeout(treeTimer); treeTimer = setTimeout(loadTree, 80); });
+  $('#tr-t').addEventListener('input', e => { S.treeT = +e.target.value; clearTimeout(treeTimer); treeTimer = setTimeout(loadTree, 80); });
+}
+
+// ---- entities: what the store is about
+async function loadEntities() {
+  const d = await j('/api/entities'), box = $('#en');
+  if (!d.nodes.length) { box.innerHTML = `<div class="empty">No entity tags yet. A tag names what a fact is about: a person, a component, a file.</div>`; return; }
+  const people = d.nodes.filter(n => n.person).length;
+  const stat = (l, v, s, tone) => `<div class="panel stat"><div class="eyebrow">${l}</div><div class="display num v ${tone || ''}">${v}</div><div class="s">${s}</div></div>`;
+  let h = `<div class="stats" style="grid-template-columns:repeat(4,minmax(0,1fr))">${stat('distinct tags', fmt(d.nodes.length), `across ${fmt(d.live)} live facts`, 'acc')}${stat('co-occurrences', fmt(d.edges.length), 'tag pairs on one fact')}${stat('people tags', people, 'have a people record', 'k-people')}${stat('untagged', `${Math.round(100 * d.untagged / Math.max(d.live, 1))}%`, `${d.untagged} live facts carry no tag`, 'mut')}</div>`;
+  // layout: hand-rolled force; singletons on an orbit ring
+  const W = 1000, H = 520, cx = W / 2, cy = H / 2;
+  const maxN = Math.max(1, ...d.nodes.map(n => n.n)), rad = n => 5 + 17 * Math.sqrt((n - 1) / Math.max(maxN - 1, 1));
+  const linked = new Set(d.edges.flatMap(e => [e.a, e.b]));
+  const nodes = d.nodes.map(n => ({...n, kind: Object.entries(n.kinds).sort((a, b) => b[1] - a[1])[0][0], single: !linked.has(n.id), r: rad(n.n)}));
+  const byId = new Map(nodes.map(n => [n.id, n]));
+  const singles = nodes.filter(n => n.single).sort((a, b) => b.n - a.n), cluster = nodes.filter(n => !n.single);
+  singles.forEach((n, i) => { const a = -Math.PI / 2 + (i / Math.max(1, singles.length)) * Math.PI * 2; n.x = cx + Math.cos(a) * (W / 2 - 70); n.y = cy + Math.sin(a) * (H / 2 - 26); });
+  cluster.forEach((n, i) => { n.x = cx + Math.cos(i * 2.4) * (20 + i * 3); n.y = cy + Math.sin(i * 2.4) * (20 + i * 3); });
+  const links = d.edges.filter(e => byId.has(e.a) && byId.has(e.b)).map(e => ({s: byId.get(e.a), t: byId.get(e.b), n: e.n}));
+  for (let it = 0; it < 320; it++) {
+    const alpha = 1 - it / 320;
+    for (const a of cluster) { a.vx = 0; a.vy = 0; }
+    for (let i = 0; i < cluster.length; i++) for (let k = i + 1; k < cluster.length; k++) {
+      const a = cluster[i], b = cluster[k]; let dx = a.x - b.x, dy = a.y - b.y, d2 = dx * dx + dy * dy || 0.01, dist = Math.sqrt(d2);
+      let f = 2600 / d2; const min = a.r + b.r + 22; if (dist < min) f += (min - dist) * 0.6;
+      dx /= dist; dy /= dist; a.vx += dx * f; a.vy += dy * f; b.vx -= dx * f; b.vy -= dy * f;
+    }
+    for (const l of links) { const a = l.s, b = l.t; const dx = b.x - a.x, dy = b.y - a.y, dist = Math.sqrt(dx * dx + dy * dy) || 0.01, L = 95 - Math.min(l.n, 4) * 8, f = (dist - L) * (0.06 + Math.min(l.n, 4) * 0.03); if (!a.single) { a.vx += dx / dist * f; a.vy += dy / dist * f; } if (!b.single) { b.vx -= dx / dist * f; b.vy -= dy / dist * f; } }
+    for (const a of cluster) { a.vx += (cx - a.x) * 0.02; a.vy += (cy - a.y) * 0.02; const m = Math.sqrt(a.vx * a.vx + a.vy * a.vy) || 0.01, s = Math.min(m, 14 * alpha + 0.5); a.x = Math.max(30, Math.min(W - 30, a.x + a.vx / m * s)); a.y = Math.max(20, Math.min(H - 20, a.y + a.vy / m * s)); }
+  }
+  const maxE = Math.max(1, ...links.map(l => l.n));
+  const neigh = {}; d.edges.forEach(e => { (neigh[e.a] = neigh[e.a] || []).push([e.b, e.n]); (neigh[e.b] = neigh[e.b] || []).push([e.a, e.n]); }); Object.values(neigh).forEach(v => v.sort((a, b) => b[1] - a[1]));
+  const label = new Map(nodes.map(n => [n.id, n.label]));
+  let svg = `<svg id="en-svg" viewBox="0 0 ${W} ${H}" style="display:block;width:100%;height:auto;user-select:none" role="img" aria-label="${nodes.length} tags, ${links.length} co-occurrences"><g>` +
+    links.map(l => `<line data-l="${esc(l.s.id)}|${esc(l.t.id)}" x1="${l.s.x.toFixed(1)}" y1="${l.s.y.toFixed(1)}" x2="${l.t.x.toFixed(1)}" y2="${l.t.y.toFixed(1)}" stroke="var(--line-2)" stroke-width="${(1 + l.n / maxE * 3).toFixed(1)}" stroke-linecap="round" opacity=".9"></line>`).join('') + `</g><g>` +
+    nodes.map(n => `<g class="nd" data-n="${esc(n.id)}" data-e="${esc(n.id)}" transform="translate(${n.x.toFixed(1)},${n.y.toFixed(1)})" style="cursor:pointer"><title>${esc(n.label)}${n.person ? ' · person' : ''} · ${n.n} fact${n.n === 1 ? '' : 's'} · ${KINDS.filter(k => n.kinds[k]).map(k => `${k} ${n.kinds[k]}`).join(', ')} · ${Object.entries(n.scopes).map(([s, c]) => `${s} ${c}`).join(', ')}${neigh[n.id] ? '\nwith ' + neigh[n.id].slice(0, 6).map(x => x[0]).join(', ') : ''}</title>${n.person ? `<circle r="${(n.r + 4).toFixed(1)}" fill="none" stroke="var(--k-people)" stroke-width="2"></circle>` : ''}<circle r="${(n.r + 8).toFixed(1)}" fill="transparent"></circle><circle r="${n.r.toFixed(1)}" fill="var(--k-${n.kind})" stroke="var(--surface)" stroke-width="2"></circle>${(n.single || n.n >= 2) ? `<text y="${(n.r + 13).toFixed(1)}" text-anchor="middle" font-size="11" font-family="IBM Plex Mono, ui-monospace, monospace" fill="var(--ink-2)" style="paint-order:stroke;stroke:var(--surface);stroke-width:3px;stroke-linejoin:round">${esc(n.label)}</text>` : ''}</g>`).join('') + `</g></svg>`;
+  h += `<div class="panel" style="margin-bottom:16px"><div class="ph"><div><div class="eyebrow">co-occurrence</div><h2>What the store is about</h2></div><div class="r legend">${KINDS.map(k => `<span><i style="background:var(--k-${k});border-radius:50%"></i>${k}</span>`).join('')}<span><i style="border:2px solid var(--k-people);border-radius:50%;width:8px;height:8px"></i>person</span><span class="mut">size = facts · line = co-occurrence</span></div></div><div class="pb"><p class="mut" style="margin:0 0 8px;font-size:12px">Hover a tag to see its neighbors; click to open it in the ledger; drag to untangle. Tags that never share a fact sit on the outer ring.</p>${svg}</div></div>`;
+  const bar = n => `<span style="display:inline-flex;height:8px;width:96px;gap:1px;border-radius:2px;overflow:hidden" title="${KINDS.filter(k => n.kinds[k]).map(k => `${k} ${n.kinds[k]}`).join(', ')}">${KINDS.filter(k => n.kinds[k]).map(k => `<i style="display:block;height:100%;width:${(n.kinds[k] / n.n * 100).toFixed(0)}%;background:var(--k-${k})"></i>`).join('')}</span>`;
+  const count = new Map(nodes.map(n => [n.id, n.n]));
+  const sortKey = S.entSort || 'n';
+  const rows = [...nodes].sort((a, b) => sortKey === 'label' ? a.label.localeCompare(b.label) : b.n - a.n || a.label.localeCompare(b.label));
+  h += `<div class="g12"><div class="panel" style="grid-column:span 8"><div class="ph"><div><div class="eyebrow">every tag</div><h2>Vocabulary in use</h2></div><div class="r">${nodes.length} tags</div></div><div class="pb" style="overflow:auto;max-height:560px"><table class="rs" style="table-layout:auto"><thead><tr><th data-es="label" style="cursor:pointer">tag${sortKey === 'label' ? ' ↑' : ''}</th><th data-es="n" style="cursor:pointer;text-align:right">facts${sortKey === 'n' ? ' ↓' : ''}</th><th>kinds</th><th>scopes</th><th>co-occurs with</th></tr></thead><tbody>` +
+    rows.map(n => `<tr><td><a class="tag" data-e="${esc(n.id)}">${esc(n.label)}</a>${n.person ? ' <span class="k-people" style="font-size:10px">person</span>' : ''}</td><td class="mono num" style="text-align:right">${n.n}</td><td>${bar(n)}</td><td class="mono ink2" style="font-size:11.5px">${Object.entries(n.scopes).map(([s, c]) => `${esc(s)}${c > 1 ? ' ×' + c : ''}`).join(', ')}</td><td><div style="display:flex;flex-wrap:wrap;gap:4px">${(neigh[n.id] || []).slice(0, 5).map(([id, c]) => `<span style="display:inline-flex;align-items:center;gap:2px"><a class="tag" data-e="${esc(id)}">${esc(label.get(id) || id)}</a><span class="mono mut" style="font-size:10px">${c}</span></span>`).join('') || '<span class="mut">—</span>'}</div></td></tr>`).join('') + `</tbody></table></div></div>
+    <div class="panel" style="grid-column:span 4"><div class="ph"><div><div class="eyebrow">hygiene</div><h2>Vocabulary</h2></div></div><div class="pb" style="font-size:12.5px">
+      <div class="eyebrow" style="margin-bottom:6px">near-duplicate tags</div>${d.near.length ? d.near.map(p => { const keep = (count.get(p.a.toLowerCase()) || 0) >= (count.get(p.b.toLowerCase()) || 0) ? p.a : p.b, drop = keep === p.a ? p.b : p.a; return `<div style="border:1px solid var(--line);border-radius:6px;padding:8px;margin-bottom:8px"><div style="display:flex;align-items:center;gap:6px"><a class="tag" data-e="${esc(p.a.toLowerCase())}">${esc(p.a)}</a><span class="mut">~</span><a class="tag" data-e="${esc(p.b.toLowerCase())}">${esc(p.b)}</a><span class="mono mut" style="margin-left:auto">${Math.round(p.ratio * 100)}%</span></div><p class="ink2" style="margin:6px 0 0">${esc(p.why)}. Use the stored spelling <code style="color:var(--ink)">${esc(keep)}</code> next time; <code>${esc(drop)}</code> has fewer facts.</p></div>`; }).join('') : '<p class="mut" style="margin:0 0 12px">None: no two tags are within 80% of each other, and none is part of another.</p>'}
+      <div class="eyebrow" style="margin:12px 0 6px">name-like tags without a people record</div>${d.orphans.length ? d.orphans.map(t => `<div style="margin-bottom:8px"><a class="tag" data-e="${esc(t.toLowerCase())}">${esc(t)}</a><div class="cmd"><code>${esc(`${S.me} note people "…" --entities=${t}`)}</code><button class="cp" data-c="${esc(`${S.me} note people "…" --entities=${t}`)}">copy</button></div></div>`).join('') : '<p class="mut" style="margin:0 0 12px">None: every capitalized tag has a people record.</p>'}
+      <div class="eyebrow" style="margin:12px 0 6px">untagged</div><p class="ink2" style="margin:0">${Math.round(100 * d.untagged / Math.max(d.live, 1))}% of live facts have no tag; tags pair overrides, match promotions, build pressure, and make capitalized words count in the hook.</p>
+    </div></div></div>`;
+  box.innerHTML = h;
+  // hover highlight and drag
+  const svgEl = $('#en-svg'); let drag = null;
+  const setActive = id => { const act = id ? new Set([id, ...(neigh[id] || []).map(x => x[0])]) : null; svgEl.querySelectorAll('.nd').forEach(g => g.setAttribute('opacity', act && !act.has(g.dataset.n) ? .25 : 1)); svgEl.querySelectorAll('line[data-l]').forEach(l => { const [a, b] = l.dataset.l.split('|'); l.setAttribute('opacity', act && !(act.has(a) && act.has(b)) ? .15 : .9); }); };
+  svgEl.addEventListener('pointerover', e => { const g = e.target.closest('.nd'); if (g) setActive(g.dataset.n); });
+  svgEl.addEventListener('pointerout', e => { const g = e.target.closest('.nd'); if (g && !drag) setActive(null); });
+  svgEl.addEventListener('pointerdown', e => { const g = e.target.closest('.nd'); if (!g) return; drag = {id: g.dataset.n, moved: false}; svgEl.setPointerCapture(e.pointerId); });
+  svgEl.addEventListener('pointermove', e => { if (!drag) return; const b = svgEl.getBoundingClientRect(), x = (e.clientX - b.left) / b.width * W, y = (e.clientY - b.top) / b.height * H, n = byId.get(drag.id); n.x = x; n.y = y; drag.moved = true; svgEl.querySelector(`.nd[data-n="${CSS.escape(drag.id)}"]`).setAttribute('transform', `translate(${x.toFixed(1)},${y.toFixed(1)})`); svgEl.querySelectorAll('line[data-l]').forEach(l => { const [a, c] = l.dataset.l.split('|'); if (a === drag.id) { l.setAttribute('x1', x); l.setAttribute('y1', y); } if (c === drag.id) { l.setAttribute('x2', x); l.setAttribute('y2', y); } }); });
+  svgEl.addEventListener('pointerup', () => { if (drag && drag.moved) S.entDragged = true; drag = null; });
+  svgEl.addEventListener('click', e => { if (S.entDragged) { S.entDragged = false; e.stopPropagation(); } }, true);
+}
+
+// ---- lineage: how a fact changed
+async function loadLineage() {
+  const d = await j('/api/chains'), box = $('#li'), chains = d.chains;
+  if (!chains.length) { box.innerHTML = `<div class="empty"><div class="display" style="font-size:20px;color:var(--ink)">No chains yet</div><p class="ink2" style="max-width:60ch;margin:8px auto 0">Raw facts are never edited. A newer fact points at the one it replaces with <code>--supersedes=&lt;id&gt;</code>, and the old one stops being live. That pointer chain is the fact's history, and it shows up here once one exists.</p></div>`; return; }
+  const kind = S.linKind || '', ent = (S.linEnt || '').toLowerCase();
+  const filtered = chains.filter(c => (!kind || c.kind === kind) && (!ent || c.entities.some(e => e.includes(ent))));
+  const sel = filtered.find(c => c.head === S.linSel) || filtered[0];
+  const versions = chains.reduce((a, c) => a + c.versions.length, 0);
+  const kc = KINDS.map(k => [k, chains.filter(c => c.kind === k).length]).filter(x => x[1]);
+  const stat = (l, v, s, tone) => `<div class="panel stat"><div class="eyebrow">${l}</div><div class="display num v ${tone || ''}">${v}</div><div class="s">${s}</div></div>`;
+  const beads = (n, k) => { const shown = Math.min(n, 8), step = 10, r = 2.6, w = (shown - 1) * step + r * 2 + 2; return `<svg width="${w}" height="${r * 2 + 2}" style="flex-shrink:0">${shown > 1 ? `<line x1="${r + 1}" x2="${(shown - 1) * step + r + 1}" y1="${r + 1}" y2="${r + 1}" stroke="var(--k-${k})" opacity=".6"></line>` : ''}${Array.from({length: shown}, (_, i) => `<circle cx="${i * step + r + 1}" cy="${r + 1}" r="${r}" fill="${i === shown - 1 ? `var(--k-${k})` : 'var(--surface)'}" stroke="var(--k-${k})" stroke-width="1.2"></circle>`).join('')}</svg>`; };
+  let h = `<div class="vh"><div><div class="eyebrow">lineage · how a fact changed</div><h2 class="display">Facts that changed</h2></div></div>
+    <div class="stats" style="grid-template-columns:repeat(4,minmax(0,1fr))">${stat('chains', chains.length, 'facts with more than one version')}${stat('versions', versions, `${versions - chains.length} superseded`)}${stat('longest', chains[0].versions.length, `${esc(chains[0].entities[0] || chains[0].kind)} · #${chains[0].head}`, 'acc')}<div class="panel stat"><div class="eyebrow">by kind</div><div style="display:flex;height:12px;gap:1px;margin-top:8px;border-radius:2px;overflow:hidden">${kc.map(([k, n]) => `<i style="width:${(n / chains.length * 100).toFixed(0)}%;background:var(--k-${k})" title="${k}: ${n}"></i>`).join('')}</div><div class="s mono" style="display:flex;gap:10px">${kc.map(([k, n]) => `<span class="k-${k}">${k} ${n}</span>`).join('')}</div></div></div>`;
+  h += `<div class="g12"><div class="panel" style="grid-column:span 4"><div class="ph"><div><div class="eyebrow">chains</div><h2>Which changed</h2></div><div class="r">${filtered.length} of ${chains.length}</div></div><div class="pb">
+    <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:8px">${KINDS.map(k => `<button class="chip${kind === k ? ' on' : ''}" data-lk="${k}"><span class="k ${k}" style="border:0;padding:0;color:inherit"><i></i>${k}</span></button>`).join('')}</div>
+    <input id="li-ent" value="${esc(S.linEnt || '')}" placeholder="filter by entity" style="width:100%;font-size:12px;margin-bottom:8px">
+    <div style="max-height:600px;overflow:auto">${filtered.map(c => { const last = c.versions[c.versions.length - 1]; return `<div data-lc="${c.head}" style="padding:8px;border-radius:6px;cursor:pointer;${sel && sel.head === c.head ? 'background:var(--surface-2)' : ''}"><div style="display:flex;align-items:center;gap:8px"><span class="k ${c.kind}"><i></i>${c.kind}</span>${beads(c.versions.length, c.kind)}<span class="mono mut" style="font-size:11px">${c.versions.length}v</span><span class="mono mut" style="font-size:11px;margin-left:auto">${last.ts.slice(0, 10)}</span></div><div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">${c.entities.length ? c.entities.map(e => `<a class="tag" data-e="${esc(e)}">${esc(e)}</a>`).join('') : '<span class="mut" style="font-size:11px">untagged</span>'}</div><p class="ink2" style="margin:4px 0 0;font-size:12px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical">${esc(last.text)}</p></div>`; }).join('') || '<p class="mut" style="text-align:center;padding:20px">nothing matches</p>'}</div></div></div>`;
+  if (sel) {
+    const vs = sel.versions, newest = vs[vs.length - 1], days = Math.max(0, Math.round((new Date(newest.ts) - new Date(vs[0].ts)) / 86400000));
+    const net = vs.slice(1).reduce((a, v) => ({added: a.added + (v.added || 0), removed: a.removed + (v.removed || 0)}), {added: 0, removed: 0});
+    const mode = S.linMode || 'diff';
+    const diffHTML = d => d.map(([op, t]) => op === '=' ? `<span>${esc(t)} </span>` : op === '+' ? `<ins style="text-decoration:none;color:var(--ink);background:color-mix(in oklab,var(--k-procedural) 22%,transparent);box-shadow:0 1px 0 var(--k-procedural);border-radius:2px;padding:0 1px">${esc(t)}</ins> ` : `<del style="color:var(--mute)">${esc(t)}</del> `).join('');
+    const sup = `${S.me} note ${sel.kind} "…" --supersedes=${newest.id}${sel.entities.length ? ' --entities=' + sel.entities.join(',') : ''}`;
+    h += `<div class="panel" style="grid-column:span 8"><div class="ph"><div><div class="eyebrow">lineage · ${esc(slabel(sel.scope))}</div><h2 style="display:flex;align-items:center;gap:10px">${esc(sel.entities[0] || '#' + sel.head)} <span class="k ${sel.kind}"><i></i>${sel.kind}</span></h2></div><div class="r" style="display:flex;gap:6px"><button class="chip${mode === 'diff' ? ' on' : ''}" data-lm="diff">show diff</button><button class="chip${mode === 'text' ? ' on' : ''}" data-lm="text">show text</button></div></div><div class="pb">
+      <p class="ink2 num" style="margin:0 0 10px">${vs.length} versions over ${days} ${days === 1 ? 'day' : 'days'}; <span class="k-procedural">+${net.added}</span> <span class="mut">−${net.removed}</span> words net.</p>
+      <div class="cmd"><code>${esc(sup)}</code><button class="cp" data-c="${esc(sup)}">copy</button></div>
+      <ol style="list-style:none;margin:20px 0 0 12px;padding:0 0 0 24px;border-left:1px solid var(--line-2);position:relative">${[...vs].reverse().map((v, i, arr) => { const older = arr[i + 1], newer = arr[i - 1], bytes = new TextEncoder().encode(v.text).length; return `<li style="position:relative;padding-bottom:${i === arr.length - 1 ? 0 : 24}px"><span style="position:absolute;left:-30px;top:8px;width:9px;height:9px;border-radius:50%;border:2px solid var(--k-${sel.kind});background:${i === 0 ? `var(--k-${sel.kind})` : 'var(--surface)'}"></span><article style="border:1px solid ${i === 0 ? 'var(--line-2)' : 'var(--line)'};border-radius:8px;padding:14px;background:${i === 0 ? 'var(--surface)' : 'color-mix(in oklab,var(--bg) 40%,transparent)'}"><header style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;font-size:12px;margin-bottom:8px"><a class="ent display" data-id="${v.id}" style="font-size:18px">#${v.id}</a><span class="mono ink2">${v.ts.slice(0, 16).replace('T', ' ')}</span><span class="mono mut num">${bytes}/280 b</span>${i === 0 ? `<span class="mono" style="padding:0 8px;border-radius:999px;font-size:11px;background:color-mix(in oklab,var(--k-procedural) 22%,transparent);color:var(--k-procedural)">live</span>` : `<span class="mono mut" style="font-size:11px">superseded by <a class="ent" data-id="${newer.id}">#${newer.id}</a></span>`}${!older ? '<span class="mono mut" style="font-size:11px">original</span>' : ''}${older && mode === 'diff' ? `<span class="mono num" style="margin-left:auto;font-size:11px"><span class="k-procedural">+${v.added || 0}</span> <span class="mut">−${v.removed || 0}</span></span>` : ''}</header>${older && mode === 'diff' && v.diff ? `<p style="margin:0;font-size:15px;line-height:1.6">${diffHTML(v.diff)}</p>` : `<p style="margin:0;font-size:15px;line-height:1.6">${esc(v.text)}</p>`}${v.entities ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:8px">${v.entities.split(',').filter(x => x.trim()).map(e => `<a class="tag" data-e="${esc(e.trim().toLowerCase())}">${esc(e.trim())}</a>`).join('')}</div>` : ''}</article></li>`; }).join('')}</ol></div></div>`;
+  }
+  h += `</div>`;
+  box.innerHTML = h;
+  $('#li-ent').addEventListener('input', e => { S.linEnt = e.target.value; clearTimeout(hookTimer); hookTimer = setTimeout(loadLineage, 200); });
+}
+
 // ---- live
 function live(txt, on) { $('#livetxt').textContent = txt; $('#live').classList.toggle('on', !!on); }
 const es = new EventSource('/api/events');
 es.onopen = () => live('live', true);
 es.onerror = () => live('reconnecting', false);
 es.onmessage = () => { S.writes++; live(`live · ${S.writes} write${S.writes === 1 ? '' : 's'}`, true); S.spine = []; refresh(); };
-function refresh() { loadSpine().then(() => { if (S.tab === 'overview') loadOverview(); }); if (S.tab === 'console') loadConsole(); if (S.tab === 'ledger') loadLedger(); loadFeed(); }
+const VIEWS = {overview: loadOverview, console: loadConsole, ledger: loadLedger, hook: loadHook, tree: loadTree, entities: loadEntities, lineage: loadLineage};
+function refresh() { loadSpine().then(() => { if (S.tab === 'overview' || S.tab === 'tree') VIEWS[S.tab](); }); if (S.tab !== 'overview' && S.tab !== 'tree') VIEWS[S.tab](); loadFeed(); }
 function setTab(tab) {
   S.tab = tab;
   document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.t === tab));
   document.querySelectorAll('section').forEach(s => s.classList.toggle('on', s.id === tab));
-  if (tab === 'overview') loadOverview(); if (tab === 'console') loadConsole(); if (tab === 'ledger') { loadLedger(); $('#q').focus(); }
+  if (tab === 'tree' && !S.spine.length) loadSpine().then(loadTree); else VIEWS[tab](); if (tab === 'ledger') $('#q').focus();
 }
 
 // ---- events
 document.addEventListener('click', e => {
-  const t = e.target.closest('[data-t],[data-mx],[data-s],[data-id],[data-e],[data-fk],[data-clear],[data-row],.cp');
+  const t = e.target.closest('[data-t],[data-mx],[data-s],[data-hs],[data-ts],[data-tb],[data-tt],[data-es],[data-lk],[data-lc],[data-lm],[data-id],[data-e],[data-fk],[data-clear],[data-row],.cp');
   if (!t) return;
   if (t.matches('.cp')) { navigator.clipboard.writeText(t.dataset.c).then(() => { t.textContent = 'copied'; setTimeout(() => t.textContent = 'copy', 1200); }); return; }
   if (t.dataset.t) { setTab(t.dataset.t); return; }
   if (t.dataset.mx) { const [s, k] = t.dataset.mx.split('|'); S.f = {scope: s, kind: k}; S.q = ''; $('#q').value = ''; setTab('ledger'); return; }
+  if (t.dataset.hs) { S.hookScope = t.dataset.hs; loadHook(); return; }
+  if (t.dataset.ts) { S.treeScope = t.dataset.ts; S.treeT = 0; loadTree(); return; }
+  if (t.dataset.tb) { S.treeBudget = +t.dataset.tb; loadTree(); return; }
+  if (t.dataset.tt) { S.treeT = +t.dataset.tt; loadTree(); return; }
+  if (t.dataset.es) { S.entSort = t.dataset.es; loadEntities(); return; }
+  if (t.dataset.lk) { S.linKind = S.linKind === t.dataset.lk ? '' : t.dataset.lk; loadLineage(); return; }
+  if (t.dataset.lc) { S.linSel = +t.dataset.lc; loadLineage(); return; }
+  if (t.dataset.lm) { S.linMode = t.dataset.lm; loadLineage(); return; }
   if (t.dataset.s) { S.scope = t.dataset.s; S.sel = null; $('#insp').innerHTML = '<p class="mut">Select a line.</p>'; setTab('console'); return; }
   if (t.dataset.e !== undefined) { S.f = {entity: t.dataset.e}; S.q = ''; $('#q').value = ''; setTab('ledger'); return; }
   if (t.dataset.fk) { const k = t.dataset.fk, v = t.dataset.fv; if (S.f[k] === v) delete S.f[k]; else S.f[k] = v; loadLedger(); return; }
   if (t.dataset.clear) { S.f = {}; loadLedger(); return; }
   if (t.dataset.row) { const id = +t.dataset.row; S.open = S.open.includes(id) ? S.open.filter(x => x !== id) : [...S.open, id]; loadLedger(); return; }
+  if (t.dataset.id && t.dataset.tscope) { S.scope = S.treeScope; S.sel = +t.dataset.id; setTab('console'); return; }
   if (t.dataset.id) { const id = +t.dataset.id; if (S.tab === 'ledger' && !t.closest('#feed') && !t.closest('td.x') && !t.closest('#spine')) { if (!S.open.includes(id)) S.open.push(id); loadLedger(); } else { S.sel = id; setTab('console'); } }
 });
 let gKey = false;
@@ -2105,11 +2492,11 @@ document.addEventListener('keydown', e => {
   const t = e.target; if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) { if (e.key === 'Escape') t.blur(); return; }
   if (e.key === '/') { e.preventDefault(); setTab('ledger'); return; }
   if (e.key === 'g') { gKey = true; setTimeout(() => gKey = false, 800); return; }
-  if (gKey) { const m = {o: 'overview', c: 'console', l: 'ledger'}[e.key]; if (m) setTab(m); gKey = false; }
+  if (gKey) { const m = {o: 'overview', c: 'console', e: 'ledger', h: 'hook', t: 'tree', n: 'entities', l: 'lineage'}[e.key]; if (m) setTab(m); gKey = false; }
 });
 $('#q').addEventListener('input', e => { S.q = e.target.value; clearTimeout(qTimer); qTimer = setTimeout(loadLedger, 200); });
 $('#q').addEventListener('keydown', e => { if (e.key === 'Enter') { clearTimeout(qTimer); S.q = e.target.value; loadLedger(); } });
-j('/api/state').then(d => { S.scope = d.scope; S.me = d.me; S.db = d.db; S.budget = d.budget; }).then(refresh);
+j('/api/state').then(d => { S.scope = d.scope; S.me = d.me; S.db = d.db; S.budget = d.budget; S.scopes = d.scopes; }).then(refresh);
 </script>
 """
 

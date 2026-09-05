@@ -249,12 +249,15 @@ def nap_prompt(c, kind, scope, lo, hi, left):
 
 
 def next_nap(c, scope):
+    """(scope, prompt, lo, hi) for the compression wake would ask for, or
+    None. The tail is appended, not prepended: three callers read [0] and
+    [1] and none of them care about the range."""
     for sc in (scope, GLOBAL) if scope != GLOBAL else (GLOBAL,):
         T = stream_len(c, "episodic", sc)
         todo = pending(c, "episodic", sc, T)
         if todo:
             lo, hi = todo[0]
-            return sc, nap_prompt(c, "episodic", sc, lo, hi, len(todo) - 1)
+            return sc, nap_prompt(c, "episodic", sc, lo, hi, len(todo) - 1), lo, hi - 1
     return None
 
 
@@ -2699,6 +2702,21 @@ def cmd_prompt(c, args):
     print((SUBAGENT if "--subagent" in args else PROMPT).format(me=ME))
 
 
+def cmd_next_nap(c, args):
+    """The compression wake would ask for. `--json` so a hook reads the
+    range and the prompt as data instead of parsing the prose wake prints;
+    `{}` when nothing is pending. Answering it is still the model's job."""
+    nap = next_nap(c, project())
+    if "--json" not in args:
+        if nap:
+            print(nap[1])
+        return
+    import json
+    print(json.dumps({} if not nap else
+                     {"scope": short(nap[0]), "range": "%d-%d" % (nap[2], nap[3]),
+                      "prompt": nap[1]}))
+
+
 def cmd_project(c, args):
     print(project())
 
@@ -2709,7 +2727,7 @@ def main():
             "project": cmd_project, "hook": cmd_hook, "mcp": cmd_mcp,
             "html": cmd_html, "serve": cmd_serve, "stale": cmd_stale, "touch": cmd_touch,
             "prompt": cmd_prompt, "contribute": cmd_contribute,
-            "check-note": cmd_check_note,
+            "check-note": cmd_check_note, "next-nap": cmd_next_nap,
             "org-init": cmd_org_init}
     if len(sys.argv) < 2 or sys.argv[1] not in cmds:
         die("usage: %s <%s> ..." % (ME, "|".join(cmds)))

@@ -6,46 +6,106 @@
 //
 // Wake runs in prompt.context, not session.start: prompt.context fires first.
 //
-// Ordering: the UserPromptSubmit command hook runs *inside* next(e), so a
+// prompt.context is dispatched more than once and the dispatches OVERLAP;
+// the engine keeps whichever answer settles first. So the once-guard caches
+// the promise, not the value: a guard that sets its sentinel before the
+// await lets the second dispatch through with nothing, and that empty
+// answer, being the fast one, is the one the engine keeps.
+//
+// Ordering. The UserPromptSubmit command hook runs *inside* next(e), so a
 // hook that waited for next(e) before claiming could never win. Each hook
 // below claims first and holds its output before it calls next, so a claim
-// it wins is a claim it can deliver.
-import type { Register } from "claude-code";
+// it wins is a claim it can deliver. On wake the race is lost anyway: the
+// SessionStart command hook and this module start at the same moment and
+// the command hook's process reaches the insert first, every time measured.
+// That is fine, because both paths print the same wake. Anything only this
+// module can produce must therefore not be gated on winning: see draftNap.
+import type { EngineInterface, Register } from "claude-code";
 
 const TIMEOUT = 10_000;
 
-export const register: Register = (on) => {
-  let wake: string | undefined;
+/** What one session start gathers: the memory, and a draft nap if one is due. */
+type Gathered = { wake: string; draft: string };
 
-  on("prompt.context", async ($, e, next) => {
-    if (wake === undefined) {
-      wake = "";
-      try {
-        const r = await $.process.run(
-          [$.plugin.root + "/segmem", "wake", "--once",
-           "--session=" + (await $.session.id()), "--served=function"],
-          { cwd: await $.session.cwd(), timeoutMs: TIMEOUT },
-        );
-        if (r.exitCode === 0) wake = r.stdout.trim();
-        else $.ui.log("segmem wake failed: " + r.stderr.trim());
-      } catch (err) {
-        $.ui.log("segmem wake failed: " + String(err));
-      }
-      // What the Stop hook will interrupt about, as a line the user can see
-      // before it does. The block in the Stop hook stays the model's trigger.
-      try {
-        const r = await $.process.run(
-          [$.plugin.root + "/segmem", "stale", "--count"],
-          { cwd: await $.session.cwd(), timeoutMs: TIMEOUT },
-        );
-        const n = r.exitCode === 0 ? Number(r.stdout.trim()) : 0;
-        $.ui.status(n > 0 ? "segmem: " + n + " under pressure" : undefined);
-      } catch (err) {
-        $.ui.log("segmem stale failed: " + String(err));
+/**
+ * Wake, the pressure count, and the nap draft, once per module life.
+ *
+ * Wake is claimed with `--once`, so it prints only if this path owns the
+ * session. The other two are not behind that claim: the two paths race on
+ * it and the command hook wins, so anything gated on winning would never
+ * ship. Neither doubles anything a command hook prints.
+ *
+ * The plugin never runs `nap`. It drafts a line and offers it, because a
+ * draft that flattens a doubt into a cause is worse than no draft, and only
+ * the model can tell the difference.
+ */
+async function gather($: EngineInterface): Promise<Gathered> {
+  const root = $.plugin.root + "/segmem";
+  const cwd = await $.session.cwd();
+  let wake = "";
+  try {
+    const r = await $.process.run(
+      [root, "wake", "--once", "--session=" + (await $.session.id()),
+       "--served=function"],
+      { cwd, timeoutMs: TIMEOUT },
+    );
+    if (r.exitCode === 0) wake = r.stdout.trim();
+    else $.ui.log("segmem wake failed: " + r.stderr.trim());
+  } catch (err) {
+    $.ui.log("segmem wake failed: " + String(err));
+  }
+
+  // What the Stop hook will interrupt about, as a line the user can see
+  // before it does. The Stop block stays the model's trigger; this is a
+  // notice.
+  try {
+    const r = await $.process.run([root, "stale", "--count"], { cwd, timeoutMs: TIMEOUT });
+    const n = r.exitCode === 0 ? Number(r.stdout.trim()) : 0;
+    $.ui.status(n > 0 ? "segmem: " + n + " under pressure" : undefined);
+  } catch (err) {
+    $.ui.log("segmem stale failed: " + String(err));
+  }
+
+  let draft = "";
+  try {
+    const r = await $.process.run([root, "next-nap", "--json"], { cwd, timeoutMs: TIMEOUT });
+    const nap = r.exitCode === 0 ? JSON.parse(r.stdout || "{}") : {};
+    if (typeof nap.range === "string" && typeof nap.prompt === "string") {
+      const line = (await $.model.complete({
+        model: await $.session.model(),
+        prompt: nap.prompt,
+        system: "Answer with the compressed line alone: no quotes, no command, "
+          + "no preamble, no explanation.",
+      })).trim();
+      if (line) {
+        draft = "A draft for the compression segmem asked for. Run `segmem nap "
+          + nap.range + ' "' + line + '"` if it keeps doubts as doubts and '
+          + "invents nothing; otherwise write your own line and run that instead.";
       }
     }
-    if (!wake) return next(e);
-    return next({ ...e, blocks: [...e.blocks, { name: "segmem", text: wake }] });
+  } catch (err) {
+    $.ui.log("segmem nap draft failed: " + String(err));
+  }
+  return { wake, draft };
+}
+
+export const register: Register = (on) => {
+  let once: Promise<Gathered> | undefined;
+
+  on("prompt.context", async ($, e, next) => {
+    let g: Gathered;
+    try {
+      once ??= gather($);
+      g = await once;
+    } catch (err) {
+      $.ui.log("segmem gather failed: " + String(err));
+      return next(e);
+    }
+    const blocks = [...e.blocks];
+    if (g.wake) blocks.push({ name: "segmem", text: g.wake });
+    if (g.draft) blocks.push({ name: "segmem-nap-draft", text: g.draft });
+    if (blocks.length === e.blocks.length) return next(e);
+    return next({ ...e, blocks });
   });
 
   // Recall on every prompt, as the UserPromptSubmit command hook does. No

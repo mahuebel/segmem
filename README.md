@@ -218,6 +218,7 @@ rewrites a note without an agent deciding to.
 | `segmem html [file] [--no-open]` | write a self-contained snapshot page of the store, and open it |
 | `segmem mcp` | run as an MCP server over stdio |
 | `segmem prompt [--subagent]` | print the doctrine block; `--subagent` prints the read-only paragraph a subagent gets |
+| `segmem next-nap [--json]` | print the compression wake would ask for; `--json` for its range and prompt as data |
 | `segmem project` | print the scope key for the current directory |
 
 Examples:
@@ -332,6 +333,13 @@ returns what it printed, so a call presses the entities it finds exactly as
 a Bash recall does. Bash recall keeps working in every session, flagged or
 not. `note` is not registered: it stays a shell command, which is what keeps
 "subagents never note" true without anything extra to enforce it.
+
+When wake asks for a compression, the module drafts the line with the
+session's own model and adds it as a context block named
+`segmem-nap-draft`, framed as a proposal: run it if it keeps doubts as
+doubts and invents nothing, otherwise write your own. The plugin never runs
+`nap`. A summary that turns an unknown cause into a cause is worse than no
+summary, and only the model reading the originals can tell the two apart.
 
 To type-check the module after a Claude Code update, run `/plugin-types` in a
 session (it writes `.claude/types/`), then `tsc -p tsconfig.json`.

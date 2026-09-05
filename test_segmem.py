@@ -604,6 +604,18 @@ class Segmem(unittest.TestCase):
         self.assertIn("touch <name>", out)
         self.assertNotIn("hooks", out)   # doctrine only; no install block
 
+    def test_next_nap_json_is_the_pending_request(self):
+        import json
+        self.assertEqual({}, json.loads(run("next-nap", "--json")))
+        for i in range(18):
+            run("note", "episodic", "event number %d happened" % i)
+        d = json.loads(run("next-nap", "--json"))
+        self.assertEqual("0-1", d["range"])
+        self.assertIn("Compress episodic memories #0-1", d["prompt"])
+        # the same request wake prints, and asking for it writes nothing
+        self.assertIn(d["prompt"].splitlines()[0], run("wake"))
+        self.assertEqual(d, json.loads(run("next-nap", "--json")))
+
     def test_stale_count_is_one_number(self):
         self.assertEqual("0", run("stale", "--count").strip())
         run("note", "people", "Alice owns deploys", "--entities=alice")

@@ -300,6 +300,23 @@ version (bump `plugin.json` only when Mark asks).
 - The registered tool's full name is `mcp__segmem__recall` under
   `--plugin-dir` too, so the literal matcher holds; the engine serves it
   over a loopback MCP server it starts itself.
+- `prompt.context` is dispatched more than once and the dispatches
+  OVERLAP; the engine keeps whichever answer settles FIRST. S0's once-guard
+  set its sentinel before its await, so the second dispatch passed through
+  with an empty value and, being the fast one, won. The typed wake block had
+  therefore never once reached a model: every green live check was answered
+  by the command hook's wake instead. The guard now caches the promise, not
+  the value. Measured this session from two `prompt.context settled` lines,
+  2.4ms and 1177.5ms.
+- On wake the two paths race and the command hook wins the claim every time
+  measured: it and the module start together and its process reaches the
+  insert first. Harmless for wake, since both paths print the same text, but
+  anything only the module can produce (the nap draft) must not be gated on
+  winning, or it never ships.
+- `$` may be passed only to a function declared at the top of the file; the
+  loader refuses a helper declared inside `register` and names the line.
+  `claude plugin validate` catches it, so run all three checks before every
+  live check, not two of them.
 - Naps: draft only, the model approves: user, September 4, 2026.
 - Pressure nags: the model verifies via the Stop block, the user sees a
   status line: user, September 4, 2026.
@@ -326,6 +343,6 @@ version (bump `plugin.json` only when Mark asks).
 - [x] S3 note validation before the shell runs
 - [x] S4 pressure visible in the terminal
 - [x] S5 recall as a registered tool
-- [ ] S6 nap drafts in context
+- [x] S6 nap drafts in context
 - [ ] S7 org contradictions as a toast
 - [ ] S8 compaction re-wake settled

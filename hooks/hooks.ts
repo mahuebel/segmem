@@ -31,6 +31,18 @@ export const register: Register = (on) => {
       } catch (err) {
         $.ui.log("segmem wake failed: " + String(err));
       }
+      // What the Stop hook will interrupt about, as a line the user can see
+      // before it does. The block in the Stop hook stays the model's trigger.
+      try {
+        const r = await $.process.run(
+          [$.plugin.root + "/segmem", "stale", "--count"],
+          { cwd: await $.session.cwd(), timeoutMs: TIMEOUT },
+        );
+        const n = r.exitCode === 0 ? Number(r.stdout.trim()) : 0;
+        $.ui.status(n > 0 ? "segmem: " + n + " under pressure" : undefined);
+      } catch (err) {
+        $.ui.log("segmem stale failed: " + String(err));
+      }
     }
     if (!wake) return next(e);
     return next({ ...e, blocks: [...e.blocks, { name: "segmem", text: wake }] });

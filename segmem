@@ -804,6 +804,10 @@ def cmd_stale(c, args):
     pmin = int(opts.get("min", PROC_STALE_MIN))
     due = [r for r in dossier_pressure(c) if r[1] >= dmin]
     pdue = [r for r in note_pressure(c, [project(), GLOBAL]) if r[1] >= pmin]
+    if "count" in opts:
+        # for a status line: how many subjects are due, and nothing else
+        print(len(due) + len(pdue))
+        return
     if "hook" in opts:
         return stale_hook(c, due, pdue)
     if not due and not pdue:

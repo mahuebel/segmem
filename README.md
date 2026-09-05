@@ -208,7 +208,7 @@ rewrites a note without an agent deciding to.
 | `segmem promote <id>` | lift a project fact to global, if three projects agree |
 | `segmem forget <id>` | delete a misfiled note; episodic only when newest |
 | `segmem forget <lo>-<hi>` | drop a bad summary; it's rebuilt on request |
-| `segmem stale [--min=n] [--hook]` | list people notes and procedural facts under evidence pressure |
+| `segmem stale [--min=n] [--hook] [--count]` | list people notes and procedural facts under evidence pressure; `--count` prints the number alone |
 | `segmem touch <entity\|id> [--keep]` | claim reviewed, unchanged; resets its pressure; `--keep` marks a procedural fact memory-resident |
 | `segmem contribute <id>` | print the org-repo candidate for a procedural fact, and the PR commands |
 | `segmem org-init <dir>` | scaffold a knowledge repo with the witnessing convention |
@@ -318,6 +318,13 @@ wrong kind is refused with the trim mark, and a near-miss tag or a missing
 people record comes back as a hint beside the result. Every other command
 passes untouched. Without the flag the model learns the same thing from the
 note that failed; with it, the note is never sent.
+
+After wake, the module counts what is under pressure with `segmem stale
+--count` and pins `segmem: N under pressure` beneath the prompt, or clears
+the line when nothing is due. It is a notice, not a prompt: the Stop hook's
+block is still what asks the model to verify a fact against the repo. A
+headless run has nowhere to draw it, and the engine says so in the debug
+log rather than failing.
 
 To type-check the module after a Claude Code update, run `/plugin-types` in a
 session (it writes `.claude/types/`), then `tsc -p tsconfig.json`.

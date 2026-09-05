@@ -286,6 +286,13 @@ version (bump `plugin.json` only when Mark asks).
   (`cd x && segmem note ...`) is read too. Quoting `shlex` cannot parse is
   silence and exit 0: never block a command on a guess. `note_scope()` is
   shared with `cmd_note`, so the check and the write cannot drift.
+- `stale --count` prints one number and returns before the `--hook` path,
+  so counting for the status line never writes a nag touch. The status call
+  runs inside the same once-per-module-life branch as wake; `prompt.context`
+  is cached by the engine, so refreshing it per prompt would buy nothing.
+- A `-p` run has no surface, so `$.ui.status` is dropped and the engine logs
+  `no session bound; dropped: <text>`. That is the line the live check reads:
+  the call is well formed and has nowhere to draw.
 - Naps: draft only, the model approves: user, September 4, 2026.
 - Pressure nags: the model verifies via the Stop block, the user sees a
   status line: user, September 4, 2026.
@@ -310,7 +317,7 @@ version (bump `plugin.json` only when Mark asks).
 - [x] S1 recall as a typed prompt result
 - [x] S2 subagent doctrine on agent.spawn
 - [x] S3 note validation before the shell runs
-- [ ] S4 pressure visible in the terminal
+- [x] S4 pressure visible in the terminal
 - [ ] S5 recall as a registered tool
 - [ ] S6 nap drafts in context
 - [ ] S7 org contradictions as a toast

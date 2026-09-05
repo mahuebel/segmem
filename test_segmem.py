@@ -604,6 +604,15 @@ class Segmem(unittest.TestCase):
         self.assertIn("touch <name>", out)
         self.assertNotIn("hooks", out)   # doctrine only; no install block
 
+    def test_stale_count_is_one_number(self):
+        self.assertEqual("0", run("stale", "--count").strip())
+        run("note", "people", "Alice owns deploys", "--entities=alice")
+        run("note", "episodic", "alice event a", "--entities=alice")
+        run("note", "episodic", "alice event b", "--entities=alice")
+        self.assertEqual("1", run("stale", "--count").strip())
+        # counting never nags and never writes a nag touch
+        self.assertEqual("1", run("stale", "--count").strip())
+
     def test_check_note_refuses_and_hints_without_writing(self):
         run("note", "procedural", "the release runs from make-release",
             "--entities=make-release")

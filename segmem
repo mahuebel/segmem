@@ -25,8 +25,9 @@ import sys
 KINDS = ("identity", "procedural", "episodic", "people")
 GLOBAL = "global"
 MAX_BYTES = 280
-WAKE_EPISODIC = 64      # lines of project episodic cover
-WAKE_EPISODIC_GLOBAL = 16
+WAKE_EPISODIC = 16      # lines of project episodic cover
+WAKE_EPISODIC_GLOBAL = 8
+WAKE_PROCEDURAL = 32    # newest procedural notes printed in full; recall finds the rest
 PROMOTE_MIN = 3         # see should_promote()
 STALE_MIN = 6           # weighted touches before a dossier is under pressure
 PROC_STALE_MIN = 12     # same, per procedural note; hub entities accrue fast
@@ -74,6 +75,14 @@ CREATE TABLE IF NOT EXISTS touches (
   session TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS touches_by_entity ON touches(entity, ts);
+CREATE TABLE IF NOT EXISTS claims (
+  ts      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  session TEXT NOT NULL,
+  cmd     TEXT NOT NULL,                 -- which command served the session
+  source  TEXT NOT NULL,                 -- startup, resume, compact, clear, fork
+  served  TEXT NOT NULL,                 -- 'command' hook or 'function' hook
+  PRIMARY KEY (session, cmd, source)
+);
 """
 
 
@@ -270,6 +279,27 @@ def should_promote(row, siblings):
 # was last written or reviewed. Only a people note or an explicit review
 # resets the clock: an episodic note about a person raises pressure on the
 # dossier, it never relieves it.
+
+def hook_input():
+    """The JSON a Claude Code hook gets on stdin, or {} at a terminal."""
+    import json
+    try:
+        data = {} if sys.stdin.isatty() else json.load(sys.stdin)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def claim(c, session, cmd, source, served):
+    """Once per session: the command hook and the function hook both serve
+    wake when CLAUDE_CODE_ENABLE_FUNCTION_HOOKS is on, in an order the
+    engine does not promise. Whichever inserts the row first speaks; the
+    other stays silent. Keyed on source so a compaction wakes again."""
+    with c:
+        cur = c.execute("INSERT OR IGNORE INTO claims(session,cmd,source,served) "
+                        "VALUES (?,?,?,?)", (session, cmd, source, served))
+    return cur.rowcount == 1
+
 
 def touch(c, entities, kind, session=""):
     rows = [(e.strip().lower(), kind, session) for e in entities if e.strip()]
@@ -505,7 +535,7 @@ def known_tags(c):
     return tags
 
 
-def canon(c, raw, kind):
+def canon(c, raw, kind, scope=GLOBAL):
     """Trim and dedupe tags; a tag that matches a known one ignoring case
     takes the stored spelling. Returns (entities, hints): hints name a new
     tag's near matches, and a name-like tag with no people record."""
@@ -519,6 +549,10 @@ def canon(c, raw, kind):
         if not e or k in seen:
             continue
         seen.add(k)
+        if scope != GLOBAL and k == short(scope).lower():
+            hints.append("tag %s is the scope itself and was dropped; tag the subject "
+                         "(a component, file, or person) instead" % e)
+            continue
         if k in tags:
             out.append(tags[k])
             continue
@@ -548,7 +582,7 @@ def cmd_note(c, args):
     sup = int(opts["supersedes"]) if "supersedes" in opts else None
     if sup is not None and not c.execute("SELECT 1 FROM memories WHERE id=?", (sup,)).fetchone():
         die("No memory #%d to supersede." % sup)
-    entities, hints = canon(c, opts.get("entities", ""), kind)
+    entities, hints = canon(c, opts.get("entities", ""), kind, scope)
     with c:
         seq = stream_len(c, kind, scope)
         c.execute("INSERT INTO memories(kind,scope,seq,entities,supersedes,text) "
@@ -649,7 +683,9 @@ def cmd_forget(c, args):
 def cmd_recall(c, args):
     if not args:
         die("usage: %s recall <query>   (FTS5 syntax; searches every scope and kind)" % ME)
-    q = " ".join(args)
+    q = " ".join(a for a in args if a != "--all")
+    if not q:
+        die("usage: %s recall <query> [--all]" % ME)
     sql = ("SELECT m.* FROM memories_fts f JOIN memories m ON m.id=f.rowid "
            "WHERE memories_fts MATCH ? ORDER BY rank LIMIT 50")
     try:
@@ -665,10 +701,20 @@ def cmd_recall(c, args):
             die("Bad query: %s" % e)
     oc = org_connect()
     orows = org_search(oc, q, HOOK_MAX) if oc else []
+    dead = {r[0] for r in c.execute("SELECT supersedes FROM memories WHERE supersedes IS NOT NULL")}
+    show_all = "--all" in args
+    if not show_all:
+        # Superseded rows are history, not answers; the cwd's project and
+        # global rank above other projects; FTS rank orders within.
+        alive = [r for r in rows if r["id"] not in dead]
+        rows = alive or rows          # only history matched: show it, flagged
+        near = {GLOBAL, project()}
+        rows.sort(key=lambda r: r["scope"] not in near)
+    more = max(0, len(rows) - RECALL_MAX) if not show_all else 0
+    rows = rows[:len(rows) - more]
     if not rows and not orows:
         print("No match.")
         return
-    dead = {r[0] for r in c.execute("SELECT supersedes FROM memories WHERE supersedes IS NOT NULL")}
     for r in rows:
         flag = " [superseded]" if r["id"] in dead else ""
         tags = " [%s]" % r["entities"] if r["entities"] else ""
@@ -676,6 +722,8 @@ def cmd_recall(c, args):
                                         tags, flag, r["text"]))
     for r in orows:
         print(org_line(r))
+    if more:
+        print("(%d more; %s recall --all %s)" % (more, ME, q))
     touch(c, {e for r in rows for e in entity_set(r)}, "recall")
 
 
@@ -919,6 +967,13 @@ This repo holds org facts; candidates merge at three witnesses. See README.
 
 
 def cmd_wake(c, args):
+    opts, _ = flags(args)
+    if "once" in opts:
+        data = {} if "session" in opts else hook_input()
+        sid = opts.get("session") or data.get("session_id", "")
+        src = opts.get("source") or data.get("source", "startup")
+        if sid and not claim(c, sid, "wake", src, opts.get("served", "command")):
+            return          # the other hook path already woke this session
     p = project()
     scopes = [GLOBAL] if p == GLOBAL else [GLOBAL, p]
     out = ["## Memory (project: %s)" % short(p)]
@@ -939,9 +994,15 @@ def cmd_wake(c, args):
                     conflicted.update((pr["id"], g["id"]))
                     out.append("#%d %s (global) OVERRIDDEN by #%d %s (%s)"
                                % (g["id"], g["text"], pr["id"], pr["text"], short(p)))
-        for r in rows:
-            if r["id"] not in conflicted:
-                out.append("#%d %s (%s)" % (r["id"], r["text"], short(r["scope"])))
+        shown = [r for r in rows if r["id"] not in conflicted]
+        hidden = 0
+        if kind == "procedural" and len(shown) > WAKE_PROCEDURAL and "--all" not in args:
+            hidden, shown = len(shown) - WAKE_PROCEDURAL, shown[-WAKE_PROCEDURAL:]
+        for r in shown:
+            out.append("#%d %s (%s)" % (r["id"], r["text"], short(r["scope"])))
+        if hidden:
+            out.append("(%d older procedural notes not printed; recall and the prompt hook "
+                       "still find them, or: %s wake --all)" % (hidden, ME))
         if kind == "procedural":
             for row, p2, n2, since, reviewed, kept in note_pressure(c, scopes):
                 if p2 < PROC_STALE_MIN:
@@ -1013,15 +1074,13 @@ def cmd_wake(c, args):
             else:
                 s = summary(c, "episodic", sc, lo, hi)
                 if s is None:
-                    todo = pending(c, "episodic", sc, T)
-                    print("\n".join(out))
-                    print("\nCannot wake: #%d-%d is not compressed yet. Do the %d compression%s "
-                          "below, then run %s wake again.\n" % (lo, hi - 1, len(todo),
-                                                                "" if len(todo) == 1 else "s", ME))
-                    print(nap_prompt(c, "episodic", sc, *todo[0], len(todo) - 1))
-                    # exit 0: as a SessionStart hook, a failed command would
-                    # hide this output. The text already says what to do.
-                    sys.exit(0)
+                    # Not compressed yet: wake never blocks. Print the block
+                    # raw and let next_nap ask for one compression below.
+                    out.append("#%d-%d %s (not compressed yet)" % (lo, hi - 1, span(c, sc, lo, hi)))
+                    for r in c.execute("SELECT seq, ts, text FROM memories WHERE kind='episodic' "
+                                       "AND scope=? AND seq>=? AND seq<? ORDER BY seq", (sc, lo, hi)):
+                        out.append("  #%d %s %s" % (r[0], r[1][:10], r[2]))
+                    continue
                 out.append("#%d-%d %s %s" % (lo, hi - 1, span(c, sc, lo, hi), s))
     print("\n".join(out))
     print("\nYou are awake.")
@@ -1031,6 +1090,7 @@ def cmd_wake(c, args):
 
 
 HOOK_MAX = 8
+RECALL_MAX = 12
 STOP = set("""i a an the and or but if then of to in on at for with from by as is are was
 were be been this that these those it its my me we our you your they their he she
 his her what which who how when where why do does did can could should would will
@@ -2152,7 +2212,7 @@ async function loadOverview() {
   const wk = Object.entries(o.wake).sort((a, b) => b[1].tokens - a[1].tokens); const wmax = Math.max(1, ...wk.map(([, w]) => w.tokens));
   h += `<div class="panel c5"><div class="ph"><div><div class="eyebrow">wake cost</div><h2>What a session pays</h2></div><div class="r">≈ bytes ÷ 4 · from the real command</div></div><div class="pb">` +
     wk.map(([s, w]) => `<div class="wb" data-s="${esc(s)}" title="${w.lines} lines; open in console"><span>${esc(slabel(s))}</span><span class="tr"><i style="width:${(w.tokens / wmax * 100).toFixed(1)}%"></i></span><span class="num">≈${fmt(w.tokens)}</span></div>`).join('') +
-    `<p class="mut" style="font-size:12px;margin:12px 0 0">Every project wake carries global identity and procedural facts, the people names, and its own episodic cover at budget ${S.budget || 64}.</p></div></div>`;
+    `<p class="mut" style="font-size:12px;margin:12px 0 0">Every project wake carries global identity and procedural facts, the people names, and its own episodic cover at budget ${S.budget || 16}.</p></div></div>`;
   // what needs a hand
   const idlist = xs => xs.map(x => `<a class="ent mono" data-id="${x.id}" title="${esc(x.text)}">#${x.id}</a> <span class="mut">${esc(short(x.scope))}</span>`).join(' ');
   const due = Object.entries(o.due).sort((a, b) => b[1].T - a[1].T); const dueN = due.reduce((a, [, d]) => a + d.pending, 0);
@@ -2311,7 +2371,7 @@ async function loadTree() {
   if (!scopes.length) { box.innerHTML = `<div class="empty">No episodic memories yet. The tree grows from decisions with their reasons, root causes, and handoffs.</div>`; return; }
   if (!scopes.some(([s]) => s === S.treeScope)) { S.treeScope = scopes[0][0]; S.treeT = 0; }
   const realT = epi[S.treeScope];
-  if (!S.treeBudget) S.treeBudget = S.budget || 64;
+  if (!S.treeBudget) S.treeBudget = S.budget || 16;
   const T = Math.max(S.treeT || 0, realT), budget = S.treeBudget;
   const t = await j('/api/tree?' + new URLSearchParams({scope: S.treeScope, budget, T}));
   const root = rootOf(Math.max(t.T, 1));
@@ -2320,9 +2380,9 @@ async function loadTree() {
     <p class="ink2" style="max-width:76ch;margin:8px 0 0;font-size:13.5px">A block may be as wide as it is old, so each doubling of age gets about the same number of lines: the newest facts print verbatim, the oldest as one line each (Datar, Gionis, Indyk, Motwani, 2002). The outline shows what <code>wake</code> prints at this budget; dashed accent shows what <code>nap</code> would ask for first.</p></div>
     <div id="tr-scopes" style="display:flex;gap:6px;flex-wrap:wrap">${scopes.map(([s, n]) => chip(s === S.treeScope, 'ts', esc(s), `${esc(short(s))} <span style="opacity:.7">${n}</span>`)).join('')}</div></div>`;
   const stat = (l, v, s, tone) => `<div class="panel stat"><div class="eyebrow">${l}</div><div class="display num v ${tone || ''}">${v}</div><div class="s">${s}</div></div>`;
-  h += `<div class="stats">${stat('T · stream', fmt(t.T), t.T > t.real_T ? `${fmt(t.real_T)} real, ${fmt(t.T - t.real_T)} simulated` : 'real length', t.T > t.real_T ? 'acc' : '')}${stat('budget', budget, budget === (S.budget || 64) ? 'wake default' : `default ${S.budget || 64}`)}${stat('cover', t.cover.length, 'lines wake prints', 'k-episodic')}${stat('summarized', t.summaries.length, 'blocks with a line')}${stat('pending', t.pending.length, 'compressions due', t.pending.length ? 'acc' : '')}${stat('root', fmt(root), 'next power of two')}</div>`;
+  h += `<div class="stats">${stat('T · stream', fmt(t.T), t.T > t.real_T ? `${fmt(t.real_T)} real, ${fmt(t.T - t.real_T)} simulated` : 'real length', t.T > t.real_T ? 'acc' : '')}${stat('budget', budget, budget === (S.budget || 16) ? 'wake default' : `default ${S.budget || 16}`)}${stat('cover', t.cover.length, 'lines wake prints', 'k-episodic')}${stat('summarized', t.summaries.length, 'blocks with a line')}${stat('pending', t.pending.length, 'compressions due', t.pending.length ? 'acc' : '')}${stat('root', fmt(root), 'next power of two')}</div>`;
   h += `<div class="panel" style="margin-bottom:16px"><div class="ph"><div><div class="eyebrow">scrub</div><h2>Budget and stream length</h2></div><div class="r">cover() ran on the server</div></div><div class="pb g12">
-    <div class="c6" style="grid-column:span 6"><div style="display:flex;justify-content:space-between;font-size:12px"><span class="eyebrow">wake budget</span><span class="mono num">${budget} lines</span></div><input type="range" id="tr-b" min="1" max="256" value="${budget}" style="width:100%;accent-color:var(--k-episodic);padding:0;border:0;background:none"><div style="display:flex;gap:4px;margin-top:6px">${[16, 64, 128, 256].map(b => chip(budget === b, 'tb', b, b + (b === 16 ? ' global' : b === 64 ? ' project' : ''))).join('')}</div></div>
+    <div class="c6" style="grid-column:span 6"><div style="display:flex;justify-content:space-between;font-size:12px"><span class="eyebrow">wake budget</span><span class="mono num">${budget} lines</span></div><input type="range" id="tr-b" min="1" max="256" value="${budget}" style="width:100%;accent-color:var(--k-episodic);padding:0;border:0;background:none"><div style="display:flex;gap:4px;margin-top:6px">${[8, 16, 64, 256].map(b => chip(budget === b, 'tb', b, b + (b === 8 ? ' global' : b === 16 ? ' project' : ''))).join('')}</div></div>
     <div class="c6" style="grid-column:span 6"><div style="display:flex;justify-content:space-between;font-size:12px"><span class="eyebrow">T · notes in the stream</span><span class="mono num">${T}${T > realT ? `<span class="acc"> (+${T - realT} simulated)</span>` : ''}</span></div><input type="range" id="tr-t" min="${realT || 1}" max="4096" value="${T}" style="width:100%;accent-color:var(--accent);padding:0;border:0;background:none"><div style="display:flex;gap:4px;margin-top:6px;flex-wrap:wrap">${chip(T <= realT, 'tt', realT, 'real · ' + realT)}${[[65, 'first nap'], [128, '128'], [256, '256'], [1024, '1024']].map(([v, l]) => chip(T === v, 'tt', v, l)).join('')}</div></div></div></div>`;
   // icicle
   const sums = new Map(t.summaries.map(s => [`${s.lo}-${s.hi}`, s.text])), cov = new Map(t.cover.map(b => [`${b.lo}-${b.hi}`, b])), pend = new Map(t.pending.map(([lo, hi], i) => [`${lo}-${hi}`, i])), leafBySeq = new Map(t.leaves.map(l => [l.seq, l]));

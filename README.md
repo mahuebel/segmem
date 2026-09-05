@@ -233,7 +233,7 @@ segmem recall lambda
 
 Episodic facts form a binary tree. Two adjacent facts compress into one line,
 two of those into another, and so on. `wake` prints a fixed budget of lines
-(64 per project), chosen greedily: a block may be as wide as it is old, so
+(16 per project, 8 for global), chosen greedily: a block may be as wide as it is old, so
 the newest facts appear verbatim and each doubling of age gets about the same
 number of lines. Picking the cover takes one pass and well under a
 millisecond at a million memories.
@@ -273,6 +273,28 @@ The `init` output includes this block. For Claude Code, merge it into
   or a procedural fact has fallen behind the evidence, once per subject and
   session, and never
   twice in a row: a stop caused by its own block passes through.
+
+### Function hooks
+
+Claude Code 2.1.261 carries an early-access hook type behind
+`CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`: a TypeScript module the engine runs
+in-process, with typed events instead of stdin JSON. The plugin ships one,
+`hooks/hooks.ts`, that answers `prompt.context` with the wake output as a
+context block named `segmem`. The command hooks stay in `hooks.json`, so a
+session without the flag (Desktop, cloud, Codex, an older build) loses
+nothing.
+
+With the flag on, both paths run and neither knows the other's order, so both
+call `wake --once`. The first to insert a row in the `claims` table, keyed by
+session, command, and start source, prints; the other prints nothing. A
+compaction is a new source and wakes again. Without a session id, `--once`
+does nothing. The `served` column records which path spoke, so a transcript
+that looks wrong can be traced.
+
+To type-check the module after a Claude Code update, run `/plugin-types` in a
+session (it writes `.claude/types/`), then `tsc -p tsconfig.json`.
+`claude plugin validate .claude-plugin/plugin.json` shows what the engine
+reads from the module.
 
 ## Seeing what it knows
 

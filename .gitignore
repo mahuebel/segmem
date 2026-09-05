@@ -3,3 +3,4 @@ __pycache__/
 *.db-wal
 *.db-shm
 .segmem/
+.claude/types/

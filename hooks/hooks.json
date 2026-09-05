@@ -11,7 +11,7 @@
           },
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/segmem\" wake",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/segmem\" wake --once",
             "timeout": 10
           }
         ]
@@ -39,5 +39,8 @@
         ]
       }
     ]
-  }
+  },
+  "modules": [
+    "hooks.ts"
+  ]
 }

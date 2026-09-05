@@ -78,23 +78,37 @@ class Segmem(unittest.TestCase):
         self.assertIn("Nothing to compress", run("nap", "0-1", "x", check=False))
 
     def test_nap_only_when_cover_needs_it(self):
-        for i in range(66):
+        for i in range(18):
             run("note", "episodic", "e%d" % i)
-        out = run("wake", check=False)
-        self.assertIn("Cannot wake", out)
-        self.assertIn("#0-1", out)           # smallest needed block first
+        out = run("wake")
+        # wake never blocks: a block with no summary prints raw, then asks
+        self.assertIn("You are awake", out)
+        self.assertIn("not compressed yet", out)
+        self.assertIn("nap 0-1", out)             # smallest needed block first
         self.assertIn("Keep doubts as doubts", out)
         run("nap", "0-1", "e0 e1")
-        out = run("wake", check=False)
-        # the cover for 66 lines over budget 64 needs only a few old blocks
-        self.assertTrue("You are awake" in out or "Cannot wake" in out)
-        while "Cannot wake" in out:
+        out = run("wake")
+        while "Compress episodic" in out:
             import re
             lo, hi = re.search(r"nap (\d+)-(\d+)", out).groups()
             run("nap", "%s-%s" % (lo, hi), "sum %s-%s" % (lo, hi))
-            out = run("wake", check=False)
+            out = run("wake")
         self.assertIn("You are awake", out)
+        self.assertNotIn("not compressed yet", out)
         self.assertNotIn("Compress", out)    # nothing premature after wake
+
+    def test_wake_once_per_session(self):
+        run("note", "procedural", "sky is blue")
+        hook = '{"session_id": "s1", "source": "startup"}'
+        # function-hook path claims first; the command hook then stays silent
+        self.assertIn("sky is blue", run("wake", "--once", "--session=s1", "--served=function"))
+        self.assertEqual("", run("wake", "--once", stdin=hook))
+        # a compaction is a new source: it wakes again; so does another session
+        self.assertIn("sky is blue", run("wake", "--once", stdin=hook.replace("startup", "compact")))
+        self.assertIn("sky is blue", run("wake", "--once", stdin=hook.replace("s1", "s2")))
+        # no session id known: --once is a no-op, plain wake is untouched
+        self.assertIn("sky is blue", run("wake", "--once", stdin=""))
+        self.assertIn("sky is blue", run("wake"))
 
     def test_people_listed_by_name(self):
         run("note", "people", "Alice owns deploys", "--entities=alice")
@@ -102,13 +116,41 @@ class Segmem(unittest.TestCase):
         self.assertIn("People known: alice", w)
         self.assertIn("Alice owns deploys", run("recall", "alice"))
 
-    def test_wake_refuses_when_cover_needs_missing_summary(self):
-        # Force a cover that needs a summary: budget is 64, so exceed it.
-        env_budget = 70
-        for i in range(env_budget):
+    def test_wake_prints_raw_when_summary_missing(self):
+        # budget is 16 per project, so exceed it: the oldest block prints raw
+        for i in range(20):
             run("note", "episodic", "e%d" % i)
-        out = run("wake", check=False)
-        self.assertIn("Cannot wake", out)
+        out = run("wake")
+        self.assertIn("You are awake", out)
+        self.assertIn("#0-1", out)
+        self.assertIn("  #0 ", out)
+
+    def test_wake_caps_procedural(self):
+        for i in range(40):
+            run("note", "procedural", "rule %d" % i)
+        out = run("wake")
+        self.assertIn("rule 39", out)
+        self.assertNotIn("rule 0 ", out)
+        self.assertIn("8 older procedural notes", out)
+        self.assertIn("rule 0 ", run("wake", "--all"))
+
+    def test_scope_name_is_not_a_tag(self):
+        out = run("note", "procedural", "x", "--entities=alpha,widget")
+        self.assertIn("alpha is the scope itself", out)
+        self.assertIn("[widget]", run("recall", "x"))
+        self.assertNotIn("[alpha", run("recall", "x"))
+
+    def test_recall_hides_superseded_and_caps(self):
+        run("note", "procedural", "old fact about zed")
+        run("note", "procedural", "new fact about zed", "--supersedes=1")
+        out = run("recall", "zed")
+        self.assertNotIn("old fact", out)
+        self.assertIn("old fact", run("recall", "zed", "--all"))
+        for i in range(15):
+            run("note", "episodic", "zed thing %d" % i)
+        out = run("recall", "zed")
+        self.assertEqual(out.count("zed"), 12 + 1)  # 12 rows plus the "more" line
+        self.assertIn("more;", out)
 
     def test_promote_needs_three_agreeing_projects(self):
         run("note", "procedural", "uses pnpm", "--entities=pkg", project="/p/a")
@@ -278,10 +320,10 @@ class Segmem(unittest.TestCase):
         self.assertRegex(out, r"#0 \d{4}-\d{2}-\d{2} an event")
 
     def test_wake_stays_under_transport_limits(self):
-        # 64 near-max episodic notes fit the budget with no summaries needed;
+        # 16 near-max episodic notes fit the budget with no summaries needed;
         # the whole wake must stay under the smallest harness cutoff (30k chars)
         filler = "x" * 200
-        for i in range(64):
+        for i in range(16):
             run("note", "episodic", "event %d %s" % (i, filler))
         for i in range(4):
             run("note", "procedural", "rule %d %s" % (i, filler))
@@ -495,12 +537,12 @@ class Segmem(unittest.TestCase):
         self.assertIn("Not empty", run("org-init", kb, check=False))
 
     def test_note_warns_on_scope_mismatch(self):
-        run("note", "episodic", "vp sync notes", "--entities=hr-hub", project="/p/hr-hub")
-        out = run("note", "episodic", "more vp sync", "--entities=hr-hub", project="/p/armory")
-        self.assertIn("prior notes about hr-hub live in hr-hub, not armory", out)
+        run("note", "episodic", "vp sync notes", "--entities=vp-sync", project="/p/hr-hub")
+        out = run("note", "episodic", "more vp sync", "--entities=vp-sync", project="/p/armory")
+        self.assertIn("prior notes about vp-sync live in hr-hub, not armory", out)
         self.assertIn("forget 2", out)
         # a tag already at home in this project draws no warning
-        out = run("note", "episodic", "follow-up", "--entities=hr-hub", project="/p/hr-hub")
+        out = run("note", "episodic", "follow-up", "--entities=vp-sync", project="/p/hr-hub")
         self.assertNotIn("misfiled", out)
 
     def test_forget_note_by_id(self):
@@ -545,10 +587,15 @@ class Segmem(unittest.TestCase):
         cfg = json.load(open(os.path.join(HERE, "hooks", "hooks.json")))
         cmds = [h["command"] for evt in cfg["hooks"].values()
                 for m in evt for h in m["hooks"]]
-        for want in ("segmem\" prompt", "segmem\" wake", "segmem\" hook", "segmem\" stale --hook"):
+        for want in ("segmem\" prompt", "segmem\" wake --once", "segmem\" hook", "segmem\" stale --hook"):
             self.assertTrue(any(c.endswith(want) for c in cmds), want)
         for c in cmds:
             self.assertIn("${CLAUDE_PLUGIN_ROOT}", c)
+        # the function-hook module beside it also wakes --once, or the two double up
+        self.assertEqual(cfg["modules"], ["hooks.ts"])
+        ts = open(os.path.join(HERE, "hooks", "hooks.ts")).read()
+        self.assertIn('"wake", "--once"', ts)
+        self.assertIn("--served=function", ts)
 
     def test_hook_caps_facts(self):
         import json

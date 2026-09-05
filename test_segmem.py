@@ -604,6 +604,14 @@ class Segmem(unittest.TestCase):
         self.assertIn("touch <name>", out)
         self.assertNotIn("hooks", out)   # doctrine only; no install block
 
+    def test_prompt_subagent_is_read_only(self):
+        out = run("prompt", "--subagent")
+        self.assertIn("wake", out)
+        self.assertIn("recall", out)
+        for w in ("note", "nap", "promote"):
+            self.assertIn(w, out)
+        self.assertNotIn("30-day test", out)   # the parent's doctrine, not this
+
     def test_plugin_hooks_match_cli(self):
         import json
         cfg = json.load(open(os.path.join(HERE, "hooks", "hooks.json")))
@@ -620,6 +628,9 @@ class Segmem(unittest.TestCase):
         self.assertIn('"wake", "--once"', ts)
         self.assertIn('"hook", "--once"', ts)
         self.assertIn("--served=function", ts)
+        # the subagent rule lives in Python; the module only fetches it
+        self.assertIn('"prompt", "--subagent"', ts)
+        self.assertNotIn("never `note`", ts)
 
     def test_hook_caps_facts(self):
         import json

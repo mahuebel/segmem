@@ -2619,6 +2619,14 @@ what it learned that passes the 30-day test.
 """
 
 
+SUBAGENT = """\
+Memory: you may run `{me} wake` to read what this project knows and
+`{me} recall <words>` to search it; never `note`, `nap`, or `promote`.
+Report what you learned in your answer: the session that spawned you
+records it.
+"""
+
+
 HOOK = """\
 Hooks (recommended): merge into ~/.claude/settings.json (Claude Code) or save
 as ~/.codex/hooks.json (Codex CLI). SessionStart makes wake run on every start
@@ -2641,8 +2649,12 @@ def cmd_init(c, args):
 
 def cmd_prompt(c, args):
     """The doctrine block alone: what to record and when. As a SessionStart
-    hook (the plugin uses this), it replaces the CLAUDE.md paste."""
-    print(PROMPT.format(me=ME))
+    hook (the plugin uses this), it replaces the CLAUDE.md paste.
+
+    `--subagent` prints the read-only paragraph instead, addressed to the
+    subagent. The function hook appends it at `agent.spawn`, so the rule
+    lives here and not in TypeScript."""
+    print((SUBAGENT if "--subagent" in args else PROMPT).format(me=ME))
 
 
 def cmd_project(c, args):

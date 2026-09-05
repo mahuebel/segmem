@@ -216,6 +216,7 @@ rewrites a note without an agent deciding to.
 | `segmem serve [--port=7878] [--no-open]` | serve a live page over the store on loopback; Ctrl-C stops it |
 | `segmem html [file] [--no-open]` | write a self-contained snapshot page of the store, and open it |
 | `segmem mcp` | run as an MCP server over stdio |
+| `segmem prompt [--subagent]` | print the doctrine block; `--subagent` prints the read-only paragraph a subagent gets |
 | `segmem project` | print the scope key for the current directory |
 
 Examples:
@@ -298,6 +299,15 @@ transcript that looks wrong can be traced.
 The recall path takes every prompt the command hook takes, whatever its
 origin: a scheduled prompt, a peer session's message and one you typed all
 get the same memories.
+
+At `agent.spawn` the module appends the read-only rule to the subagent's
+prompt: read with `wake` and `recall`, never `note`, `nap`, or `promote`,
+and report what you learned so the parent records it. It never refuses a
+spawn. The rule's text comes from `segmem prompt --subagent`, so it is
+written once, in Python. Without the flag the parent is still told to pass
+the rule on, which is the line that has always been in the doctrine block.
+This path needs no claim: it writes the subagent's prompt, which no command
+hook can reach, so there is nothing to double.
 
 To type-check the module after a Claude Code update, run `/plugin-types` in a
 session (it writes `.claude/types/`), then `tsc -p tsconfig.json`.

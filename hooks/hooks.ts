@@ -61,4 +61,27 @@ export const register: Register = (on) => {
     if (!found || r.drop !== undefined) return r;
     return { ...r, context: [...(r.context ?? []), found] };
   });
+
+  // The rule the parent is told to pass on, passed on by the harness instead.
+  // No claim: this writes the subagent's prompt, which no command hook can
+  // reach, so there is nothing to double. Never denies a spawn.
+  let doctrine: string | undefined;
+
+  on("agent.spawn", async ($, e, next) => {
+    if (doctrine === undefined) {
+      doctrine = "";
+      try {
+        const r = await $.process.run(
+          [$.plugin.root + "/segmem", "prompt", "--subagent"],
+          { cwd: await $.session.cwd(), timeoutMs: TIMEOUT },
+        );
+        if (r.exitCode === 0) doctrine = r.stdout.trim();
+        else $.ui.log("segmem prompt --subagent failed: " + r.stderr.trim());
+      } catch (err) {
+        $.ui.log("segmem prompt --subagent failed: " + String(err));
+      }
+    }
+    if (!doctrine) return next(e);
+    return next({ ...e, prompt: e.prompt + "\n\n" + doctrine });
+  });
 };

@@ -118,4 +118,43 @@ export const register: Register = (on) => {
     if (!hint || r.deny !== undefined) return r;
     return { ...r, context: [...(r.context ?? []), hint] };
   });
+
+  // Recall as a tool the model can call directly. Bash recall keeps working
+  // everywhere, so an unflagged session loses nothing. `note` is not
+  // registered: it stays a Bash command, which is what keeps "subagents
+  // never note" true with no extra enforcement.
+  on("session.start", async ($, e, next) => {
+    try {
+      const t = await $.tool.register({
+        name: "recall",
+        description:
+          "Search segmem, the project's memory, across every kind and scope. " +
+          "Use it when a prompt names a person, component, branch, issue, or " +
+          "past decision.",
+        inputSchema: {
+          type: "object",
+          required: ["query"],
+          properties: { query: { type: "string", description: "words to search for" } },
+        },
+      });
+      $.ui.log("segmem registered " + t.tool);
+    } catch (err) {
+      $.ui.log("segmem tool.register failed: " + String(err));
+    }
+    return next(e);
+  });
+
+  on("tool.call", { tool: "mcp__segmem__recall" }, async ($, e, next) => {
+    try {
+      const r = await $.process.run(
+        [$.plugin.root + "/segmem", "recall", String(e.query ?? "")],
+        { cwd: await $.session.cwd(), timeoutMs: TIMEOUT },
+      );
+      if (r.exitCode === 0) return { result: r.stdout.trim() };
+      return { deny: r.stderr.trim() || "segmem recall failed" };
+    } catch (err) {
+      $.ui.log("segmem recall failed: " + String(err));
+      return next(e);
+    }
+  });
 };

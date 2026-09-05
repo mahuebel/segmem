@@ -663,6 +663,14 @@ class Segmem(unittest.TestCase):
         # the subagent rule lives in Python; the module only fetches it
         self.assertIn('"prompt", "--subagent"', ts)
         self.assertNotIn("never `note`", ts)
+        # recall is the only registered tool: note stays a Bash command, which
+        # is what keeps "subagents never note" true with no extra enforcement
+        self.assertEqual(ts.count("$.tool.register"), 1)
+        self.assertIn('name: "recall"', ts)
+        self.assertNotIn('name: "note"', ts)
+        # and the module never writes memory
+        for w in ('"note"', '"nap"', '"promote"', '"forget"', '"touch"'):
+            self.assertNotIn('/segmem", %s' % w, ts)
 
     def test_hook_caps_facts(self):
         import json

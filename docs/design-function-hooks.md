@@ -363,6 +363,17 @@ version (bump `plugin.json` only when Mark asks).
   this path may speak for that key". A second compaction therefore wakes
   again, where the old rule would have left it silent, and no key is ever
   served by both paths. The invariant is no double output, not one output.
+- The degradation table's "module fails to load" row was observed, not
+  assumed, and by accident: while S6 was being built the loader refused the
+  module over the `$`-in-a-nested-helper rule, and that session ran on the
+  command hooks alone and completed its naps normally. Nothing was arranged
+  about it, which makes it better evidence than a flag toggle.
+- An unflagged session could NOT be tested on this machine: the GrowthBook
+  rollout `tengu_plugin_hooks_modules` is enrolled for this account, and
+  `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=0` does not turn it off (the module
+  still loaded and still served recall). The env var overrides upward only.
+  The command floor is covered instead by the load-failure run above and by
+  the unit tests, which exercise every command path with no engine at all.
 - Naps: draft only, the model approves: user, September 4, 2026.
 - Pressure nags: the model verifies via the Stop block, the user sees a
   status line: user, September 4, 2026.

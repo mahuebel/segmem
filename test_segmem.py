@@ -604,6 +604,29 @@ class Segmem(unittest.TestCase):
         self.assertIn("touch <name>", out)
         self.assertNotIn("hooks", out)   # doctrine only; no install block
 
+    def test_check_note_refuses_and_hints_without_writing(self):
+        run("note", "procedural", "the release runs from make-release",
+            "--entities=make-release")
+        # too long: refused, with the mark where the limit falls
+        long = run("check-note", check=False,
+                   stdin='segmem note procedural "%s"' % ("x" * 300))
+        self.assertIn("Too long: 300 bytes", long)
+        self.assertIn("\u25ae", long)
+        # a near tag: allowed, with the spelling named
+        near = run("check-note",
+                   stdin='segmem note procedural "another" --entities=make-relase')
+        self.assertIn("similar: make-release", near)
+        # not a note at all: silence
+        self.assertEqual("", run("check-note", stdin="ls -la && git status"))
+        self.assertEqual("", run("check-note", stdin="segmem recall make-release"))
+        # a wrong kind is refused the way note refuses it
+        self.assertIn("usage:", run("check-note", check=False,
+                                    stdin='segmem note wrongkind "hi"'))
+        # quoting this parser cannot read never blocks a command
+        self.assertEqual("", run("check-note", stdin='segmem note procedural "unclosed'))
+        # and none of it wrote anything
+        self.assertIn("No match.", run("recall", "another"))
+
     def test_prompt_subagent_is_read_only(self):
         out = run("prompt", "--subagent")
         self.assertIn("wake", out)

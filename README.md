@@ -213,6 +213,7 @@ rewrites a note without an agent deciding to.
 | `segmem contribute <id>` | print the org-repo candidate for a procedural fact, and the PR commands |
 | `segmem org-init <dir>` | scaffold a knowledge repo with the witnessing convention |
 | `segmem hook [--once --session=id --served=command\|function]` | the prompt hook; reads JSON on stdin |
+| `segmem check-note` | read a shell command on stdin; run the note checks on it and write nothing |
 | `segmem serve [--port=7878] [--no-open]` | serve a live page over the store on loopback; Ctrl-C stops it |
 | `segmem html [file] [--no-open]` | write a self-contained snapshot page of the store, and open it |
 | `segmem mcp` | run as an MCP server over stdio |
@@ -308,6 +309,15 @@ written once, in Python. Without the flag the parent is still told to pass
 the rule on, which is the line that has always been in the doctrine block.
 This path needs no claim: it writes the subagent's prompt, which no command
 hook can reach, so there is nothing to double.
+
+At `tool.call` the module checks a Bash command that mentions `segmem`
+before the shell runs it. `segmem check-note` reads the whole command on
+stdin, finds the `note` arguments, and runs the same length and tag checks
+the real `note` runs without writing anything: a line over 280 bytes or a
+wrong kind is refused with the trim mark, and a near-miss tag or a missing
+people record comes back as a hint beside the result. Every other command
+passes untouched. Without the flag the model learns the same thing from the
+note that failed; with it, the note is never sent.
 
 To type-check the module after a Claude Code update, run `/plugin-types` in a
 session (it writes `.claude/types/`), then `tsc -p tsconfig.json`.

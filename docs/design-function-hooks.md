@@ -281,6 +281,11 @@ version (bump `plugin.json` only when Mark asks).
   writes the subagent's prompt, which no command hook can reach, so there
   is no double output to arbitrate. The invariant guards double output, not
   hook count: decided this session.
+- `check-note` finds the note by scanning the command's tokens for one
+  whose basename is `segmem` followed by `note`, so a compound command
+  (`cd x && segmem note ...`) is read too. Quoting `shlex` cannot parse is
+  silence and exit 0: never block a command on a guess. `note_scope()` is
+  shared with `cmd_note`, so the check and the write cannot drift.
 - Naps: draft only, the model approves: user, September 4, 2026.
 - Pressure nags: the model verifies via the Stop block, the user sees a
   status line: user, September 4, 2026.
@@ -304,7 +309,7 @@ version (bump `plugin.json` only when Mark asks).
 - [x] S0 claims table and wake --once (built; commit pending)
 - [x] S1 recall as a typed prompt result
 - [x] S2 subagent doctrine on agent.spawn
-- [ ] S3 note validation before the shell runs
+- [x] S3 note validation before the shell runs
 - [ ] S4 pressure visible in the terminal
 - [ ] S5 recall as a registered tool
 - [ ] S6 nap drafts in context

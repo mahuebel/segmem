@@ -84,4 +84,26 @@ export const register: Register = (on) => {
     if (!doctrine) return next(e);
     return next({ ...e, prompt: e.prompt + "\n\n" + doctrine });
   });
+
+  // The note rules, before the shell runs rather than after it failed. The
+  // check writes nothing: Python re-runs its own length and tag checks on
+  // the command text and says refuse or warn. Any other Bash command passes
+  // untouched, and the substring test keeps the shell-out off that path.
+  on("tool.call", { tool: "Bash" }, async ($, e, next) => {
+    if (!e.command.includes("segmem")) return next(e);
+    let hint = "";
+    try {
+      const r = await $.process.run(
+        [$.plugin.root + "/segmem", "check-note"],
+        { cwd: await $.session.cwd(), timeoutMs: TIMEOUT, stdin: e.command },
+      );
+      if (r.exitCode !== 0) return { deny: r.stderr.trim() || r.stdout.trim() };
+      hint = r.stdout.trim();
+    } catch (err) {
+      $.ui.log("segmem check-note failed: " + String(err));
+    }
+    const r = await next(e);
+    if (!hint || r.deny !== undefined) return r;
+    return { ...r, context: [...(r.context ?? []), hint] };
+  });
 };

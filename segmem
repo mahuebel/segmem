@@ -570,17 +570,26 @@ def canon(c, raw, kind, scope=GLOBAL):
     return ",".join(out), hints
 
 
+def note_scope(opts, kind):
+    """Where a note lands: --scope as given, else global for the kinds that
+    are about a person and the project for the kinds that are about work."""
+    default = GLOBAL if kind in ("identity", "people") else project()
+    return {"global": GLOBAL, "project": project()}.get(opts.get("scope"), None) \
+        or opts.get("scope") or default
+
+
+NOTE_USAGE = ("usage: %s note <%s> \"<text>\" [--scope=global|project] "
+              "[--entities=a,b] [--supersedes=id]")
+
+
 def cmd_note(c, args):
     opts, pos = flags(args)
     if len(pos) != 2 or pos[0] not in KINDS:
-        die("usage: %s note <%s> \"<text>\" [--scope=global|project] "
-            "[--entities=a,b] [--supersedes=id]" % (ME, "|".join(KINDS)))
+        die(NOTE_USAGE % (ME, "|".join(KINDS)))
     kind, text = pos
     text = " ".join(text.split())
     check_len(text)
-    default_scope = GLOBAL if kind in ("identity", "people") else project()
-    scope = {"global": GLOBAL, "project": project()}.get(opts.get("scope"), None) \
-        or opts.get("scope") or default_scope
+    scope = note_scope(opts, kind)
     sup = int(opts["supersedes"]) if "supersedes" in opts else None
     if sup is not None and not c.execute("SELECT 1 FROM memories WHERE id=?", (sup,)).fetchone():
         die("No memory #%d to supersede." % sup)
@@ -600,6 +609,35 @@ def cmd_note(c, args):
     nap = next_nap(c, project())
     if nap:
         print("\n" + nap[1])
+
+
+def cmd_check_note(c, args):
+    """A Bash command about to run, whole, on stdin. When it invokes
+    `segmem note`, run the checks the real note runs and write nothing: a
+    line that would be refused exits 1 with the trim mark or the usage, and
+    one that would only be warned about exits 0 with the hints. Any other
+    command is silence and exit 0, so the shell runs as it always did.
+
+    The function hook calls this before the Bash tool, which turns a note
+    the model would have to retry into one it never sends."""
+    import shlex
+    try:
+        toks = shlex.split("" if sys.stdin.isatty() else sys.stdin.read())
+    except ValueError:
+        return              # quoting this parser cannot read: never block on a guess
+    at = next((i for i, t in enumerate(toks)
+               if os.path.basename(t) == os.path.basename(ME)
+               and toks[i + 1:i + 2] == ["note"]), None)
+    if at is None:
+        return
+    opts, pos = flags(toks[at + 2:])
+    if len(pos) != 2 or pos[0] not in KINDS:
+        die(NOTE_USAGE % (ME, "|".join(KINDS)))
+    kind, text = pos
+    check_len(" ".join(text.split()))
+    _, hints = canon(c, opts.get("entities", ""), kind, note_scope(opts, kind))
+    for h in hints:
+        print(h)
 
 
 def scope_hints(c, entities, scope, rid):
@@ -2667,6 +2705,7 @@ def main():
             "project": cmd_project, "hook": cmd_hook, "mcp": cmd_mcp,
             "html": cmd_html, "serve": cmd_serve, "stale": cmd_stale, "touch": cmd_touch,
             "prompt": cmd_prompt, "contribute": cmd_contribute,
+            "check-note": cmd_check_note,
             "org-init": cmd_org_init}
     if len(sys.argv) < 2 or sys.argv[1] not in cmds:
         die("usage: %s <%s> ..." % (ME, "|".join(cmds)))

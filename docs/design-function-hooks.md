@@ -321,6 +321,25 @@ version (bump `plugin.json` only when Mark asks).
   no claim: gating it on the wake claim would have made it dead code the way
   S6's draft nearly was. wake collects the id pairs beside the lines it
   already prints, so there is still one implementation of the rule.
+- S8, measured: `prompt.context` does NOT fire again after a compaction, so
+  S0's behavior stands and no code changed. From one debug log, a headless
+  `/compact` on a conversation of five turns:
+
+      02:38:34.054  hooks module segmem prompt.context settled in 627.9ms
+      02:38:34.344  hooks module segmem prompt.context settled in 4.7ms
+      02:38:34.378  [API REQUEST] /v1/messages ... source=compact
+      02:39:14.420  compact: kept tail holds 1 thinking block(s)
+      02:39:14.711  Hook SessionStart:compact success: ## Memory (project: proj)
+
+  Both `prompt.context` fires precede the compaction and none follows it;
+  the SessionStart command hook wakes with source `compact` afterwards.
+  `/compact` runs under `claude -p --continue`, so no interactive session
+  was needed after all; it needs a conversation long enough to summarize.
+- The owner rule changed what a claim means, and the change is wanted: it
+  used to mean "spoken once per (session, cmd, source)" and now means "only
+  this path may speak for that key". A second compaction therefore wakes
+  again, where the old rule would have left it silent, and no key is ever
+  served by both paths. The invariant is no double output, not one output.
 - Naps: draft only, the model approves: user, September 4, 2026.
 - Pressure nags: the model verifies via the Stop block, the user sees a
   status line: user, September 4, 2026.
@@ -349,4 +368,4 @@ version (bump `plugin.json` only when Mark asks).
 - [x] S5 recall as a registered tool
 - [x] S6 nap drafts in context
 - [x] S7 org contradictions as a toast
-- [ ] S8 compaction re-wake settled
+- [x] S8 compaction re-wake settled

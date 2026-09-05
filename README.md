@@ -349,6 +349,14 @@ sees one without reading it. `segmem wake --conflicts` answers with the id
 pairs alone and takes no claim: showing them is not serving the session's
 memory, and the command hook owns that.
 
+A compaction is served by the command hook, not the module. `prompt.context`
+fires only when a conversation computes the context its first message
+carries, and a compaction is not a new conversation: it does not fire again,
+so the typed blocks go with the context that was compacted. What does fire
+is `SessionStart` with source `compact`, which runs `wake --once`. Because
+the claim is keyed on the source, a startup claim held by the module does
+not silence it, and memory comes back.
+
 To type-check the module after a Claude Code update, run `/plugin-types` in a
 session (it writes `.claude/types/`), then `tsc -p tsconfig.json`.
 `claude plugin validate .claude-plugin/plugin.json` shows what the engine

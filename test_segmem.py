@@ -132,6 +132,27 @@ class Segmem(unittest.TestCase):
         self.assertIn("make-release", run("hook", "--once", stdin=ask.replace(
             '"session_id": "s1"', '"session_id": ""')))
 
+    def test_compaction_wakes_through_the_command_hook(self):
+        """prompt.context does not fire again after a compaction, so the
+        function path cannot re-wake and the command hook must. Its claim is
+        keyed on the source, so a startup claim held by the function path
+        does not silence the compact one."""
+        run("note", "procedural", "sky is blue")
+        start = '{"session_id": "s1", "source": "startup"}'
+        compact = '{"session_id": "s1", "source": "compact"}'
+        # the function path owns startup for s1
+        self.assertIn("sky is blue",
+                      run("wake", "--once", "--session=s1", "--served=function"))
+        self.assertEqual("", run("wake", "--once", stdin=start))
+        # the compaction is a different source, so the command hook still wakes
+        self.assertIn("sky is blue", run("wake", "--once", stdin=compact))
+        # the other path stays silent on that source: the claim is about who
+        # may speak, not about how many times the owner does, so a second
+        # compaction gets its memory back and a second path never doubles it
+        self.assertEqual("", run("wake", "--once", "--session=s1",
+                                 "--source=compact", "--served=function"))
+        self.assertIn("sky is blue", run("wake", "--once", stdin=compact))
+
     def test_people_listed_by_name(self):
         run("note", "people", "Alice owns deploys", "--entities=alice")
         w = run("wake")

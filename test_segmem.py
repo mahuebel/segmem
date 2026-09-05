@@ -110,6 +110,28 @@ class Segmem(unittest.TestCase):
         self.assertIn("sky is blue", run("wake", "--once", stdin=""))
         self.assertIn("sky is blue", run("wake"))
 
+    def test_hook_once_owner_serves_every_prompt(self):
+        import json
+        run("note", "procedural", "the deploy runs from make-release",
+            "--entities=make-release")
+        ask = json.dumps({"prompt": "how does `make-release` work?", "session_id": "s1"})
+        # the function path claims s1 first, so it owns recall for s1
+        self.assertIn("make-release",
+                      run("hook", "--once", "--session=s1", "--served=function", stdin=ask))
+        self.assertEqual("", run("hook", "--once", stdin=ask))
+        # and it keeps owning it on later prompts, not just the first
+        self.assertIn("make-release",
+                      run("hook", "--once", "--session=s1", "--served=function", stdin=ask))
+        self.assertEqual("", run("hook", "--once", stdin=ask))
+        # another session is arbitrated on its own; here the command path wins
+        s2 = ask.replace("s1", "s2")
+        self.assertIn("make-release", run("hook", "--once", stdin=s2))
+        self.assertEqual("", run("hook", "--once", "--session=s2", "--served=function", stdin=s2))
+        # no --once, or no session id: never silent
+        self.assertIn("make-release", run("hook", stdin=ask))
+        self.assertIn("make-release", run("hook", "--once", stdin=ask.replace(
+            '"session_id": "s1"', '"session_id": ""')))
+
     def test_people_listed_by_name(self):
         run("note", "people", "Alice owns deploys", "--entities=alice")
         w = run("wake")
@@ -587,7 +609,8 @@ class Segmem(unittest.TestCase):
         cfg = json.load(open(os.path.join(HERE, "hooks", "hooks.json")))
         cmds = [h["command"] for evt in cfg["hooks"].values()
                 for m in evt for h in m["hooks"]]
-        for want in ("segmem\" prompt", "segmem\" wake --once", "segmem\" hook", "segmem\" stale --hook"):
+        for want in ("segmem\" prompt", "segmem\" wake --once", "segmem\" hook --once",
+                     "segmem\" stale --hook"):
             self.assertTrue(any(c.endswith(want) for c in cmds), want)
         for c in cmds:
             self.assertIn("${CLAUDE_PLUGIN_ROOT}", c)
@@ -595,6 +618,7 @@ class Segmem(unittest.TestCase):
         self.assertEqual(cfg["modules"], ["hooks.ts"])
         ts = open(os.path.join(HERE, "hooks", "hooks.ts")).read()
         self.assertIn('"wake", "--once"', ts)
+        self.assertIn('"hook", "--once"', ts)
         self.assertIn("--served=function", ts)
 
     def test_hook_caps_facts(self):

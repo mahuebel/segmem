@@ -281,7 +281,14 @@ version (bump `plugin.json` only when Mark asks).
 - Pressure nags: the model verifies via the Stop block, the user sees a
   status line: user, September 4, 2026.
 - Tools: register `recall` only: user, September 4, 2026.
-- Origin filtering in S1: executor's choice; constraint above.
+- Origin filtering in S1: no filtering. Parity with the command hook is
+  the default and costs no code; a scheduled or peer prompt gets the same
+  memories a typed one does. Documented in the README.
+- The UserPromptSubmit command hook runs *inside* `next(e)` at
+  `prompt.submit`, so a function hook that awaited `next(e)` before claiming
+  could never win the race. Every hook in `hooks.ts` claims and holds its
+  output before it calls `next`, so a claim it wins is a claim it can
+  deliver: decided this session.
 - Names of new Python flags (`check-note`, `stale --count`, `next-nap
   --json`, `prompt --subagent`): executor's choice; constraint: each is
   documented in the README command list and has one test.
@@ -291,7 +298,7 @@ version (bump `plugin.json` only when Mark asks).
 ## Status
 
 - [x] S0 claims table and wake --once (built; commit pending)
-- [ ] S1 recall as a typed prompt result
+- [x] S1 recall as a typed prompt result
 - [ ] S2 subagent doctrine on agent.spawn
 - [ ] S3 note validation before the shell runs
 - [ ] S4 pressure visible in the terminal

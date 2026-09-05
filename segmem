@@ -292,13 +292,15 @@ def hook_input():
 
 def claim(c, session, cmd, source, served):
     """Once per session: the command hook and the function hook both serve
-    wake when CLAUDE_CODE_ENABLE_FUNCTION_HOOKS is on, in an order the
-    engine does not promise. Whichever inserts the row first speaks; the
-    other stays silent. Keyed on source so a compaction wakes again."""
+    wake and recall when CLAUDE_CODE_ENABLE_FUNCTION_HOOKS is on, in an
+    order the engine does not promise. Whichever inserts the row first owns
+    it; every path speaks only when it is the owner. Keyed on source so a
+    compaction wakes again. Returns the owner's `served` value."""
     with c:
-        cur = c.execute("INSERT OR IGNORE INTO claims(session,cmd,source,served) "
-                        "VALUES (?,?,?,?)", (session, cmd, source, served))
-    return cur.rowcount == 1
+        c.execute("INSERT OR IGNORE INTO claims(session,cmd,source,served) "
+                  "VALUES (?,?,?,?)", (session, cmd, source, served))
+    return c.execute("SELECT served FROM claims WHERE session=? AND cmd=? AND source=?",
+                     (session, cmd, source)).fetchone()[0]
 
 
 def touch(c, entities, kind, session=""):
@@ -972,8 +974,9 @@ def cmd_wake(c, args):
         data = {} if "session" in opts else hook_input()
         sid = opts.get("session") or data.get("session_id", "")
         src = opts.get("source") or data.get("source", "startup")
-        if sid and not claim(c, sid, "wake", src, opts.get("served", "command")):
-            return          # the other hook path already woke this session
+        served = opts.get("served", "command")
+        if sid and claim(c, sid, "wake", src, served) != served:
+            return          # the other hook path owns this session's wake
     p = project()
     scopes = [GLOBAL] if p == GLOBAL else [GLOBAL, p]
     out = ["## Memory (project: %s)" % short(p)]
@@ -1119,15 +1122,20 @@ def identifiers(text, tags=()):
 
 def cmd_hook(c, args):
     """Claude Code UserPromptSubmit hook: reads the prompt as JSON on stdin,
-    prints matching memories as extra context. Never fails the prompt."""
-    import json
-    sid = ""
-    try:
-        data = json.load(sys.stdin)
-        text = data.get("prompt", "") if isinstance(data, dict) else ""
-        sid = data.get("session_id", "") if isinstance(data, dict) else ""
-    except Exception:
-        text = sys.stdin.read() if not sys.stdin.isatty() else ""
+    prints matching memories as extra context. Never fails the prompt.
+
+    `--once` claims the session for one path: the claim is keyed on the
+    session alone (source `session`), so the first prompt decides who serves
+    recall for every prompt after it. There is no id both paths see per
+    prompt, so per-prompt arbitration is not available."""
+    opts, _ = flags(args)
+    data = hook_input()
+    text = data.get("prompt", "")
+    sid = opts.get("session") or data.get("session_id", "")
+    if "once" in opts:
+        served = opts.get("served", "command")
+        if sid and claim(c, sid, "hook", "session", served) != served:
+            return          # the other hook path owns this session's recall
     tags = known_tags(c)
     ids = identifiers(text, tags)
     if not ids:

@@ -212,7 +212,7 @@ rewrites a note without an agent deciding to.
 | `segmem touch <entity\|id> [--keep]` | claim reviewed, unchanged; resets its pressure; `--keep` marks a procedural fact memory-resident |
 | `segmem contribute <id>` | print the org-repo candidate for a procedural fact, and the PR commands |
 | `segmem org-init <dir>` | scaffold a knowledge repo with the witnessing convention |
-| `segmem hook` | the prompt hook; reads JSON on stdin |
+| `segmem hook [--once --session=id --served=command\|function]` | the prompt hook; reads JSON on stdin |
 | `segmem serve [--port=7878] [--no-open]` | serve a live page over the store on loopback; Ctrl-C stops it |
 | `segmem html [file] [--no-open]` | write a self-contained snapshot page of the store, and open it |
 | `segmem mcp` | run as an MCP server over stdio |
@@ -279,17 +279,25 @@ The `init` output includes this block. For Claude Code, merge it into
 Claude Code 2.1.261 carries an early-access hook type behind
 `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`: a TypeScript module the engine runs
 in-process, with typed events instead of stdin JSON. The plugin ships one,
-`hooks/hooks.ts`, that answers `prompt.context` with the wake output as a
-context block named `segmem`. The command hooks stay in `hooks.json`, so a
-session without the flag (Desktop, cloud, Codex, an older build) loses
+`hooks/hooks.ts`. It answers `prompt.context` with the wake output as a
+context block named `segmem`, and `prompt.submit` with the recall hits as
+typed context beside the prompt. The command hooks stay in `hooks.json`, so
+a session without the flag (Desktop, cloud, Codex, an older build) loses
 nothing.
 
-With the flag on, both paths run and neither knows the other's order, so both
-call `wake --once`. The first to insert a row in the `claims` table, keyed by
-session, command, and start source, prints; the other prints nothing. A
-compaction is a new source and wakes again. Without a session id, `--once`
-does nothing. The `served` column records which path spoke, so a transcript
-that looks wrong can be traced.
+With the flag on, both paths run and neither knows the other's order, so
+each output path calls the same command with `--once`: `wake --once` for the
+memory at start, `hook --once` for the recall on every prompt. The first to
+insert a row in the `claims` table owns it, and only the owner prints. The
+key is the session, the command, and the source: `startup` for wake, so a
+compaction is a new source and wakes again, and `session` for recall, so the
+first prompt decides who serves every prompt after it. Without a session id,
+`--once` does nothing. The `served` column records which path spoke, so a
+transcript that looks wrong can be traced.
+
+The recall path takes every prompt the command hook takes, whatever its
+origin: a scheduled prompt, a peer session's message and one you typed all
+get the same memories.
 
 To type-check the module after a Claude Code update, run `/plugin-types` in a
 session (it writes `.claude/types/`), then `tsc -p tsconfig.json`.

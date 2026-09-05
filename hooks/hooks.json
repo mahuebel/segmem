@@ -22,7 +22,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/segmem\" hook",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/segmem\" hook --once",
             "timeout": 10
           }
         ]

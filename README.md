@@ -326,6 +326,13 @@ block is still what asks the model to verify a fact against the repo. A
 headless run has nowhere to draw it, and the engine says so in the debug
 log rather than failing.
 
+At `session.start` the module registers one tool, `recall`, which the model
+calls as `mcp__segmem__recall` with a `query`. It runs `segmem recall` and
+returns what it printed, so a call presses the entities it finds exactly as
+a Bash recall does. Bash recall keeps working in every session, flagged or
+not. `note` is not registered: it stays a shell command, which is what keeps
+"subagents never note" true without anything extra to enforce it.
+
 To type-check the module after a Claude Code update, run `/plugin-types` in a
 session (it writes `.claude/types/`), then `tsc -p tsconfig.json`.
 `claude plugin validate .claude-plugin/plugin.json` shows what the engine

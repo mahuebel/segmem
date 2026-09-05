@@ -293,6 +293,13 @@ version (bump `plugin.json` only when Mark asks).
 - A `-p` run has no surface, so `$.ui.status` is dropped and the engine logs
   `no session bound; dropped: <text>`. That is the line the live check reads:
   the call is well formed and has nowhere to draw.
+- Two matched `tool.call` registrations in one module are accepted: the
+  engine's "one hook per event" rule covers plain registrations, and
+  `plugin validate` lists `tool.call{tool=Bash}` and
+  `tool.call{tool=mcp__segmem__recall}` side by side. Measured this session.
+- The registered tool's full name is `mcp__segmem__recall` under
+  `--plugin-dir` too, so the literal matcher holds; the engine serves it
+  over a loopback MCP server it starts itself.
 - Naps: draft only, the model approves: user, September 4, 2026.
 - Pressure nags: the model verifies via the Stop block, the user sees a
   status line: user, September 4, 2026.
@@ -318,7 +325,7 @@ version (bump `plugin.json` only when Mark asks).
 - [x] S2 subagent doctrine on agent.spawn
 - [x] S3 note validation before the shell runs
 - [x] S4 pressure visible in the terminal
-- [ ] S5 recall as a registered tool
+- [x] S5 recall as a registered tool
 - [ ] S6 nap drafts in context
 - [ ] S7 org contradictions as a toast
 - [ ] S8 compaction re-wake settled

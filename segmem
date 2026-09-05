@@ -615,32 +615,42 @@ def cmd_note(c, args):
 
 
 def cmd_check_note(c, args):
-    """A Bash command about to run, whole, on stdin. When it invokes
-    `segmem note`, run the checks the real note runs and write nothing: a
-    line that would be refused exits 1 with the trim mark or the usage, and
-    one that would only be warned about exits 0 with the hints. Any other
-    command is silence and exit 0, so the shell runs as it always did.
+    """A Bash command about to run, whole, on stdin. For every `segmem note`
+    in it, run the checks the real note runs and write nothing: one that
+    would be refused exits 1 with the trim mark or the usage, one that would
+    only be warned about exits 0 with the hints. Any other command is
+    silence and exit 0, so the shell runs as it always did.
 
     The function hook calls this before the Bash tool, which turns a note
-    the model would have to retry into one it never sends."""
+    the model would have to retry into one it never sends.
+
+    `shlex` tokenizes quoting, not grammar. It knows nothing of `&&`, `|`,
+    redirections or newlines, and every one of them would otherwise read as
+    another argument to note and fail a valid command. Hence a scan per
+    line, and a stop at the first shell operator within a line."""
     import shlex
-    try:
-        toks = shlex.split("" if sys.stdin.isatty() else sys.stdin.read())
-    except ValueError:
-        return              # quoting this parser cannot read: never block on a guess
-    at = next((i for i, t in enumerate(toks)
-               if os.path.basename(t) == os.path.basename(ME)
-               and toks[i + 1:i + 2] == ["note"]), None)
-    if at is None:
-        return
-    opts, pos = flags(toks[at + 2:])
-    if len(pos) != 2 or pos[0] not in KINDS:
-        die(NOTE_USAGE % (ME, "|".join(KINDS)))
-    kind, text = pos
-    check_len(" ".join(text.split()))
-    _, hints = canon(c, opts.get("entities", ""), kind, note_scope(opts, kind))
-    for h in hints:
-        print(h)
+    for line in ("" if sys.stdin.isatty() else sys.stdin.read()).splitlines():
+        try:
+            toks = shlex.split(line)
+        except ValueError:
+            continue        # quoting this parser cannot read: never block on a guess
+        for i, t in enumerate(toks):
+            if os.path.basename(t) != os.path.basename(ME) \
+                    or toks[i + 1:i + 2] != ["note"]:
+                continue
+            argv = []
+            for a in toks[i + 2:]:
+                if a in (";", "&&", "||", "|", "&") or re.match(r"^\d*[<>]", a):
+                    break
+                argv.append(a)
+            opts, pos = flags(argv)
+            if len(pos) != 2 or pos[0] not in KINDS:
+                die(NOTE_USAGE % (ME, "|".join(KINDS)))
+            kind, text = pos
+            check_len(" ".join(text.split()))
+            _, hints = canon(c, opts.get("entities", ""), kind, note_scope(opts, kind))
+            for h in hints:
+                print(h)
 
 
 def scope_hints(c, entities, scope, rid):

@@ -368,12 +368,25 @@ version (bump `plugin.json` only when Mark asks).
   module over the `$`-in-a-nested-helper rule, and that session ran on the
   command hooks alone and completed its naps normally. Nothing was arranged
   about it, which makes it better evidence than a flag toggle.
-- An unflagged session could NOT be tested on this machine: the GrowthBook
-  rollout `tengu_plugin_hooks_modules` is enrolled for this account, and
-  `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=0` does not turn it off (the module
-  still loaded and still served recall). The env var overrides upward only.
-  The command floor is covered instead by the load-failure run above and by
-  the unit tests, which exercise every command path with no engine at all.
+- An unflagged session IS testable, and the command floor is verified. An
+  earlier note here said otherwise and blamed the GrowthBook rollout; that
+  was wrong. The cause is settings: `~/.claude/settings.json` carries
+  `env: {"CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1"}`, and a settings `env`
+  block is applied OVER the inherited shell environment, so a
+  `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=0` prefix on the command line is
+  overwritten. Override it with `--settings` instead:
+
+      echo '{"env": {"CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "0"}}' > off.json
+      claude -p --settings off.json --plugin-dir ~/Node/segmem ...
+
+  Measured both ways: with the shell prefix the module loads and `function`
+  serves recall; with `--settings` the module does not load, `command`
+  serves both wake and recall, and the model still answers from memory.
+- `check-note` scans per LINE and stops at the first shell operator in one.
+  `shlex` tokenizes quoting, not grammar: `&&`, `|`, redirections and
+  newlines all arrive as ordinary positionals, so the first build refused
+  every valid note that carried any of them. Found by dogfooding, not by the
+  suite, whose cases were all bare one-line commands.
 - Naps: draft only, the model approves: user, September 4, 2026.
 - Pressure nags: the model verifies via the Stop block, the user sees a
   status line: user, September 4, 2026.

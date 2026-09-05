@@ -687,6 +687,30 @@ class Segmem(unittest.TestCase):
                                     stdin='segmem note wrongkind "hi"'))
         # quoting this parser cannot read never blocks a command
         self.assertEqual("", run("check-note", stdin='segmem note procedural "unclosed'))
+        # a real note carries shell grammar shlex knows nothing about: a
+        # redirect or an && is not a third argument to note
+        for tail in (">/dev/null", "2>&1", "&& echo done", "| head -3",
+                     "> out.txt", "; echo next"):
+            self.assertEqual("", run("check-note",
+                                     stdin='segmem note procedural "hello" ' + tail), tail)
+        self.assertEqual("", run("check-note",
+                                 stdin='cd /tmp && segmem note procedural "hello" > o'))
+        # and the length check still bites through a redirect
+        self.assertIn("Too long", run("check-note", check=False,
+                                      stdin='segmem note procedural "%s" >/dev/null'
+                                            % ("x" * 300)))
+        # a multi-line script: shlex flattens newlines too, so without a scan
+        # per line the note's text runs on into the next command's words
+        script = ('cd /tmp\n'
+                  'segmem note procedural "hello" --entities=a\n'
+                  'echo done && ls -la\n')
+        self.assertEqual("", run("check-note", stdin=script))
+        self.assertIn("Too long", run("check-note", check=False,
+                                      stdin=script.replace("hello", "y" * 300)))
+        # every note in the script is checked, not just the first
+        self.assertIn("Too long", run("check-note", check=False,
+                                      stdin='segmem note procedural "ok"\n'
+                                            'segmem note episodic "%s"' % ("z" * 300)))
         # and none of it wrote anything
         self.assertIn("No match.", run("recall", "another"))
 

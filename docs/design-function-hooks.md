@@ -1,10 +1,33 @@
 # Design: segmem on function hooks (from stdout hooks to a typed in-process layer)
 
-**Status:** design (September 4, 2026, distilled from an ideation session).
-Everything here ships behind Claude Code's own flag,
-`CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`. A session without the flag runs the
-command hooks in `hooks/hooks.json` exactly as before and loses nothing.
-S0 is built and verified in the working tree; S1 to S8 are the work.
+**Status:** built, September 5, 2026. S0 to S8 are committed, each verified
+against a live flagged session before the next began. Everything ships
+behind Claude Code's own flag, `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`; a
+session without it runs the command hooks in `hooks/hooks.json` exactly as
+before and loses nothing.
+
+**What the build found.** Three things the design could not have known, all
+in Resolved decisions with the log lines that show them:
+
+1. `prompt.context` is dispatched more than once and the dispatches OVERLAP,
+   and the engine keeps whichever answer settles FIRST. S0's once-guard set
+   its sentinel before its await, so the second dispatch returned an empty
+   answer and, being the fast one, won. The typed wake block had never
+   reached a model: every green check up to S6 was answered by the command
+   hook's wake instead. The guard caches the promise now, not the value.
+2. The two paths race on the wake claim and the command hook wins it every
+   time measured. That is harmless for wake, where both paths print the same
+   text, but anything only the module can produce must not be gated on
+   winning or it never ships. S6's draft and S7's toast take no claim.
+3. `prompt.context` does not fire again after a compaction, which settles S8
+   in the direction that needs no code. `/compact` runs under `claude -p
+   --continue`, so the interactive session the slice warned about was not
+   needed.
+
+The lesson under all three: a live check that cannot tell which path
+answered is not a check of either. Run all three verification commands
+before every live check, and read the debug log for who spoke, not just for
+whether the answer was right.
 
 ## Why
 
@@ -360,7 +383,7 @@ version (bump `plugin.json` only when Mark asks).
 
 ## Status
 
-- [x] S0 claims table and wake --once (built; commit pending)
+- [x] S0 claims table and wake --once
 - [x] S1 recall as a typed prompt result
 - [x] S2 subagent doctrine on agent.spawn
 - [x] S3 note validation before the shell runs

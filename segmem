@@ -1315,7 +1315,7 @@ def cmd_mcp(c, args):
             if method == "initialize":
                 result = {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
                           "capabilities": {"tools": {}},
-                          "serverInfo": {"name": "segmem", "version": "0.7.0"}}
+                          "serverInfo": {"name": "segmem", "version": "0.8.0"}}
             elif method == "ping":
                 result = {}
             elif method == "tools/list":

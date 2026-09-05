@@ -201,7 +201,7 @@ rewrites a note without an agent deciding to.
 
 | Command | What it does |
 |---|---|
-| `segmem wake` | print the memory for the current project |
+| `segmem wake [--all] [--conflicts]` | print the memory for the current project; `--conflicts` prints the overriding id pairs alone |
 | `segmem note <kind> "<text>" [--entities=a,b] [--scope=global\|project] [--supersedes=id]` | record one fact, up to 280 bytes |
 | `segmem recall <query>` | full-text search across every kind and scope |
 | `segmem nap <lo>-<hi> "<text>"` | answer a compression request |
@@ -340,6 +340,14 @@ session's own model and adds it as a context block named
 doubts and invents nothing, otherwise write your own. The plugin never runs
 `nap`. A summary that turns an unknown cause into a cause is worse than no
 summary, and only the model reading the originals can tell the two apart.
+
+When a project fact overrides a global one, or a local fact overrides an
+org fact, the module toasts the pair of ids: `segmem: #12 overrides #7`, or
+`segmem: #9 overrides org:pkg-standard`. A contradiction is the point of
+the altitudes and the easiest thing to miss inside a long wake, so the user
+sees one without reading it. `segmem wake --conflicts` answers with the id
+pairs alone and takes no claim: showing them is not serving the session's
+memory, and the command hook owns that.
 
 To type-check the module after a Claude Code update, run `/plugin-types` in a
 session (it writes `.claude/types/`), then `tsc -p tsconfig.json`.

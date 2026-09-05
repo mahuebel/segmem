@@ -1025,6 +1025,7 @@ def cmd_wake(c, args):
     p = project()
     scopes = [GLOBAL] if p == GLOBAL else [GLOBAL, p]
     out = ["## Memory (project: %s)" % short(p)]
+    conflicts = []          # for --conflicts: the id pairs, without the prose
 
     for kind, title in (("identity", "Identity"), ("procedural", "Procedural")):
         rows = live(c, kind, scopes)
@@ -1042,6 +1043,7 @@ def cmd_wake(c, args):
                     conflicted.update((pr["id"], g["id"]))
                     out.append("#%d %s (global) OVERRIDDEN by #%d %s (%s)"
                                % (g["id"], g["text"], pr["id"], pr["text"], short(p)))
+                    conflicts.append("#%d overrides #%d" % (pr["id"], g["id"]))
         shown = [r for r in rows if r["id"] not in conflicted]
         hidden = 0
         if kind == "procedural" and len(shown) > WAKE_PROCEDURAL and "--all" not in args:
@@ -1084,6 +1086,7 @@ def cmd_wake(c, args):
                                    "org fact is wrong, open an issue on %s"
                                    % (of["slug"], of["text"], lr["id"], lr["text"],
                                       short(lr["scope"]), of["path"]))
+                        conflicts.append("#%d overrides org:%s" % (lr["id"], of["slug"]))
                         break
             else:
                 for lr in loc:
@@ -1130,6 +1133,12 @@ def cmd_wake(c, args):
                         out.append("  #%d %s %s" % (r[0], r[1][:10], r[2]))
                     continue
                 out.append("#%d-%d %s %s" % (lo, hi - 1, span(c, sc, lo, hi), s))
+    if "conflicts" in opts:
+        # For a hook that wants the contradictions as data, not as prose: one
+        # id pair per line, nothing else, and no claim, since showing them is
+        # not serving the session's memory.
+        print("\n".join(conflicts))
+        return
     print("\n".join(out))
     print("\nYou are awake.")
     nap = next_nap(c, p)

@@ -604,6 +604,27 @@ class Segmem(unittest.TestCase):
         self.assertIn("touch <name>", out)
         self.assertNotIn("hooks", out)   # doctrine only; no install block
 
+    def test_wake_conflicts_is_id_pairs_only(self):
+        self.assertEqual("", run("wake", "--conflicts").strip())
+        run("note", "procedural", "prefers pnpm", "--entities=pkg", "--scope=global")
+        run("note", "procedural", "uses npm, the Lambda runtime needs it",
+            "--entities=pkg")
+        self.assertEqual("#2 overrides #1", run("wake", "--conflicts").strip())
+        # the prose form still says the same thing, at length
+        self.assertIn("#1 prefers pnpm (global) OVERRIDDEN by #2", run("wake"))
+        # and it takes no claim, so asking twice answers twice
+        self.assertEqual("#2 overrides #1",
+                         run("wake", "--conflicts", "--once", "--session=s1").strip())
+        self.assertEqual("#2 overrides #1",
+                         run("wake", "--conflicts", "--once", "--session=s1").strip())
+
+    def test_wake_conflicts_names_an_org_fact(self):
+        d = org_repo(facts=[("npm-lambda", "pkg", "use pnpm everywhere")])
+        run("note", "procedural", "uses npm, the Lambda runtime needs it",
+            "--entities=pkg")
+        self.assertEqual("#1 overrides org:npm-lambda",
+                         run("wake", "--conflicts", org=d).strip())
+
     def test_next_nap_json_is_the_pending_request(self):
         import json
         self.assertEqual({}, json.loads(run("next-nap", "--json")))

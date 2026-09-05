@@ -66,6 +66,18 @@ async function gather($: EngineInterface): Promise<Gathered> {
     $.ui.log("segmem stale failed: " + String(err));
   }
 
+  // A contradiction is the whole point of the altitudes, and it is easy to
+  // miss inside a long wake. Toast the ids so the user sees one without
+  // reading it. `wake --conflicts` answers as data and takes no claim: the
+  // command hook owns wake's text, and this is not serving that text.
+  try {
+    const r = await $.process.run([root, "wake", "--conflicts"], { cwd, timeoutMs: TIMEOUT });
+    const ids = r.exitCode === 0 ? r.stdout.trim().split("\n").filter(Boolean) : [];
+    if (ids.length) $.ui.toast("segmem: " + ids.join("; "), { timeoutMs: 8000 });
+  } catch (err) {
+    $.ui.log("segmem wake --conflicts failed: " + String(err));
+  }
+
   let draft = "";
   try {
     const r = await $.process.run([root, "next-nap", "--json"], { cwd, timeoutMs: TIMEOUT });

@@ -317,6 +317,10 @@ version (bump `plugin.json` only when Mark asks).
   loader refuses a helper declared inside `register` and names the line.
   `claude plugin validate` catches it, so run all three checks before every
   live check, not two of them.
+- S7 reads `wake --conflicts` rather than scanning wake's prose, and takes
+  no claim: gating it on the wake claim would have made it dead code the way
+  S6's draft nearly was. wake collects the id pairs beside the lines it
+  already prints, so there is still one implementation of the rule.
 - Naps: draft only, the model approves: user, September 4, 2026.
 - Pressure nags: the model verifies via the Stop block, the user sees a
   status line: user, September 4, 2026.
@@ -344,5 +348,5 @@ version (bump `plugin.json` only when Mark asks).
 - [x] S4 pressure visible in the terminal
 - [x] S5 recall as a registered tool
 - [x] S6 nap drafts in context
-- [ ] S7 org contradictions as a toast
+- [x] S7 org contradictions as a toast
 - [ ] S8 compaction re-wake settled

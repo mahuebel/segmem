@@ -17,6 +17,7 @@ pressing on the people dossiers and procedural facts. Wake never prints
 them as facts.
 """
 import os
+from pathlib import Path
 import re
 import sqlite3
 import subprocess
@@ -228,7 +229,7 @@ def span(c, scope, lo, hi):
 def nap_prompt(c, kind, scope, lo, hi, left):
     if hi - lo == 2:
         rows = c.execute("SELECT seq, ts, text FROM memories WHERE kind=? AND scope=? "
-                         "AND seq>=? AND seq<? ORDER BY seq", (kind, scope, lo, hi))
+                         "AND seq>=? AND seq<? AND %s ORDER BY seq" % LIVE, (kind, scope, lo, hi))
         body = "\n".join("  #%d %s %s" % (r["seq"], r["ts"][:10], r["text"]) for r in rows)
     else:
         mid, halves = (lo + hi) // 2, []
@@ -408,7 +409,7 @@ def org_head(d):
 def parse_fact(path):
     """A fact file: --- fences, key: value lines, body is the claim."""
     try:
-        raw = open(path, encoding="utf-8").read()
+        raw = Path(path).read_text(encoding="utf-8")
     except OSError:
         return None
     m = re.match(r"---\s*\n(.*?)\n---\s*\n(.*)", raw, re.S)
@@ -858,9 +859,14 @@ def stale_hook(c, due, pdue):
         "SELECT DISTINCT entity FROM touches WHERE kind='nag' AND session=?", (sid,))}
     due = [r for r in due if r[0] not in nagged]
     pdue = [r for r in pdue if "#%d" % r[0]["id"] not in nagged]
-    if not due and not pdue:
+    # A compression the wake asked for and the turn read past. Wake never
+    # blocks, so this is the one place the ask cannot be skipped: once per
+    # session, the same prompt wake printed.
+    nap = None if "#nap" in nagged else next_nap(c, project())
+    if not due and not pdue and not nap:
         return
-    touch(c, [e for e, _, _, _ in due] + ["#%d" % r[0]["id"] for r in pdue], "nag", sid)
+    touch(c, [e for e, _, _, _ in due] + ["#%d" % r[0]["id"] for r in pdue]
+          + (["#nap"] if nap else []), "nag", sid)
     parts = []
     if due:
         names = "; ".join("%s (%s since %s)" % (e, fmt_counts(n), since[:10])
@@ -883,7 +889,10 @@ def stale_hook(c, due, pdue):
                      "`%s touch <id> --keep`."
                      % ("; ".join('#%d \"%s\"' % (r[0]["id"], r[0]["text"][:60])
                                   for r in export), ME))
-    parts.append("Keep hedges as hedges when you supersede.")
+    if due or pdue:
+        parts.append("Keep hedges as hedges when you supersede.")
+    if nap:
+        parts.append(nap[1])
     print(json.dumps({"decision": "block", "reason": " ".join(parts)}))
 
 
@@ -982,7 +991,7 @@ def cmd_org_init(c, args):
         die("Not empty: %s" % d)
     os.makedirs(os.path.join(d, "facts"), exist_ok=True)
     os.makedirs(os.path.join(d, "candidates"), exist_ok=True)
-    open(os.path.join(d, "README.md"), "w").write("""\
+    Path(d, "README.md").write_text("""\
 # Knowledge repo
 
 One fact per file. `candidates/` holds claims with fewer than three
@@ -1005,12 +1014,12 @@ File format:
 Facts are claims from when they were written. Supersede, never edit;
 delete only misfiles. Never facts about people.
 """)
-    open(os.path.join(d, "CODEOWNERS"), "w").write("""\
+    Path(d, "CODEOWNERS").write_text("""\
 # The named human on the other end of the staleness signal.
 # facts/aws-*.md @platform-team
 * @OWNER
 """)
-    open(os.path.join(d, "facts", "knowledge-repo.md"), "w").write("""\
+    Path(d, "facts", "knowledge-repo.md").write_text("""\
 ---
 kind: procedural
 scope: org
@@ -1129,9 +1138,12 @@ def cmd_wake(c, args):
         out.append("\n### Episodic (%s), oldest first" % short(sc))
         for lo, hi in cover(T, budget):
             if hi - lo == 1:
-                r = c.execute("SELECT ts, text FROM memories WHERE kind='episodic' AND scope=? AND seq=?",
-                              (sc, lo)).fetchone()
-                out.append("#%d %s %s" % (lo, r[0][:10], r[1]))
+                # A superseded episodic row keeps its seq (the tree needs the
+                # hole) but prints nothing: its replacement is a later row.
+                r = c.execute("SELECT ts, text FROM memories WHERE kind='episodic' AND scope=? "
+                              "AND seq=? AND %s" % LIVE, (sc, lo)).fetchone()
+                if r:
+                    out.append("#%d %s %s" % (lo, r[0][:10], r[1]))
             else:
                 s = summary(c, "episodic", sc, lo, hi)
                 if s is None:
@@ -1139,7 +1151,8 @@ def cmd_wake(c, args):
                     # raw and let next_nap ask for one compression below.
                     out.append("#%d-%d %s (not compressed yet)" % (lo, hi - 1, span(c, sc, lo, hi)))
                     for r in c.execute("SELECT seq, ts, text FROM memories WHERE kind='episodic' "
-                                       "AND scope=? AND seq>=? AND seq<? ORDER BY seq", (sc, lo, hi)):
+                                       "AND scope=? AND seq>=? AND seq<? AND %s ORDER BY seq" % LIVE,
+                                       (sc, lo, hi)):
                         out.append("  #%d %s %s" % (r[0], r[1][:10], r[2]))
                     continue
                 out.append("#%d-%d %s %s" % (lo, hi - 1, span(c, sc, lo, hi), s))
@@ -1315,7 +1328,7 @@ def cmd_mcp(c, args):
             if method == "initialize":
                 result = {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
                           "capabilities": {"tools": {}},
-                          "serverInfo": {"name": "segmem", "version": "0.8.0"}}
+                          "serverInfo": {"name": "segmem", "version": "0.9.0"}}
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
@@ -2652,7 +2665,7 @@ CI counts, or "awaiting review" status. Record the why and what surprised you;
 git log has the what, and the tool stamps the date (date the text only for a
 past event). A fact that replaces an older one: add --supersedes=<id>.
 When `note` suggests a tag spelling, use it next time; never re-note.
-If `note` asks for a compression, do it before your next action.
+If `note` or a stop asks for a compression, do it before your next action.
 When a person was a subject this session, not a mention: before you finish,
 supersede their people note or confirm it unchanged with `{me} touch <name>`.
 When wake or a stop flags a fact under pressure, check the claim against the

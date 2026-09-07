@@ -242,9 +242,10 @@ number of lines. Picking the cover takes one pass and well under a
 millisecond at a million memories.
 
 The agent writes each summary itself. When `wake` needs a summary that
-doesn't exist, it prints the two halves and asks for one line, and the agent
-answers with `nap`. Compression is requested only when wake would print the
-block, never ahead of time, and never in the background.
+doesn't exist, it prints the block raw, never blocks, and asks for one line;
+the agent answers with `nap`. If the turn reads past the ask, the Stop hook
+repeats it once per session. Compression is requested only when wake would
+print the block, never ahead of time, and never in the background.
 
 Raw facts are never edited. A misfiled note can be forgotten by id; anything
 else is superseded, not deleted. Summaries are a cache: drop one with
@@ -275,7 +276,9 @@ The `init` output includes this block. For Claude Code, merge it into
 - `Stop` runs `stale --hook`, which interrupts the agent when a people note
   or a procedural fact has fallen behind the evidence, once per subject and
   session, and never
-  twice in a row: a stop caused by its own block passes through.
+  twice in a row: a stop caused by its own block passes through. It also
+  asks once per session for the compression wake printed raw, since a wake
+  that never blocks is a wake the agent can read past.
 
 ### Function hooks
 
@@ -334,12 +337,13 @@ a Bash recall does. Bash recall keeps working in every session, flagged or
 not. `note` is not registered: it stays a shell command, which is what keeps
 "subagents never note" true without anything extra to enforce it.
 
-When wake asks for a compression, the module drafts the line with the
-session's own model and adds it as a context block named
-`segmem-nap-draft`, framed as a proposal: run it if it keeps doubts as
-doubts and invents nothing, otherwise write your own. The plugin never runs
-`nap`. A summary that turns an unknown cause into a cause is worse than no
-summary, and only the model reading the originals can tell the two apart.
+The module makes no model call. Version 0.8.0 drafted the pending
+compression with the session's model at start; that cost one completion on
+the first-prompt path and, in the one project with a backlog, never once
+turned into a nap. The Stop hook asks for the compression instead, and the
+plugin still never runs `nap`: a summary that turns an unknown cause into a
+cause is worse than no summary, and only the model reading the originals
+can tell the two apart.
 
 When a project fact overrides a global one, or a local fact overrides an
 org fact, the module toasts the pair of ids: `segmem: #12 overrides #7`, or

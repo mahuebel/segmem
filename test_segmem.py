@@ -1,5 +1,6 @@
 """Run: python3 test_segmem.py"""
 import os, subprocess, sys, tempfile, unittest
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(HERE, "segmem")
@@ -23,9 +24,9 @@ def org_repo(facts=(), candidates=()):
         os.makedirs(os.path.join(d, sub))
     for sub, items in (("facts", facts), ("candidates", candidates)):
         for slug, entities, text in items:
-            open(os.path.join(d, sub, slug + ".md"), "w").write(
-                "---\nkind: procedural\nscope: org\nentities: %s\n"
-                "witnesses: alice 2026-08-01 kerf\n---\n%s\n" % (entities, text))
+            with open(os.path.join(d, sub, slug + ".md"), "w") as f:
+                f.write("---\nkind: procedural\nscope: org\nentities: %s\n"
+                        "witnesses: alice 2026-08-01 kerf\n---\n%s\n" % (entities, text))
     subprocess.run(["git", "init", "-q"], cwd=d, check=True)
     subprocess.run(["git", "add", "-A"], cwd=d, check=True)
     subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
@@ -334,7 +335,7 @@ class Segmem(unittest.TestCase):
         run("note", "episodic", "an event")
         out = os.path.join(run.dir, "v.html")
         self.assertIn(out, run("html", out, "--no-open"))
-        page = open(out, encoding="utf-8").read()
+        page = Path(out).read_text(encoding="utf-8")
         self.assertIn("prefers pnpm", page)
         self.assertIn("uses npm", page)
         self.assertNotIn("<script src=", page)      # no external libraries
@@ -495,6 +496,36 @@ class Segmem(unittest.TestCase):
         run("touch", "1")
         self.assertEqual("", run("stale", "--hook", stdin=json.dumps({"session_id": "s2"})))
 
+    def test_stop_hook_asks_for_the_pending_nap_once(self):
+        # wake never blocks on a missing compression, so the stop is where the
+        # ask lands: the same prompt, once per session, nothing else due
+        import json
+        for i in range(20):
+            run("note", "episodic", "e%d" % i)
+        out = run("stale", "--hook", stdin=json.dumps({"session_id": "s1"}))
+        self.assertIn('"decision": "block"', out)
+        self.assertIn("Compress episodic memories #0-1", json.loads(out)["reason"])
+        self.assertNotIn("hedges", out)
+        self.assertEqual("", run("stale", "--hook", stdin=json.dumps({"session_id": "s1"})))
+        run("nap", "0-1", "e0 and e1")
+        out = run("stale", "--hook", stdin=json.dumps({"session_id": "s2"}))
+        self.assertIn("#2-3", json.loads(out)["reason"])
+
+    def test_wake_hides_superseded_episodic(self):
+        # the tree keeps the seq (a hole is fine); wake and the nap prompt
+        # skip the row, in a single line and inside a raw block alike
+        run("note", "episodic", "shipped the old way")
+        run("note", "episodic", "shipped the new way", "--supersedes=1")
+        w = run("wake")
+        self.assertIn("new way", w)
+        self.assertNotIn("old way", w)
+        for i in range(20):
+            run("note", "episodic", "e%d" % i)
+        w = run("wake")
+        self.assertIn("#0-1", w)
+        self.assertNotIn("old way", w)
+        self.assertNotIn("old way", run("next-nap", "--json"))
+
     def test_wake_flags_hot_procedural(self):
         run("note", "procedural", "uses npm, the Lambda runtime needs it", "--entities=pkg")
         self.assertNotIn("under pressure", run("wake"))
@@ -529,7 +560,7 @@ class Segmem(unittest.TestCase):
     def test_org_reindex_on_head_change(self):
         d = org_repo(facts=[("first-fact", "alpha-comp", "alpha-comp uses X")])
         self.assertIn("first-fact", run("recall", "alpha-comp", org=d))
-        open(os.path.join(d, "facts", "second-fact.md"), "w").write(
+        Path(d, "facts", "second-fact.md").write_text(
             "---\nkind: procedural\nscope: org\nentities: beta-comp\n---\nbeta-comp uses Y\n")
         org_commit(d)
         self.assertIn("second-fact", run("recall", "beta-comp", org=d))
@@ -724,7 +755,7 @@ class Segmem(unittest.TestCase):
 
     def test_plugin_hooks_match_cli(self):
         import json
-        cfg = json.load(open(os.path.join(HERE, "hooks", "hooks.json")))
+        cfg = json.loads(Path(HERE, "hooks", "hooks.json").read_text())
         cmds = [h["command"] for evt in cfg["hooks"].values()
                 for m in evt for h in m["hooks"]]
         for want in ("segmem\" prompt", "segmem\" wake --once", "segmem\" hook --once",
@@ -734,7 +765,7 @@ class Segmem(unittest.TestCase):
             self.assertIn("${CLAUDE_PLUGIN_ROOT}", c)
         # the function-hook module beside it also wakes --once, or the two double up
         self.assertEqual(cfg["modules"], ["hooks.ts"])
-        ts = open(os.path.join(HERE, "hooks", "hooks.ts")).read()
+        ts = Path(HERE, "hooks", "hooks.ts").read_text()
         self.assertIn('"wake", "--once"', ts)
         self.assertIn('"hook", "--once"', ts)
         self.assertIn("--served=function", ts)
@@ -749,6 +780,9 @@ class Segmem(unittest.TestCase):
         # and the module never writes memory
         for w in ('"note"', '"nap"', '"promote"', '"forget"', '"touch"'):
             self.assertNotIn('/segmem", %s' % w, ts)
+        # and never spends tokens: the nap ask is the Stop hook's, in Python
+        self.assertNotIn("$.model.complete", ts)
+        self.assertNotIn("next-nap", ts)
 
     def test_hook_caps_facts(self):
         import json

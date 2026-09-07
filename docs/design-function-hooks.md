@@ -1,7 +1,13 @@
 # Design: segmem on function hooks (from stdout hooks to a typed in-process layer)
 
 **Status:** built, September 5, 2026. S0 to S8 are committed, each verified
-against a live flagged session before the next began. Everything ships
+against a live flagged session before the next began. Revised September 7
+(0.9.0): S6's nap draft is gone. It was the module's only model call, it
+sat on the first-prompt path (about 1.1 s on haiku, measured), and in kerf,
+the one project with a compression backlog, 29 naps stayed pending across
+every flagged session. The Stop hook asks for the nap now, once per
+session, where the ask cannot be read past. The three session-start runs
+also go in parallel. Everything ships
 behind Claude Code's own flag, `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`; a
 session without it runs the command hooks in `hooks/hooks.json` exactly as
 before and loses nothing.

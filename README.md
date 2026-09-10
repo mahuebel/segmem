@@ -162,7 +162,14 @@ names the human on the other end of every staleness signal.
 A stored claim is a claim under test, and the store tracks the evidence
 arriving against it. Every time an entity is tagged in a new note (weight 3),
 served by `recall` (2), or mentioned in a prompt (1), that's a touch. Touches
-are telemetry, not memory: `wake` never prints them as facts.
+are telemetry, not memory: `wake` never prints them as facts. Each touch
+carries the project it came from: a project fact feels only its own
+project's attention, a global fact feels all of it.
+
+A session nobody is watching (a builder fleet, a scheduled run) should read
+memory without pressing on it. Set `SEGMEM_QUIET=1` in its environment: the
+prompt hook still recalls but records no touches, and the `Stop` hook never
+blocks it.
 
 **People dossiers.** Only a people note or an explicit review resets the
 clock; an episodic note *about* a person raises pressure on their dossier, it
@@ -219,6 +226,7 @@ rewrites a note without an agent deciding to.
 | `segmem mcp` | run as an MCP server over stdio |
 | `segmem prompt [--subagent]` | print the doctrine block; `--subagent` prints the read-only paragraph a subagent gets |
 | `segmem next-nap [--json]` | print the compression wake would ask for; `--json` for its range and prompt as data |
+| `segmem audit` | the numbers a store review reads: kinds, wake cost per project, pressure with its sources, session bursts, duplicates, untagged facts |
 | `segmem project` | print the scope key for the current directory |
 
 Examples:
@@ -437,6 +445,19 @@ Five views:
 - **entities**: every tag, how often it appears, and what it co-occurs with
 
 The page is read-only. Where an action is implied it offers a command to copy.
+
+## Skills
+
+The doctrine block stays short because the procedures that run rarely live
+in skills, loaded only when they apply. The plugin ships four, under
+`skills/`:
+
+| Skill | When it loads |
+|---|---|
+| `segmem:compile` | wake or the Stop hook calls a fact stable and hot; moves it into the repo down the form ladder and supersedes the note with a pointer |
+| `segmem:org` | recall shows an `(org)` fact, wake reports a contradiction or a co-sign, or the user wants to share a fact with the team |
+| `segmem:review` | "how is memory doing"; reads `segmem audit` and says what to fix |
+| `segmem:import` | a project also has Claude Code's markdown memory in `~/.claude/projects/<slug>/memory/`; moves what passes the 30-day test into segmem |
 
 ## Claude Desktop and other MCP clients
 

@@ -295,10 +295,10 @@ class Segmem(unittest.TestCase):
             self.assertGreater(ov["wake"]["/p/alpha"]["tokens"], 0)
             hk = json.loads(get("/api/hook?" + urllib.parse.urlencode(
                 {"prompt": "why npm for the `Lambda` runtime, see #2 and Alice", "scope": "/p/alpha"})))
-            self.assertEqual(hk["identifiers"], ["Lambda"])
-            # "#2" is three bytes with the hash, so it falls under the min length; Alice is prose: no tag
+            self.assertEqual(hk["identifiers"], ["Lambda", "#2"])
+            # "#2" is an issue ref however short; Alice is prose: no tag
             self.assertEqual([(d["word"], d["why"]) for d in hk["dropped"]],
-                             [("#2", "too short"), ("Alice", "capitalized but not a tag: prose")])
+                             [("Alice", "capitalized but not a tag: prose")])
             self.assertIn("#2 ", hk["output"])
             self.assertNotIn("#1 ", hk["output"])                          # project + global, ranked; Lambda hits #2 only
             tr = json.loads(get("/api/tree?scope=/p/alpha&budget=1&T=4"))
@@ -723,9 +723,10 @@ class Segmem(unittest.TestCase):
         for tail in (">/dev/null", "2>&1", "&& echo done", "| head -3",
                      "> out.txt", "; echo next"):
             self.assertEqual("", run("check-note",
-                                     stdin='segmem note procedural "hello" ' + tail), tail)
+                                     stdin='segmem note procedural "hello" --entities=greet '
+                                     + tail), tail)
         self.assertEqual("", run("check-note",
-                                 stdin='cd /tmp && segmem note procedural "hello" > o'))
+                                 stdin='cd /tmp && segmem note procedural "hello" --entities=greet > o'))
         # and the length check still bites through a redirect
         self.assertIn("Too long", run("check-note", check=False,
                                       stdin='segmem note procedural "%s" >/dev/null'
@@ -783,6 +784,75 @@ class Segmem(unittest.TestCase):
         # and never spends tokens: the nap ask is the Stop hook's, in Python
         self.assertNotIn("$.model.complete", ts)
         self.assertNotIn("next-nap", ts)
+        # and check-note is spawned only for a command that could be a note
+        self.assertIn('!e.command.includes("note")', ts)
+
+    def test_touches_carry_scope(self):
+        # a kerf fact must not feel prompts typed in another project
+        run("note", "procedural", "shader needs colorspace include", "--entities=shader")
+        for _ in range(15):
+            run("hook", stdin='{"prompt": "the `shader` in beta"}', project="/p/beta")
+        self.assertEqual(run("stale", "--count").strip(), "0")
+        for _ in range(15):
+            run("hook", stdin='{"prompt": "the `shader` in alpha"}')
+        self.assertEqual(run("stale", "--count").strip(), "1")
+        # a global fact feels attention from every project
+        run("note", "procedural", "pnpm everywhere", "--scope=global", "--entities=pnpm")
+        for _ in range(15):
+            run("hook", stdin='{"prompt": "`pnpm` broke"}', project="/p/beta")
+        self.assertEqual(run("stale", "--count").strip(), "2")
+
+    def test_quiet_session_leaves_no_evidence_and_takes_no_nag(self):
+        import json
+        run("note", "people", "Alice reviews infra", "--entities=alice")
+        for _ in range(9):
+            run("hook", stdin='{"prompt": "ask Alice"}')
+        self.assertIn("alice", run("stale"))
+        old = os.environ.get("SEGMEM_QUIET")
+        os.environ["SEGMEM_QUIET"] = "1"
+        try:
+            self.assertIn("Alice", run("hook", stdin='{"prompt": "ask Alice"}'))
+            self.assertEqual("", run("stale", "--hook", stdin=json.dumps({"session_id": "s1"})))
+            before = run("stale")
+            run("hook", stdin='{"prompt": "Alice again"}')
+            self.assertEqual(before, run("stale"))
+        finally:
+            os.environ.pop("SEGMEM_QUIET", None)
+            if old:
+                os.environ["SEGMEM_QUIET"] = old
+        self.assertIn("block", run("stale", "--hook", stdin=json.dumps({"session_id": "s1"})))
+
+    def test_duplicate_note_refused_before_and_at_write(self):
+        run("note", "procedural", "uses pnpm", "--entities=pnpm")
+        out = run("note", "procedural", "uses  pnpm", "--entities=pnpm", check=False)
+        self.assertIn("#1 already says this", out)
+        out = run("check-note", stdin='%s note procedural "uses pnpm"' % TOOL, check=False)
+        self.assertIn("#1 already says this", out)
+        # superseding it is the way to say something changed
+        run("note", "procedural", "uses pnpm", "--entities=pnpm", "--supersedes=1")
+        self.assertEqual(run("wake").count("uses pnpm"), 1)
+
+    def test_procedural_without_entities_is_warned(self):
+        self.assertIn("no --entities", run("note", "procedural", "builds with make"))
+        self.assertIn("no --entities",
+                      run("check-note", stdin='%s note procedural "uses cmake"' % TOOL))
+        self.assertNotIn("no --entities", run("note", "episodic", "shipped the thing"))
+
+    def test_hook_finds_single_digit_ids(self):
+        run("note", "episodic", "issue #5 was the retry storm", "--entities=#5")
+        self.assertIn("retry storm", run("hook", stdin='{"prompt": "what was #5?"}'))
+
+    def test_audit_prints_the_review_numbers(self):
+        run("note", "procedural", "builds with make")
+        run("note", "procedural", "deploys by hand", "--entities=deploy")
+        run("note", "episodic", "chose make over just", "--entities=make")
+        out = run("audit")
+        self.assertIn("procedural  2/2", out)
+        self.assertRegex(out, r"alpha\s+wake\s+\d+\s+hidden\s+0\s+raw\s+0\s+naps 0")
+        self.assertIn("nothing under pressure", out)
+        self.assertIn("#1 (alpha) builds with make", out)     # untagged
+        self.assertIn("integrity ok", out)
+        self.assertNotIn("Traceback", out)
 
     def test_hook_caps_facts(self):
         import json

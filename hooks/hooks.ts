@@ -148,7 +148,8 @@ export const register: Register = (on) => {
   // the command text and says refuse or warn. Any other Bash command passes
   // untouched, and the substring test keeps the shell-out off that path.
   on("tool.call", { tool: "Bash" }, async ($, e, next) => {
-    if (!e.command.includes("segmem")) return next(e);
+    // check-note reads only `note`, so `cd ~/Node/segmem && ...` pays no spawn.
+    if (!e.command.includes("segmem") || !e.command.includes("note")) return next(e);
     let hint = "";
     try {
       const r = await $.process.run(

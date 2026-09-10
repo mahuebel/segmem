@@ -33,6 +33,10 @@ PROMOTE_MIN = 3         # see should_promote()
 STALE_MIN = 6           # weighted touches before a dossier is under pressure
 PROC_STALE_MIN = 12     # same, per procedural note; hub entities accrue fast
 TOUCH_WEIGHT = {"note": 3, "recall": 2, "prompt": 1}
+# A harness-driven child session (a builder fleet, a scheduled run) reads
+# memory but leaves no evidence and takes no nag: its prompts are not a
+# person's attention, and a Stop block costs it a turn nobody reads.
+QUIET = bool(os.environ.get("SEGMEM_QUIET"))
 
 ME = os.path.abspath(sys.argv[0])
 
@@ -73,7 +77,8 @@ CREATE TABLE IF NOT EXISTS touches (
   ts      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   entity  TEXT NOT NULL,
   kind    TEXT NOT NULL CHECK (kind IN ('note','recall','prompt','review','nag')),
-  session TEXT NOT NULL DEFAULT ''
+  session TEXT NOT NULL DEFAULT '',
+  scope   TEXT NOT NULL DEFAULT ''     -- the project the touch came from
 );
 CREATE INDEX IF NOT EXISTS touches_by_entity ON touches(entity, ts);
 CREATE TABLE IF NOT EXISTS claims (
@@ -93,6 +98,11 @@ def connect():
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA foreign_keys=ON")
     c.executescript(SCHEMA)
+    if "scope" not in [r[1] for r in c.execute("PRAGMA table_info(touches)")]:
+        try:
+            c.execute("ALTER TABLE touches ADD COLUMN scope TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass        # two hooks migrating at once: the other one won
     return c
 
 
@@ -308,10 +318,30 @@ def claim(c, session, cmd, source, served):
 
 
 def touch(c, entities, kind, session=""):
-    rows = [(e.strip().lower(), kind, session) for e in entities if e.strip()]
+    # Evidence carries the project it came from, so a project fact feels
+    # only its own project's attention (see presses). Reviews and nags are
+    # keyed by entity and session, and need no scope.
+    scope = project() if kind in TOUCH_WEIGHT else ""
+    rows = [(e.strip().lower(), kind, session, scope) for e in entities if e.strip()]
     if rows:
         with c:
-            c.executemany("INSERT INTO touches(entity,kind,session) VALUES (?,?,?)", rows)
+            c.executemany("INSERT INTO touches(entity,kind,session,scope) VALUES (?,?,?,?)",
+                          rows)
+
+
+def presses(c, ents, since, scope):
+    """(pressure, counts by kind) on `ents` since `since`. A project-scoped
+    fact counts only touches stamped with its project; a global one counts
+    them all. Touches from before the stamp existed count for nobody but
+    global facts, which is the safe side: they were the noise."""
+    q = ("SELECT kind, COUNT(*) FROM touches WHERE entity IN (%s) AND ts>=? "
+         "AND kind IN ('note','recall','prompt')" % ",".join("?" * len(ents)))
+    params = [*ents, since]
+    if scope != GLOBAL:
+        q += " AND scope=?"
+        params.append(scope)
+    n = dict(c.execute(q + " GROUP BY kind", params))
+    return sum(TOUCH_WEIGHT[k] * v for k, v in n.items()), n
 
 
 def dossier_clock(c):
@@ -360,11 +390,7 @@ def note_pressure(c, scopes):
         if not ents:
             continue
         since = note_clock(c, row)
-        n = dict(c.execute(
-            "SELECT kind, COUNT(*) FROM touches WHERE entity IN (%s) AND ts>=? "
-            "AND kind IN ('note','recall','prompt') GROUP BY kind"
-            % ",".join("?" * len(ents)), (*ents, since)))
-        p = sum(TOUCH_WEIGHT[k] * v for k, v in n.items())
+        p, n = presses(c, ents, since, row["scope"])
         if not p:
             continue
         r = c.execute("SELECT COUNT(*), COALESCE(SUM(session='keep'), 0) FROM touches "
@@ -571,7 +597,18 @@ def canon(c, raw, kind, scope=GLOBAL):
             if re.fullmatch(r"[A-Z][a-z]+", e) and e.lower() not in people:
                 hints.append("no people record for %s; if a person: %s note people "
                              "\"<who they are>\" --entities=%s" % (e, ME, e))
+    if kind == "procedural" and not out:
+        hints.append("no --entities: a procedural fact with no subject never feels "
+                     "pressure, so it can go stale unseen; tag the component it governs")
     return ",".join(out), hints
+
+
+def dup_of(c, kind, scope, text):
+    """The live memory that already says exactly this, or None. A retried
+    note lands twice otherwise, and both copies wake."""
+    r = c.execute("SELECT id FROM memories WHERE kind=? AND scope=? AND text=? AND %s"
+                  % LIVE, (kind, scope, text)).fetchone()
+    return r[0] if r else None
 
 
 def note_scope(opts, kind):
@@ -597,6 +634,10 @@ def cmd_note(c, args):
     sup = int(opts["supersedes"]) if "supersedes" in opts else None
     if sup is not None and not c.execute("SELECT 1 FROM memories WHERE id=?", (sup,)).fetchone():
         die("No memory #%d to supersede." % sup)
+    dup = dup_of(c, kind, scope, text)
+    if dup is not None and dup != sup:     # re-noting over itself is a reset, allowed
+        die("#%d already says this. Nothing to do; if something changed, "
+            "note the change with --supersedes=%d." % (dup, dup))
     entities, hints = canon(c, opts.get("entities", ""), kind, scope)
     with c:
         seq = stream_len(c, kind, scope)
@@ -648,8 +689,14 @@ def cmd_check_note(c, args):
             if len(pos) != 2 or pos[0] not in KINDS:
                 die(NOTE_USAGE % (ME, "|".join(KINDS)))
             kind, text = pos
-            check_len(" ".join(text.split()))
-            _, hints = canon(c, opts.get("entities", ""), kind, note_scope(opts, kind))
+            text = " ".join(text.split())
+            check_len(text)
+            scope = note_scope(opts, kind)
+            dup = dup_of(c, kind, scope, text)
+            if dup is not None and str(dup) != opts.get("supersedes"):
+                die("#%d already says this. Nothing to do; if something changed, "
+                    "note the change with --supersedes=%d." % (dup, dup))
+            _, hints = canon(c, opts.get("entities", ""), kind, scope)
             for h in hints:
                 print(h)
 
@@ -852,7 +899,7 @@ def stale_hook(c, due, pdue):
         data = json.load(sys.stdin)
     except Exception:
         data = {}
-    if not isinstance(data, dict) or data.get("stop_hook_active"):
+    if not isinstance(data, dict) or data.get("stop_hook_active") or QUIET:
         return
     sid = data.get("session_id", "")
     nagged = {e for (e,) in c.execute(
@@ -1191,7 +1238,8 @@ def identifiers(text, tags=()):
     out, seen = [], set()
     for f in found:
         k = f.strip("`.,;:()[]{}'\"").lower()
-        if len(k) > 2 and k not in STOP and k not in seen:
+        # "#5" is two characters and still an identifier
+        if (len(k) > 2 or k.startswith("#")) and k not in STOP and k not in seen:
             seen.add(k)
             out.append(f.strip("`.,;:()[]{}'\""))
     return out
@@ -1218,7 +1266,8 @@ def cmd_hook(c, args):
     if not ids:
         return
     try:
-        touch(c, [i for i in ids if i.lower() in tags], "prompt", sid)
+        if not QUIET:
+            touch(c, [i for i in ids if i.lower() in tags], "prompt", sid)
     except sqlite3.OperationalError:
         pass
     q = " OR ".join('"%s"' % i.replace('"', '""') for i in ids)
@@ -1328,7 +1377,7 @@ def cmd_mcp(c, args):
             if method == "initialize":
                 result = {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
                           "capabilities": {"tools": {}},
-                          "serverInfo": {"name": "segmem", "version": "0.9.0"}}
+                          "serverInfo": {"name": "segmem", "version": "0.10.0"}}
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
@@ -1642,16 +1691,12 @@ def serve_fact(c, rid):
     d["total_in_stream"] = stream_len(c, row["kind"], row["scope"])
 
     since = note_clock(c, row) if row["kind"] == "procedural" else row["ts"]
-    n, last = {}, None
+    p, n, last = 0, {}, None
     if ents:
-        n = dict(c.execute(
-            "SELECT kind, COUNT(*) FROM touches WHERE entity IN (%s) AND ts>=? "
-            "AND kind IN ('note','recall','prompt') GROUP BY kind"
-            % ",".join("?" * len(ents)), (*ents, since)))
+        p, n = presses(c, ents, since, row["scope"])
         last = c.execute("SELECT MAX(ts) FROM touches WHERE entity IN (%s)"
                          % ",".join("?" * len(ents)), ents).fetchone()[0]
-    d.update(touches=n, since=since, last_touch=last,
-             pressure=sum(TOUCH_WEIGHT[k] * v for k, v in n.items()))
+    d.update(touches=n, since=since, last_touch=last, pressure=p)
     r = c.execute("SELECT COUNT(*), COALESCE(SUM(session='keep'), 0) FROM touches "
                   "WHERE kind='review' AND entity=?", ("#%d" % rid,)).fetchone()
     reviewed, kept = r[0] > 0, r[1] > 0
@@ -2670,18 +2715,11 @@ When a person was a subject this session, not a mention: before you finish,
 supersede their people note or confirm it unchanged with `{me} touch <name>`.
 When wake or a stop flags a fact under pressure, check the claim against the
 repo before answering: supersede what changed, confirm what held with
-`{me} touch <id>`. When segmem calls a fact stable and hot, compile it into
-the repo in the strongest form that fits: enforcement first (a config, a CI
-check, a lint rule), then a skill, then CLAUDE.md, then docs
-(~/.claude/CLAUDE.md for a global fact). Supersede the note with a pointer
-to where it landed, and reserve `{me} touch <id> --keep` for a fact the
-repo cannot hold.
+`{me} touch <id>`. When segmem calls a fact stable and hot, load the segmem
+`compile` skill: it moves the fact into the repo in its strongest form.
 An org fact (marked `(org)` in recall) is a colleague's claim: verify it
-like any memory. A local fact that OVERRIDES an org fact is the org layer's
-staleness signal: offer to open an issue on the org fact's file. A local
-fact matching a candidate: offer to co-sign it. The only path upward is
-`{me} contribute <id>`; it prints commands, and you run them only with the
-user's approval.
+like any memory. For a contradiction, a co-sign, or a contribution, load
+the segmem `org` skill; upward writes run only with the user's approval.
 
 When a prompt names a person, component, branch, issue, or past decision:
 `{me} recall <words>` first. It searches every scope and kind. A
@@ -2717,6 +2755,93 @@ people note or a procedural fact has fallen behind the evidence.
   "Stop": [{{"hooks": [{{"type": "command", "command": "{me} stale --hook"}}]}}]
 }}}}
 """
+
+
+def cmd_audit(c, args):
+    """The numbers a store review reads: the `review` skill says what to do
+    with them. Plain lines, no judgment, nothing written."""
+    import json
+    print("## Memories (live/total)")
+    for kind in KINDS:
+        tot = c.execute("SELECT COUNT(*) FROM memories WHERE kind=?", (kind,)).fetchone()[0]
+        lv = c.execute("SELECT COUNT(*) FROM memories WHERE kind=? AND %s" % LIVE,
+                       (kind,)).fetchone()[0]
+        print("%-11s %d/%d" % (kind, lv, tot))
+
+    print("\n## Per project (wake bytes, procedural hidden, episodic printed raw, naps pending)")
+    scopes = [r[0] for r in c.execute(
+        "SELECT scope FROM memories WHERE %s GROUP BY scope ORDER BY COUNT(*) DESC" % LIVE)]
+    for sc in scopes:
+        if sc == GLOBAL:
+            continue
+        old = os.environ.get("SEGMEM_PROJECT")
+        os.environ["SEGMEM_PROJECT"] = sc
+        try:
+            out = capture(cmd_wake, [])
+        finally:
+            if old is None:
+                os.environ.pop("SEGMEM_PROJECT", None)
+            else:
+                os.environ["SEGMEM_PROJECT"] = old
+        m = re.search(r"\((\d+) older procedural", out)
+        raw = sum(1 for l in out.splitlines() if l.startswith("  #"))
+        naps = len(pending(c, "episodic", sc, stream_len(c, "episodic", sc)))
+        print("%-24s wake %6d  hidden %2s  raw %2d  naps %d"
+              % (short(sc), len(out.encode()), m.group(1) if m else 0, raw, naps))
+
+    print("\n## Pressure (where the touches came from)")
+    seen = False
+    for e, p, n, since in dossier_pressure(c):
+        if p < STALE_MIN:
+            continue
+        seen = True
+        print("%s: pressure %d (%s) since %s" % (e, p, fmt_counts(n), since[:10]))
+        for sc, k, s in c.execute(
+                "SELECT scope, COUNT(*), COUNT(DISTINCT session) FROM touches WHERE entity=? "
+                "AND ts>=? AND kind IN ('note','recall','prompt') GROUP BY scope ORDER BY 2 DESC",
+                (e, since)):
+            print("  %-24s %d touches, %d sessions" % (short(sc) or "(unstamped)", k, s))
+    for row, p, n, since, reviewed, kept in note_pressure(c, scopes):
+        if p < PROC_STALE_MIN:
+            continue
+        seen = True
+        print('#%d (%s): pressure %d (%s) since %s: "%s"'
+              % (row["id"], short(row["scope"]), p, fmt_counts(n), since[:10], row["text"][:70]))
+        ents = sorted(entity_set(row))
+        for sc, k, s in c.execute(
+                "SELECT scope, COUNT(*), COUNT(DISTINCT session) FROM touches WHERE entity IN (%s) "
+                "AND ts>=? AND kind IN ('note','recall','prompt') GROUP BY scope ORDER BY 2 DESC"
+                % ",".join("?" * len(ents)), (*ents, since)):
+            print("  %-24s %d touches, %d sessions" % (short(sc) or "(unstamped)", k, s))
+    if not seen:
+        print("nothing under pressure")
+
+    print("\n## Sessions per day, last 14 (from claims; touches beside)")
+    for d, s, t in c.execute(
+            "SELECT d, COUNT(DISTINCT session), (SELECT COUNT(*) FROM touches WHERE substr(ts,1,10)=d) "
+            "FROM (SELECT substr(ts,1,10) AS d, session FROM claims) "
+            "WHERE d >= date('now','-14 day') GROUP BY d ORDER BY d"):
+        print("%s  %3d sessions  %4d touches" % (d, s, t))
+
+    print("\n## Duplicates (live, same kind, scope, and text)")
+    dups = c.execute("SELECT GROUP_CONCAT(id) FROM memories WHERE %s GROUP BY kind, scope, text "
+                     "HAVING COUNT(*) > 1" % LIVE).fetchall()
+    print("\n".join("#" + r[0].replace(",", " #") for r in dups) if dups else "none")
+
+    print("\n## Untagged procedural (never feel pressure)")
+    un = c.execute("SELECT id, scope, text FROM memories WHERE kind='procedural' AND entities='' "
+                   "AND %s ORDER BY id" % LIVE).fetchall()
+    for r in un:
+        print("#%d (%s) %s" % (r["id"], short(r["scope"]), r["text"][:70]))
+    if not un:
+        print("none")
+
+    print("\n## Store")
+    p = db_path()
+    wal = p + "-wal"
+    print("db %d KB, wal %d KB, integrity %s" % (
+        os.path.getsize(p) // 1024, os.path.getsize(wal) // 1024 if os.path.exists(wal) else 0,
+        c.execute("PRAGMA integrity_check").fetchone()[0]))
 
 
 def cmd_init(c, args):
@@ -2760,7 +2885,7 @@ def main():
             "html": cmd_html, "serve": cmd_serve, "stale": cmd_stale, "touch": cmd_touch,
             "prompt": cmd_prompt, "contribute": cmd_contribute,
             "check-note": cmd_check_note, "next-nap": cmd_next_nap,
-            "org-init": cmd_org_init}
+            "org-init": cmd_org_init, "audit": cmd_audit}
     if len(sys.argv) < 2 or sys.argv[1] not in cmds:
         die("usage: %s <%s> ..." % (ME, "|".join(cmds)))
     cmds[sys.argv[1]](connect(), sys.argv[2:])

@@ -267,6 +267,9 @@ E2_CASES = [
      r"\bmake +release\b", r"\bgit +push\b", "ship"),
 ]
 
+# which raw chunk holds each case's answer
+E2_TRUE = {"install": "pkg", "tests": "tests", "sqlite": "sqlite", "ship": "deploys"}
+
 E2_TAIL = ("\nReply with the single shell command you would run first, "
            "and nothing else.")
 
@@ -318,36 +321,115 @@ remote: deploy.yml triggered: production
 > wait, that deployed straight to prod with no gate. Rolled back with the previous tag.
 $ cat Makefile | grep -A3 release
 release:
-	git tag v$(shell date +%Y%m%d.%H%M)
-	git push --tags
-	./scripts/gate.sh && git push origin main
+\tgit tag v$(shell date +%Y%m%d.%H%M)
+\tgit push --tags
+\t./scripts/gate.sh && git push origin main
 > from now on: make release, never git push main"""),
-    # decoys from another repo: the words a search matches, the wrong answer
-    ("decoy-tests", """[session 2026-07-28, kerf] Task: run the tests
-$ pytest -q
-.........
-9 passed in 0.8s
-> kerf uses pytest; conftest.py sets the fixtures"""),
-    ("decoy-pkg", """[session 2026-07-30, kerf-web] Task: install and start the dev server
-$ pnpm install && pnpm dev
-  VITE ready in 412 ms
-> pnpm everywhere in kerf-web, the lockfile is pnpm's"""),
 ]
+
+# Decoys, three kinds. Same-repo sessions share the file names the task
+# names and hold no answer; other-repo sessions used the wrong command and
+# it was right there; the rest is the ordinary noise of a transcript store.
+# Each is (label, date, repo, task, body). Dates spread so that a tie on
+# word overlap breaks the way a real search breaks it: newest first.
+E2_DECOYS = [
+    # lambda-svc, no answer
+    ("d-lam-1", "2026-07-20", "lambda-svc", "bump the aws sdk in package.json",
+     "$ cat package.json | grep aws-sdk\n  \"@aws-sdk/client-s3\": \"^3.600.0\"\n"
+     "$ sed -i '' 's/3.600.0/3.650.0/' package.json\n> bumped; the workflow in .github/workflows/deploy.yml runs the bundle on push"),
+    ("d-lam-2", "2026-07-24", "lambda-svc", "add a lint step to deploy.yml",
+     "$ cat .github/workflows/deploy.yml\nname: deploy\non: push\njobs: ...\n"
+     "> added a lint job before bundle in .github/workflows/deploy.yml; src/handler.js has two unused imports"),
+    ("d-lam-3", "2026-07-28", "lambda-svc", "raise the Lambda timeout",
+     "$ grep -n timeout src/handler.js\n12:  timeout: 3000\n> the Node.js service times out on cold start; raised to 10000 in src/handler.js and the Lambda config"),
+    ("d-lam-4", "2026-08-01", "lambda-svc", "why is the deployed bundle 4mb",
+     "$ ls -la dist/\n  handler.js 4.1mb\n> the AWS Lambda bundle pulls the whole sdk; switched to per-client imports in src/handler.js"),
+    ("d-lam-5", "2026-08-06", "lambda-svc", "write a README for the service",
+     "$ ls\npackage.json pnpm-lock.yaml src .github Makefile\n> wrote README.md: a Node.js service deployed to AWS Lambda through .github/workflows/deploy.yml"),
+    ("d-lam-6", "2026-08-14", "lambda-svc", "rotate the S3 credentials",
+     "$ aws secretsmanager update-secret --secret-id lambda-svc/s3 ...\n> rotated; src/handler.js reads it at cold start, nothing to change in the checkout"),
+    ("d-lam-7", "2026-08-19", "lambda-svc", "investigate the flaky deploy",
+     "$ gh run list --workflow=deploy.yml | head\n  failure  deploy  main  2m\n  success  deploy  main  3m\n"
+     "> the flaky step is the bundle on a cold runner; deploy.yml now caches node_modules"),
+    ("d-lam-8", "2026-08-22", "lambda-svc", "check the project's dependencies for a CVE",
+     "$ npm audit\nfound 0 vulnerabilities\n> clean; package.json has 14 dependencies, all current"),
+    # segapp, no answer
+    ("d-seg-1", "2026-07-22", "segapp", "add the export command",
+     "$ grep -n 'def cmd_' segapp.py | tail -3\n> added cmd_export to segapp.py; README.md lists it; requirements.txt unchanged"),
+    ("d-seg-2", "2026-07-26", "segapp", "why does the parser drop the last line",
+     "$ python3 -c 'import segapp; print(segapp.parse(open(\"x\").read()))'\n> off by one in segapp.py parse(); added a case to test_segapp.py"),
+    ("d-seg-3", "2026-07-30", "segapp", "pin the requirements",
+     "$ cat requirements.txt\nrequests>=2\n$ pip freeze | grep -i requests\nrequests==2.32.3\n> pinned in requirements.txt; README.md says pip install -r requirements.txt"),
+    ("d-seg-4", "2026-08-03", "segapp", "rebuild the notes index",
+     "$ python3 -c \"import sqlite3; c=sqlite3.connect('app.db'); c.execute(\\\"insert into notes_fts(notes_fts) values('rebuild')\\\")\"\n"
+     "> the FTS5 external-content index on the notes table is rebuilt; app.db went from 9mb to 7mb"),
+    ("d-seg-5", "2026-08-07", "segapp", "what tables does app.db have",
+     "$ python3 -c \"import sqlite3; print(sqlite3.connect('app.db').execute('select name from sqlite_master').fetchall())\"\n"
+     "[('notes',), ('notes_fts',), ('tags',)]\n> three tables in the SQLite database; notes_fts is the FTS5 index over notes"),
+    ("d-seg-6", "2026-08-13", "segapp", "write the README",
+     "$ ls\napp.db segapp.py test_segapp.py README.md requirements.txt\n> README.md: a Python checkout, one file, SQLite database app.db beside it"),
+    ("d-seg-7", "2026-08-17", "segapp", "count tags per note",
+     "$ python3 -c \"import sqlite3; c=sqlite3.connect('app.db'); print(c.execute('select count(*) from tags').fetchone())\"\n(1290,)\n> 1290 rows in tags for 412 notes"),
+    ("d-seg-8", "2026-08-21", "segapp", "the machine is a stock macOS install, set up python",
+     "$ python3 --version\nPython 3.12.4\n$ pip3 install -r requirements.txt\n> stock macOS machine; the checkout runs on the system python3"),
+    # other repos where the wrong command was right
+    ("d-kerf-1", "2026-07-28", "kerf", "run the tests",
+     "$ pytest -q\n.........\n9 passed in 0.8s\n> kerf uses pytest; conftest.py sets the fixtures"),
+    ("d-kerf-2", "2026-08-08", "kerf", "run the test suite after the merge",
+     "$ pytest\n== 41 passed in 3.1s ==\n> green; the Python checkout's suite runs under pytest from the repo root"),
+    ("d-kweb-1", "2026-07-30", "kerf-web", "install and start the dev server",
+     "$ pnpm install && pnpm dev\n  VITE ready in 412 ms\n> pnpm everywhere in kerf-web, the lockfile is pnpm's"),
+    ("d-kweb-2", "2026-08-10", "kerf-web", "install the project's dependencies on the new machine",
+     "$ pnpm install\nPackages: +812\nDone in 11s\n> pnpm-lock.yaml respected; package.json has the packageManager field"),
+    ("d-linux-1", "2026-08-04", "ops-box", "count rows in the audit table",
+     "$ sqlite3 audit.db 'select count(*) from events'\n88213\n> the Linux sqlite3 CLI has FTS5; the FTS5 index on events is fine"),
+    ("d-linux-2", "2026-08-16", "ops-box", "inspect the SQLite database",
+     "$ sqlite3 audit.db .tables\nevents events_fts\n> sqlite3 CLI works here, the notes and events tables both indexed"),
+    ("d-api-1", "2026-08-01", "billing-api", "ship the fix",
+     "$ git push origin main\n> pushed to main; the remote origin runs CI, deploy is a manual step later"),
+    ("d-api-2", "2026-08-12", "billing-api", "ship the finished fix from the local commit",
+     "$ git log --oneline -1\n  fix: retry on 429\n$ git push origin main\n> branch main pushed; there is a Makefile but it only builds docs"),
+    ("d-api-3", "2026-08-20", "billing-api", "release the hotfix",
+     "$ make\n> no release target in the Makefile here; git push origin main and CI takes it"),
+    # ordinary noise
+    ("d-n-1", "2026-07-19", "notes", "draft the on-call handover",
+     "> wrote the handover in README.md of the notes repo; nothing to install"),
+    ("d-n-2", "2026-07-23", "dotfiles", "set up the new machine",
+     "$ brew install node python3\n> stock macOS machine; installed node and python3, checkout of dotfiles applied"),
+    ("d-n-3", "2026-08-15", "infra", "rotate the deploy key",
+     "$ gh secret set DEPLOY_KEY < key\n> the deploy workflow in .github/workflows reads DEPLOY_KEY; origin unchanged"),
+    ("d-n-4", "2026-08-18", "kerf", "finish the branch",
+     "$ git checkout main && git merge feature\n$ git push origin main\n> merged the finished branch and pushed main; kerf has no deploy on push"),
+]
+
+
+def raw_corpus():
+    """The true chunks and the decoys, as (label, date, text)."""
+    out = [(label, re.search(r"\d{4}-\d\d-\d\d", text).group(0), text)
+           for label, text in E2_RAW]
+    for label, date, repo, task, body in E2_DECOYS:
+        out.append((label, date, "[session %s, %s] Task: %s\n%s" % (date, repo, task, body)))
+    return out
+
+
 E2_RAW_K = 3
 
 
 def raw_context(fixture):
     """The chunks a word-overlap search over past sessions returns for this
     task: scored by distinct fixture words of four letters or more that the
-    chunk contains, top E2_RAW_K, in score order."""
+    chunk contains, ties newest first, top E2_RAW_K. Returns (text, labels)
+    so the result can say whether the true chunk made the cut."""
     words = {w for w in re.findall(r"[a-z][a-z0-9_.-]{3,}", fixture.lower())}
     scored = []
-    for label, chunk in E2_RAW:
+    for label, date, chunk in raw_corpus():
         hit = sum(1 for w in words if w in chunk.lower())
         if hit:
-            scored.append((-hit, label, chunk))
-    scored.sort()
-    return "\n\n".join(chunk for _, _, chunk in scored[:E2_RAW_K])
+            scored.append((-hit, date, label, chunk))
+    scored.sort(key=lambda t: t[1], reverse=True)   # newest first...
+    scored.sort(key=lambda t: t[0])                 # ...within a score
+    top = scored[:E2_RAW_K]
+    return "\n\n".join(c for _, _, _, c in top), [l for _, _, l, _ in top]
 
 
 def e2_command(answer):
@@ -381,12 +463,13 @@ def run_e2(model, n):
                     "raw": {"llm_writes": 0, "bytes": 0}}}
     for fixture, right, wrong, label in E2_CASES:
         q = fixture + E2_TAIL
-        raw = raw_context(fixture)
+        raw, picked = raw_context(fixture)
         out["cost"]["raw"]["bytes"] += len(raw) // len(E2_CASES)
         rawhead = ("## Past sessions\nA search over your past session transcripts "
                    "for this task found:\n\n" + raw + "\n\n")
         row = {"case": label, "right_re": right, "wrong_re": wrong,
-               "off": {}, "on": {}, "raw": {}, "commands": {"off": [], "on": [], "raw": []}}
+               "off": {}, "on": {}, "raw": {}, "commands": {"off": [], "on": [], "raw": []},
+               "retrieved": picked, "retrieval_hit": E2_TRUE[label] in picked}
         for cond, prompt in (("off", q), ("on", header + q), ("raw", rawhead + q)):
             for _ in range(n):
                 cmd = e2_command(ask(prompt, model))
@@ -397,7 +480,9 @@ def run_e2(model, n):
             row["prevented_" + cond] = row["off"].get("wrong", 0) - row[cond].get("wrong", 0)
         row["prevented"] = row["prevented_on"]
         out["cases"].append(row)
-        print("e2 %-8s off:%s on:%s raw:%s" % (label, row["off"], row["on"], row["raw"]))
+        print("e2 %-8s off:%s on:%s raw:%s  retrieved:%s%s"
+              % (label, row["off"], row["on"], row["raw"], ",".join(picked),
+                 "" if row["retrieval_hit"] else " (true chunk missed)"))
     for cond in ("on", "raw"):
         out["saves" if cond == "on" else "saves_raw"] = sum(
             max(0, r["prevented_" + cond]) for r in out["cases"])

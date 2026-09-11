@@ -57,11 +57,17 @@ so a surprising number can be checked against what the model actually said.
 arm; `e2.cost` holds each arm's write cost. Read wake against raw, not
 against nothing: MemDelta measured no-memory at 2% and plain retrieval at
 47%, so most of any memory system's gain is retrieval existing at all.
-First run, September 10, 2026, n=10: haiku wake 31 saves, raw 21; opus
-wake 18, raw 18. The whole haiku gap is one case, where the transcript
-shows the failed attempt before the fix and haiku copies the attempt every
-time; opus reads past it. So the note earns its keep by stating the
-conclusion, which a small model needs and a strong one extracts itself.
+Runs on September 10, 2026, n=10. Six-chunk corpus, every true chunk
+retrieved: haiku wake 31 saves, raw 21; opus wake 18, raw 18. The haiku
+gap was one case, where the transcript shows the failed attempt before the
+fix and haiku copies the attempt; opus reads past it. Thirty-three-chunk
+corpus, same-repo sessions in the noise: haiku wake 34, raw 24. Search now
+misses the install chunk and pulls another repo's `pnpm install`, and the
+three cases where search hits, raw equals wake exactly. So the note earns
+its keep twice: it states the conclusion, which a small model needs, and it
+is the unit search finds, a tagged line rather than a session diluted by
+the repo's other sessions. Both failures land on the install case; the
+other three say raw text plus retrieval is as good as a note.
 `e3.pass_rate` is the fraction of compressions that kept doubts as doubts.
 Run at least n=10 per condition; single runs are noise. Rerun after any
 prompt change in `segmem` to see whether the change earned its place.

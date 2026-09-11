@@ -16,6 +16,9 @@ needs a real option declared.
 
 ## Gate naps on the evals
 
+Spec written September 11, 2026: `docs/design-nap-gate.md`. Its S0 is a
+bug to fix now; the rest waits.
+
 A nap is an LLM rewrite of a block and nothing checks it: the pitfall evals
 (contamination, hedges) run by hand. Google's Procedural Graphs paper (arXiv
 2609.09153, September 2026) commits a rewrite only when a held-out score

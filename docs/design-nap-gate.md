@@ -1,10 +1,13 @@
 # Design: the nap gate (what a compression must keep, and how we know)
 
-**Status:** spec, September 11, 2026. Not built. Backlog said to build it
-once a nap has visibly lost something. Writing the spec found one loss that
-needs no eval to see: a summary keeps carrying a value after the leaf that
-held it is superseded (S0 below). Everything else here waits for that
-condition, or for the eval in S3 to show a number worth moving.
+**Status:** spec, September 11, 2026. Revised the same day after an
+adversarial review (chain-of-thought, against the code) that found the
+plan measured omission without acting on it, copied a WHERE clause from
+`forget` that would have cleared most of the tree, and proposed three eval
+arms of which two measured nothing new. The revised plan is smaller: fix
+two bugs now (S0, S0b), count before building (S1 becomes an audit
+extension), and one eval arm nobody else has (recall by tree level).
+Everything past S0b waits for a count or a number.
 
 ## Why
 
@@ -61,17 +64,37 @@ before these three, is the reason the eval perturbs position and order:
 sequential memory lost facts by where they sat, and a nap reads a block in
 order.
 
-## What writing the spec found
+## What writing and reviewing the spec found
 
 **S0. Supersede leaves the summary stale.** `forget` drops every summary
-over the deleted leaf (`DELETE FROM summaries ... WHERE hi > seq`), and the
-tree rebuilds on the next nap ask. `note --supersedes` does not. The
-superseded leaf is hidden from wake and recall by the LIVE filter, and the
-summary that was written from it still says the old thing, in the block's
-only voice. This is Memora's failure exactly: the trace records the
-update, the memory keeps serving the prior value. It is the one nap loss
-that needs no eval to see, and the fix is the forget precedent applied to
-supersede.
+over the deleted leaf and the tree rebuilds on the next nap ask. `note
+--supersedes` does not. The superseded leaf is hidden from wake and recall
+by the LIVE filter, and `summary()` is a flat lookup with no liveness, so
+wake prints the old value from the summary. The review verified this and
+corrected two things. The superseding note lands at the end of the stream,
+inside the finest part of the cover, so wake usually prints both values
+and the reader sees a contradiction, not a silent stale serve: a bug, not
+a silent one. And the fix cannot copy `forget`'s clause. `forget` deletes
+`WHERE hi > seq`, which is safe only because it refuses any episodic leaf
+but the newest, so `hi > seq` means "ancestors of the last leaf". A
+supersede can target any seq: on this store, T=36, superseding seq 5 with
+that clause deletes every summary but three and the Stop hook asks for a
+nap every session for a dozen sessions. The right clause is `lo <= seq AND
+hi > seq`: the leaf's ancestors only, three blocks here, and `pending()`
+requests only those the cover prints.
+
+**S0b. A nap writes over whatever range it names.** `cmd_nap` takes the
+scope from `next_nap()` and `lo`/`hi` from argv, and never checks that the
+range is the pending block. So "the gate runs on the same rows the prompt
+showed" is false today, and a mistyped range writes a summary over leaves
+the model never saw. The guard is one comparison and worth more than the
+mechanical checks below.
+
+**The mechanical checks fire on the wrong class.** TRUSTMEM's error rates
+after training were 8.08% omission, 0.14% corruption, 0.01% hallucination.
+An invention check catches the 0.01%. The 8% is a line that dropped what
+lasts, and no token check can see that. So no check is built until an
+offline count on the real store says it would have fired.
 
 ## Invariants
 
@@ -90,35 +113,32 @@ supersede.
 
 ## The gate, at nap time
 
-`segmem nap <lo>-<hi> "<line>"` runs these before the insert, in order,
-and the first failure refuses with its reason. Each is a few lines of
-Python over the leaves (or the two half-summaries) the prompt showed.
+Two things run before the insert in `cmd_nap`, both free and both refusals.
 
 1. **Length and shape.** As now: 280 bytes, one line.
-2. **Invention (faithfulness).** Every number, date, `#id`, and identifier
-   in the line (the same `identifiers()` the hook uses, plus bare numbers)
-   must appear in the sources. A date may appear in either form the store
-   uses (`2026-09-02` or `9/2`). Anything novel refuses: `invented: 0.11.0
-   is in no leaf`. TRUSTMEM measured hallucination at 0.01% after
-   training, so this will rarely fire, and when it does it is right.
-3. **Hedges (preservation of doubt).** If a source carries a hedge marker
-   and the line keeps that source's subject, the line must keep a hedge
-   marker. This is `run_audit`'s rule and the e3 grader's rule, moved to
-   write time. It refuses.
-4. **Coverage floor.** Each source must contribute at least one identifier
-   or entity to the line, or be dropped whole with a hint, not a refusal:
-   `#19 contributes nothing to this line`. The doctrine allows dropping
-   what does not last, so the tool cannot refuse; it can make the drop
-   visible in the same breath. TRUSTMEM's 8.08% omission is the class this
-   watches.
-5. **Supersede consistency.** A line may not state a value that a live
-   row in the same scope supersedes. Cheap version: if any source leaf is
-   superseded at nap time, the prompt has already excluded it (LIVE), and
-   S0 ensures no summary was written from it. Nothing to check at write
-   time once S0 is in.
+2. **Range.** The submitted `lo-hi` must equal the pending block
+   `next_nap()` returns. Otherwise: `the pending block is #20-21, not
+   #18-21`.
 
-Nothing here judges whether the line kept the *right* things. That is the
-verifier's job, and it costs a model call.
+The three content checks from the first draft are demoted to audit flags
+in `run_audit`, counted against the real store's summaries before any of
+them becomes a refusal:
+
+- **Invention.** Digit runs, dates, `#id`s, and identifiers in the line
+  not present in its sources. The review built the false positives from
+  the live store: "16/8" is one token unless split on the slash; `span()`
+  renders `2026-09-02..09-05` while summaries write `9/2-9/4`. And the
+  false negative: leaves saying "22x faster" and "8-leaf" accept "8x
+  faster", because tokens carry no relations. Audit it; count it; if it
+  fires zero times on 36 blocks, it dies.
+- **Hedges.** The existing rule stays an audit flag. As a refusal it
+  contradicts "drop what does not last": a hedged leaf is often the one to
+  drop whole, and there is no subject extractor in the codebase, so
+  "keeps that source's subject" has no implementation. A refusal loop
+  would teach the model to write "maybe" once anywhere, which passes.
+- **Coverage.** At 280 bytes over two 280-byte leaves, dropping a leaf
+  whole is the normal correct outcome, so a per-leaf hint would fire on
+  most naps and land inside the Stop block. Audit only, as a count.
 
 ## The verifier, offline
 
@@ -130,72 +150,71 @@ future decision would need from the sources. Preservation: at the summary
 level, the line keeps what the two child summaries kept. Faithfulness:
 every claim in the line is in a source.
 
-Thresholds, which TRUSTMEM leaves open: a nap passes when all three are
-true. The evals report the three failure rates separately, as TRUSTMEM's
-error judge does, so omission and hallucination are never one number.
+The review's arithmetic on thresholds: Memora needed three judges and a
+majority vote to reach 88.3% agreement with humans, and one judge at that
+rate gives about 68% joint precision on a three-boolean conjunction. A
+re-nap is a destructive write, so a false fail replaces a good line with
+a worse one and costs a turn. Therefore: the verifier is scored first
+against `E3_CASES` and against the summaries `run_audit` flags and clears
+on the real store; the three booleans are reported as three agreement
+rates, never one pass rate; and the `review` skill prints failures for a
+person to read, and never asks the model to re-nap on its own.
 
-The `review` skill runs this over summaries whose leaves it can still see,
-prints the failures, and asks the session model to re-nap the failed
-blocks. It is a skill because it costs one call per summary and only a
-person decides to spend that.
+## The eval: e4, two arms
 
-## The eval: e4, three arms
+Built in `evals/run.py` beside e1 to e3, model-in-the-loop, judged at
+temperature 0 with every answer kept. Fixtures are planted facts, Ground
+Truth First style: a fact is (subject, value, seq planted, seq superseded
+or never), and the leaves are rendered from the facts as 280-byte episodic
+notes with the noise a real stream has.
 
-Built in `evals/run.py` beside e1 to e3, model-in-the-loop, graded by a
-judge at temperature 0 with every answer kept. Fixtures are planted facts,
-Ground Truth First style: a fact is (subject, value, seq planted, seq
-superseded or never), and the leaves are rendered from the facts as
-280-byte episodic notes with the noise a real stream has.
+**Arm A, horizons.** Streams of 8 and 32 leaves (128 only if the two
+disagree), each fully napped by the session model. Questions ask for each
+planted fact as of the end of the stream. Two readers: wake only, and wake
+plus one recall. Score is recall of planted facts, split by oldest and
+newest quarter. Null result: oldest-quarter recall flat across lengths.
+Positive result: it falls with length under the wake-only reader while
+wake-plus-recall holds. The decision it changes is the wake budget or the
+nap prompt. The review is right that this does not replicate Ground Truth
+First, whose loss was eviction and segmem has none; it is still the arm
+that says whether summarizing loses old facts at all.
 
-**Arm A, horizons.** Streams of 8, 32, and 128 leaves, each fully napped
-by the session model. Questions ask for each planted fact, as of the end
-of the stream. Two readers: wake only, and wake plus one recall. Score is
-recall of planted facts, split into oldest quarter and newest quarter. The
-crossover to look for is the curated-map one: wake-only recall of the
-oldest quarter falling with stream length while wake-plus-recall holds.
-If it falls, the tree evicts by summarizing, and the fix is in the nap
-prompt or the budget, not in the gate.
+**Arm D, loss by tree level.** The number no paper has. The same planted
+facts, scored for recall in the level-one summary (two leaves), the
+level-two summary (two summaries), and level three. Null result: flat.
+Positive result: recall falls per level, which says a summary of summaries
+compounds loss and the tree's shape, not the nap prompt, is the lever.
 
-**Arm B, perturbation.** The same 32-leaf stream with the planted facts
-moved: each fact at the first, middle, and last position of its block,
-and the block order reversed. Same questions, wake-only reader. A fact
-whose survival depends on its position is a nap that reads the block in
-order, and the number to report is the spread between best and worst
-position.
+Two arms from the first draft are cut. Position and order (after ParSer):
+a nap prompt shows two items, so it has no first, middle, and last, and
+any workable version collapses into arm A's length axis. Stale reuse
+(after Memora): before S0 it fails by construction, and after S0 the
+superseded leaf is filtered from the prompt and its ancestors are gone, so
+the model cannot see the stale value; a regression test on S0 measures the
+same thing for free.
 
-**Arm C, stale reuse.** Streams where a third of the planted facts are
-superseded mid-stream by a later leaf. Questions ask for the current
-value. Each superseded value is one must-not-appear criterion; each
-current value one must-appear. Score is Memora's FAMA, with the judge
-asked whether the answer relies on the old value. The number to report is
-plain accuracy minus FAMA. Before S0 this arm fails by construction and
-proves the finding; after S0 it measures whether re-napping restores the
-block.
-
-Sizing: Memora separated systems at 150 questions; Ground Truth First was
-at the floor of its randomization test with six users. Start at n=10 per
-condition as the other evals do, and treat anything under a ten-point gap
-as noise until n grows.
+Sizing: start at n=10 per condition as the other evals do, and treat
+anything under a ten-point gap as noise until n grows.
 
 ## Slices
 
-- **S0. Supersede drops summaries.** In `cmd_note`, when `--supersedes`
-  names an episodic row, delete the summaries over its block the way
-  `forget` does, and let the next nap ask rebuild. Test: nap a block,
-  supersede a leaf in it, wake shows neither the old value nor the stale
-  line, and a nap is pending. Ships now; it is a bug.
-- **S1. The mechanical gate.** Checks 2 to 4 in `cmd_nap`, shared with a
-  `check-nap` the function hook can call before the shell runs, as
-  `check-note` is. Test: an invented version number refuses, a dropped
-  hedge refuses, a leaf that contributes nothing hints.
-- **S2. The verifier prompt** in `evals/run.py` and in the `review` skill,
-  with e3's hedge cases as the first fixtures so the judge is checked
-  against a grader we trust.
-- **S3. e4, arms A and B.** Fixture generator, the two readers, the judge.
+- **S0. Supersede drops the leaf's ancestors.** In `cmd_note`, when
+  `--supersedes` names an episodic row, delete summaries `WHERE kind=
+  'episodic' AND scope=? AND lo<=seq AND hi>seq`, and let the next nap ask
+  rebuild. Test: nap a block, supersede a leaf in it, wake shows neither
+  the old value nor the stale line, a nap is pending, and summaries over
+  other blocks survive. Ships now; it is a bug.
+- **S0b. The range guard** in `cmd_nap`. Test: a nap naming a range other
+  than the pending block is refused and writes nothing. Ships with S0.
+- **S1. Audit counts.** Invention and coverage added to `run_audit` as
+  flags beside the hedge flag, with a count per flag over the real store.
+  About twenty lines, no model calls. Whether any becomes a refusal is
+  decided by its count.
+- **S2. The verifier prompt** in `evals/run.py`, scored against
+  `E3_CASES` and the audit's flags before it judges anything else.
+- **S3. e4, arms A and D.** Fixture generator, the two readers, the judge.
   Run on haiku and opus at n=10 and record the numbers in the eval README
   as e2's are.
-- **S4. e4, arm C.** After S0, so the arm measures re-napping and not the
-  bug.
 
 ## Degradation
 
@@ -216,13 +235,15 @@ so; the gate never depends on it.
 
 ## Open decisions
 
-1. Whether check 4 (coverage floor) should ever refuse. The doctrine says
-   drop what does not last; a leaf that only said "PR is open" should be
-   droppable without ceremony. Hint until e4 arm A says otherwise.
-2. Whether the horizons arm needs a 128-leaf stream, which costs the
+1. Whether the horizons arm needs a 128-leaf stream, which costs the
    session model 127 naps per run. Start with 8 and 32 and add 128 only if
    the two disagree.
-3. Which model judges. TRUSTMEM never named its backbone and reported no
+2. Which model judges. TRUSTMEM never named its backbone and reported no
    agreement study; Memora used three judges and majority vote to reach
    88.3% agreement with humans. One judge at temperature 0 to start, and a
    second only if a number is going to change a design.
+3. Whether a large S0 backlog should be rebuilt in one sitting. Each
+   supersede of an old leaf drops up to log2(T) summaries, and the Stop
+   hook asks for one nap per session, so a burst of supersedes nags for as
+   many sessions as blocks. Acceptable at the rate supersedes happen today;
+   revisit if the review skill starts superseding in bulk.

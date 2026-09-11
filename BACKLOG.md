@@ -24,3 +24,10 @@ graphs. The segmem version: run the two evals on a nap's line and refuse a
 rewrite that regresses. Left September 10, 2026 with the tool-keyed recall
 and the rejection ledger from the same paper shipped: worth doing once a nap
 has visibly lost something, not before.
+
+The eval to gate on comes from ParSer (arXiv 2609.06702): sequential
+memory agents lose a fact depending on where it sits, in what order, and
+how far apart its parts are, while a query over the raw chunks does not.
+So plant one fact at each position of a block, nap, and check that wake or
+recall still finds it; then reverse the block and check again. Naps are the
+sequential design; bronze rows plus recall are the parallel one.

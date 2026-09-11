@@ -33,6 +33,13 @@ so a surprising number can be checked against what the model actually said.
   command grades other, since looking first is not damage. The score is the
   count of wrong first commands the memory prevented. One-shot prediction,
   no tools; the tool-using version is under "Not covered yet".
+  A third arm, `raw`, is the control MemDelta (arXiv 2606.29914) asks for:
+  the same facts as verbatim past-session transcript chunks, picked by a
+  word-overlap search over a small corpus that includes decoys from another
+  repo, and written by nobody. Wake costs one LLM-written note per fact;
+  raw costs nothing to write. If raw prevents as many wrong commands as
+  wake, curation is not what earns the keep, search is. The result records
+  both arms' write cost (LLM calls, bytes) beside the score.
 - **e3, hedge preservation.** Builds real `nap` prompts whose leaves carry
   calibrated doubt ("cause unknown, suspect the replay job"), asks the model
   to compress, and checks the line keeps a doubt marker whenever it keeps
@@ -46,6 +53,15 @@ so a surprising number can be checked against what the model actually said.
 `e1.contamination` is the total flip count toward the preference.
 `e2.saves` is the count of wrong first commands memory prevented;
 `e2.right_gain` is how many more answers hit the convention exactly.
+`e2.saves_raw` and `e2.right_gain_raw` are the same for the raw-transcript
+arm; `e2.cost` holds each arm's write cost. Read wake against raw, not
+against nothing: MemDelta measured no-memory at 2% and plain retrieval at
+47%, so most of any memory system's gain is retrieval existing at all.
+First run, September 10, 2026, n=10: haiku wake 31 saves, raw 21; opus
+wake 18, raw 18. The whole haiku gap is one case, where the transcript
+shows the failed attempt before the fix and haiku copies the attempt every
+time; opus reads past it. So the note earns its keep by stating the
+conclusion, which a small model needs and a strong one extracts itself.
 `e3.pass_rate` is the fraction of compressions that kept doubts as doubts.
 Run at least n=10 per condition; single runs are noise. Rerun after any
 prompt change in `segmem` to see whether the change earned its place.

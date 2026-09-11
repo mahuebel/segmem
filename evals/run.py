@@ -270,6 +270,85 @@ E2_CASES = [
 E2_TAIL = ("\nReply with the single shell command you would run first, "
            "and nothing else.")
 
+# The control arm, after MemDelta (arXiv 2606.29914): the same facts as
+# verbatim past-session text, found by a word-overlap search over transcript
+# chunks, written by nobody. Wake costs an LLM-written note per fact; this
+# costs nothing to write. If it prevents as many wrong commands as wake, the
+# curation is not what earns the keep. The chunks read like real sessions:
+# the fact is in there, beside the noise it was learned in, and two decoys
+# from another repo carry the words a search would also match.
+E2_RAW = [
+    ("pkg", """[session 2026-08-02, lambda-svc] Task: install deps and run the bundler
+$ pnpm install
+Lockfile is up to date, resolution step is skipped
+Done in 4.1s
+$ npm run bundle
+> esbuild src/handler.js --bundle --platform=node --outfile=dist/handler.js
+X [ERROR] Could not resolve "@aws-sdk/client-s3"
+  node_modules/.pnpm/... is a symlink; the Lambda bundler config follows no symlinks
+$ rm -rf node_modules && npm install
+added 212 packages in 9s
+$ npm run bundle
+  dist/handler.js  1.2mb
+> ok that works. the pnpm-lock.yaml is from before the Lambda move; leaving it for now"""),
+    ("tests", """[session 2026-08-05, segapp] Task: run the tests after the parser change
+$ pytest
+zsh: command not found: pytest
+$ python3 -m pytest
+/usr/bin/python3: No module named pytest
+$ head -5 test_segapp.py
+'''Run: python3 test_segapp.py'''
+import os, sys
+$ python3 test_segapp.py
+....
+4 passed
+> the file is a bare-assert script with its own runner, so that's the command"""),
+    ("sqlite", """[session 2026-08-09, segapp] Task: check how many notes are in app.db
+$ sqlite3 app.db "select count(*) from notes"
+Error: no such module: fts5
+$ sqlite3 --version
+3.43.2 2023-10-10 (stock macOS build, no FTS5)
+$ python3 -c "import sqlite3; c=sqlite3.connect('app.db'); print(c.execute('select count(*) from notes').fetchone())"
+(412,)
+> python's bundled sqlite has FTS5, the CLI on this Mac doesn't"""),
+    ("deploys", """[session 2026-08-11, lambda-svc] Task: ship the retry fix
+$ git push origin main
+...
+remote: deploy.yml triggered: production
+> wait, that deployed straight to prod with no gate. Rolled back with the previous tag.
+$ cat Makefile | grep -A3 release
+release:
+	git tag v$(shell date +%Y%m%d.%H%M)
+	git push --tags
+	./scripts/gate.sh && git push origin main
+> from now on: make release, never git push main"""),
+    # decoys from another repo: the words a search matches, the wrong answer
+    ("decoy-tests", """[session 2026-07-28, kerf] Task: run the tests
+$ pytest -q
+.........
+9 passed in 0.8s
+> kerf uses pytest; conftest.py sets the fixtures"""),
+    ("decoy-pkg", """[session 2026-07-30, kerf-web] Task: install and start the dev server
+$ pnpm install && pnpm dev
+  VITE ready in 412 ms
+> pnpm everywhere in kerf-web, the lockfile is pnpm's"""),
+]
+E2_RAW_K = 3
+
+
+def raw_context(fixture):
+    """The chunks a word-overlap search over past sessions returns for this
+    task: scored by distinct fixture words of four letters or more that the
+    chunk contains, top E2_RAW_K, in score order."""
+    words = {w for w in re.findall(r"[a-z][a-z0-9_.-]{3,}", fixture.lower())}
+    scored = []
+    for label, chunk in E2_RAW:
+        hit = sum(1 for w in words if w in chunk.lower())
+        if hit:
+            scored.append((-hit, label, chunk))
+    scored.sort()
+    return "\n\n".join(chunk for _, _, chunk in scored[:E2_RAW_K])
+
 
 def e2_command(answer):
     """The command: first nonblank line that isn't a fence, with backticks
@@ -297,26 +376,39 @@ def run_e2(model, n):
     mem = wake(env)
     header = ("## Memory\nYour memory is segmem; this is what it holds.\n\n"
               + mem + "\n\n")
-    out = {"eval": "e2", "model": model, "n": n, "cases": []}
+    out = {"eval": "e2", "model": model, "n": n, "cases": [],
+           "cost": {"on": {"llm_writes": len(E2_NOTES), "bytes": len(mem)},
+                    "raw": {"llm_writes": 0, "bytes": 0}}}
     for fixture, right, wrong, label in E2_CASES:
         q = fixture + E2_TAIL
+        raw = raw_context(fixture)
+        out["cost"]["raw"]["bytes"] += len(raw) // len(E2_CASES)
+        rawhead = ("## Past sessions\nA search over your past session transcripts "
+                   "for this task found:\n\n" + raw + "\n\n")
         row = {"case": label, "right_re": right, "wrong_re": wrong,
-               "off": {}, "on": {}, "commands": {"off": [], "on": []}}
-        for cond, prompt in (("off", q), ("on", header + q)):
+               "off": {}, "on": {}, "raw": {}, "commands": {"off": [], "on": [], "raw": []}}
+        for cond, prompt in (("off", q), ("on", header + q), ("raw", rawhead + q)):
             for _ in range(n):
                 cmd = e2_command(ask(prompt, model))
                 cls = e2_class(cmd, right, wrong)
                 row[cond][cls] = row[cond].get(cls, 0) + 1
                 row["commands"][cond].append("%-5s %s" % (cls.upper(), cmd[:120]))
-        row["prevented"] = row["off"].get("wrong", 0) - row["on"].get("wrong", 0)
+        for cond in ("on", "raw"):
+            row["prevented_" + cond] = row["off"].get("wrong", 0) - row[cond].get("wrong", 0)
+        row["prevented"] = row["prevented_on"]
         out["cases"].append(row)
-        print("e2 %-8s off:%s on:%s" % (label, row["off"], row["on"]))
-    out["saves"] = sum(max(0, r["prevented"]) for r in out["cases"])
-    out["right_gain"] = sum(r["on"].get("right", 0) - r["off"].get("right", 0)
-                            for r in out["cases"])
-    print("e2 wrong first commands memory prevented: %d over %d cases x %d "
-          "trials (right answers gained: %+d)"
-          % (out["saves"], len(E2_CASES), n, out["right_gain"]))
+        print("e2 %-8s off:%s on:%s raw:%s" % (label, row["off"], row["on"], row["raw"]))
+    for cond in ("on", "raw"):
+        out["saves" if cond == "on" else "saves_raw"] = sum(
+            max(0, r["prevented_" + cond]) for r in out["cases"])
+        out["right_gain" if cond == "on" else "right_gain_raw"] = sum(
+            r[cond].get("right", 0) - r["off"].get("right", 0) for r in out["cases"])
+    print("e2 wrong first commands prevented over %d cases x %d trials: "
+          "wake %d (right gained %+d, %d LLM-written notes, %d bytes); "
+          "raw transcripts %d (right gained %+d, 0 writes, ~%d bytes)"
+          % (len(E2_CASES), n, out["saves"], out["right_gain"],
+             out["cost"]["on"]["llm_writes"], out["cost"]["on"]["bytes"],
+             out["saves_raw"], out["right_gain_raw"], out["cost"]["raw"]["bytes"]))
     return out
 
 
@@ -330,7 +422,7 @@ def main():
     a = ap.parse_args()
     runs = {"e1": run_e1, "e2": run_e2, "e3": run_e3, "audit": run_audit}
     todo = ["audit", "e3", "e1", "e2"] if a.which == "all" else [a.which]
-    calls = sum({"e1": 2 * len(E1_QUESTIONS) * a.n, "e2": 2 * len(E2_CASES) * a.n,
+    calls = sum({"e1": 2 * len(E1_QUESTIONS) * a.n, "e2": 3 * len(E2_CASES) * a.n,
                  "e3": len(E3_CASES) * a.n}.get(w, 0) for w in todo)
     if calls:
         print("About to make %d claude calls on model %s.\n" % (calls, a.model))

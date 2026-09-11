@@ -632,6 +632,36 @@ class Segmem(unittest.TestCase):
         run("note", "episodic", "replacement")
         self.assertIn("replacement", run("wake"))
 
+    def test_supersede_drops_the_leafs_ancestors(self):
+        import re
+        for i in range(18):
+            run("note", "episodic", "e%d: value v%d" % (i, i))
+        out = run("wake")
+        while "Compress episodic" in out:
+            lo, hi = re.search(r"nap (\d+)-(\d+)", out).groups()
+            run("nap", "%s-%s" % (lo, hi), "sum %s-%s: values v%s..v%s" % (lo, hi, lo, hi))
+            out = run("wake")
+        before = run("wake")
+        self.assertIn("v3", before)
+        # supersede leaf seq 3 (id 4): its ancestors go, other summaries stay
+        run("note", "episodic", "e3: value w3", "--supersedes=4")
+        out = run("wake")
+        self.assertNotIn("v3", out)             # neither the leaf nor its summary
+        self.assertIn("w3", out)
+        self.assertIn("Compress episodic", out)  # the block is asked again
+        self.assertIn("sum 0-1", out)            # the sibling block's summary survived
+        self.assertNotIn("sum 2-3", out)
+
+    def test_nap_refuses_a_range_that_is_not_pending(self):
+        for i in range(18):
+            run("note", "episodic", "e%d" % i)
+        self.assertIn("nap 0-1", run("wake"))
+        out = run("nap", "2-3", "wrong block", check=False)
+        self.assertIn("pending block is #0-1", out)
+        self.assertNotIn("wrong block", run("wake"))
+        run("nap", "0-1", "right block")
+        self.assertIn("right block", run("wake"))
+
     def test_forget_and_supersede_chain(self):
         run("note", "identity", "lives in Berlin")
         run("note", "identity", "lives in Lisbon", "--supersedes=1")

@@ -209,9 +209,9 @@ rewrites a note without an agent deciding to.
 | Command | What it does |
 |---|---|
 | `segmem wake [--all] [--conflicts]` | print the memory for the current project; `--conflicts` prints the overriding id pairs alone |
-| `segmem note <kind> "<text>" [--entities=a,b] [--scope=global\|project] [--supersedes=id]` | record one fact, up to 280 bytes |
+| `segmem note <kind> "<text>" [--entities=a,b] [--scope=global\|project] [--supersedes=id]` | record one fact, up to 280 bytes; superseding an episodic leaf drops the summaries over it, and the next nap rebuilds them |
 | `segmem recall <query>` | full-text search across every kind and scope |
-| `segmem nap <lo>-<hi> "<text>"` | answer a compression request |
+| `segmem nap <lo>-<hi> "<text>"` | answer a compression request; the range must be the pending block |
 | `segmem promote <id>` | lift a project fact to global, if three projects agree |
 | `segmem forget <id> ["why"]` | delete a note and record the rejection: the same line is refused after; episodic only when newest |
 | `segmem forget <lo>-<hi>` | drop a bad summary; it's rebuilt on request |

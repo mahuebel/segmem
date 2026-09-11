@@ -7,7 +7,8 @@ plan measured omission without acting on it, copied a WHERE clause from
 arms of which two measured nothing new. The revised plan is smaller: fix
 two bugs now (S0, S0b), count before building (S1 becomes an audit
 extension), and one eval arm nobody else has (recall by tree level).
-Everything past S0b waits for a count or a number.
+S0 and S0b were built the same day, with a regression test each.
+Everything past them waits for a count or a number.
 
 ## Why
 

@@ -6,14 +6,16 @@
   e2     convention recall: does a stored project convention prevent the
          wrong first command the visible repo state invites? Same A/B.
   e3     hedge preservation: does the nap prompt keep doubts as doubts?
-  audit  free lint of the real store: summaries that dropped every hedge
-         their leaves carried.
+  audit  free lint of the real store: summaries against their leaves, one
+         flag per nap-gate check (hedge dropped, invented token, silent
+         leaf), counted so a check earns its way to a refusal.
 
 Run:  python3 evals/run.py all --model haiku -n 10
 Results land in evals/results/<eval>-<model>.json. Grading is mechanical;
 read the misses in the JSON before trusting a surprising number.
 """
 import argparse
+import importlib.machinery
 import json
 import os
 import re
@@ -201,25 +203,86 @@ def run_e3(model, n):
 
 # ---------------------------------------------------------------- audit
 
+def _segmem():
+    """The tool as a module, for identifiers() and the store's own rules."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "segmem_mod", TOOL, loader=importlib.machinery.SourceFileLoader("segmem_mod", TOOL))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def audit_flags(summary, leaves, leaf_dates, identifiers):
+    """The nap gate's content checks, as flags on one stored summary against
+    its leaves (docs/design-nap-gate.md, S1). Counted here before any of
+    them may refuse a nap.
+
+    invented:  a digit run or identifier in the summary that no leaf holds.
+               Digit runs compare as ints so 9/2, 09-02, and 16/8 all resolve
+               to what the leaves carry; a leaf's own date counts as source.
+    hedge:     leaves carried a doubt marker, the summary carries none.
+    silent:    leaves whose identifiers and numbers the summary shares none
+               of; dropping a leaf whole is allowed, this counts how often."""
+    def nums(t):
+        # 1,681 is one number; 9/2 and 09-02 are two that compare as ints
+        return {int(x.replace(",", "")) for x in re.findall(r"\d[\d,]*", t)}
+    def idents(t):
+        # identifiers() also returns a sentence-ending word ("tags only." is
+        # a path to the regex); here only code-shaped tokens count
+        return {i.lower() for i in identifiers(t) if re.search(r"[_/.\-#]", i.strip(".,;:"))}
+    src = " ".join(leaves) + " " + " ".join(leaf_dates)
+    src_nums, src_idents, src_low = nums(src), idents(src), src.lower()
+    def novel(i):
+        # a summary joins what leaves held apart (s1-s3, e1/e3): invented
+        # only if no part of it is in the sources
+        parts = [p for p in re.split(r"[-/]", i) if len(p) > 1] or [i]
+        return all(p not in src_low for p in parts)
+    invented = sorted({str(n) for n in nums(summary) - src_nums}
+                      | {i for i in idents(summary) if novel(i)})
+    hedge = any(re.search(HEDGES, t, re.I) for t in leaves) and not re.search(HEDGES, summary, re.I)
+    silent = []
+    for i, leaf in enumerate(leaves):
+        keys = idents(leaf) | {str(n) for n in nums(leaf) if n > 31}
+        if keys and not (keys & (idents(summary) | {str(n) for n in nums(summary)})):
+            silent.append(i)
+    return {"invented": invented, "hedge": hedge, "silent": silent}
+
+
 def run_audit(_model=None, _n=None):
-    """Free: real-store summaries whose leaves carried hedges they dropped."""
+    """Free: real-store summaries against their leaves, one flag per check.
+    The hedge flag is the original audit; invented and silent are the nap
+    gate's other checks, counted so their firing rate decides whether they
+    ever become refusals."""
     env = dict(os.environ)
     import sqlite3
     db = os.path.join(env.get("SEGMEM_DIR") or os.path.expanduser("~/.segmem"), "segmem.db")
     c = sqlite3.connect(db)
-    flagged, total = [], 0
+    identifiers = _segmem().identifiers
+    rows, total = [], 0
     for kind, scope, lo, hi, text in c.execute("SELECT kind,scope,lo,hi,text FROM summaries"):
         total += 1
-        leaves = [t for (t,) in c.execute(
-            "SELECT text FROM memories WHERE kind=? AND scope=? AND seq>=? AND seq<?",
-            (kind, scope, lo, hi))]
-        leaf_hedged = any(re.search(HEDGES, t, re.I) for t in leaves)
-        if leaf_hedged and not re.search(HEDGES, text, re.I):
-            flagged.append({"scope": scope, "block": "%d-%d" % (lo, hi - 1), "summary": text})
-    print("audit: %d summaries, %d dropped every hedge their leaves carried" % (total, len(flagged)))
-    for f in flagged:
-        print("  %s #%s: %s" % (os.path.basename(f["scope"]), f["block"], f["summary"][:120]))
-    return {"eval": "audit", "summaries": total, "flagged": flagged}
+        leaves = c.execute(
+            "SELECT text, ts FROM memories WHERE kind=? AND scope=? AND seq>=? AND seq<? ORDER BY seq",
+            (kind, scope, lo, hi)).fetchall()
+        f = audit_flags(text, [t for t, _ in leaves], [ts[:10] for _, ts in leaves], identifiers)
+        f.update({"scope": scope, "block": "%d-%d" % (lo, hi - 1), "summary": text,
+                  "leaves": len(leaves)})
+        rows.append(f)
+    hedged = [r for r in rows if r["hedge"]]
+    invented = [r for r in rows if r["invented"]]
+    silent = [r for r in rows if r["silent"]]
+    print("audit: %d summaries" % total)
+    print("  hedge dropped: %d" % len(hedged))
+    for r in hedged:
+        print("    %s #%s: %s" % (os.path.basename(r["scope"]), r["block"], r["summary"][:100]))
+    print("  invented tokens: %d summaries" % len(invented))
+    for r in invented:
+        print("    %s #%s: %s" % (os.path.basename(r["scope"]), r["block"], ", ".join(r["invented"])))
+    print("  silent leaves: %d summaries, %d leaves of %d"
+          % (len(silent), sum(len(r["silent"]) for r in silent), sum(r["leaves"] for r in rows)))
+    return {"eval": "audit", "summaries": total, "flagged": hedged,
+            "invented": invented, "silent": silent}
 
 
 # ---------------------------------------------------------------- e2

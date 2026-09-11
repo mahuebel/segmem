@@ -7,8 +7,11 @@ plan measured omission without acting on it, copied a WHERE clause from
 arms of which two measured nothing new. The revised plan is smaller: fix
 two bugs now (S0, S0b), count before building (S1 becomes an audit
 extension), and one eval arm nobody else has (recall by tree level).
-S0 and S0b were built the same day, with a regression test each.
-Everything past them waits for a count or a number.
+S0 and S0b were built the same day, with a regression test each. S1 ran
+the same day: on the real store's 130 summaries, the hedge flag fires on
+13, the invented flag on 33, the silent-leaf count is 74 of 450 leaves.
+None becomes a refusal (see S1 in Slices for why). The invented list did
+find one summary stored over the wrong block, the S0b bug in the wild.
 
 ## Why
 
@@ -207,10 +210,21 @@ anything under a ten-point gap as noise until n grows.
   other blocks survive. Ships now; it is a bug.
 - **S0b. The range guard** in `cmd_nap`. Test: a nap naming a range other
   than the pending block is refused and writes nothing. Ships with S0.
-- **S1. Audit counts.** Invention and coverage added to `run_audit` as
-  flags beside the hedge flag, with a count per flag over the real store.
-  About twenty lines, no model calls. Whether any becomes a refusal is
-  decided by its count.
+- **S1. Audit counts.** Built. Invention and coverage added to
+  `run_audit` beside the hedge flag, counted over the real store, 130
+  summaries over 450 leaves. Invented fired on 71 summaries as a bare
+  token check, 33 after three refinements (parts of a hyphenated or
+  slashed token count if any part is in a leaf; `1,681` is one number;
+  prose words the identifier regex reads as paths are dropped). What is
+  left is a mix: digit runs inside commit hashes, PR numbers the model
+  knew from its session and not from the leaves, and one summary
+  (key-and-arrow #6-7) that describes a different block entirely. A
+  quarter of naps refused with reasons a person has to decode is not a
+  gate; it stays an audit list, and that list found the corruption.
+  Silent leaves: 74 of 450 contribute nothing to their summary, in 32 of
+  130 summaries. That is the doctrine's "drop what does not last" working
+  as written; a hint that fires on a quarter of naps is noise. Count only.
+  Hedge: 13 of 130, unchanged, stays a flag.
 - **S2. The verifier prompt** in `evals/run.py`, scored against
   `E3_CASES` and the audit's flags before it judges anything else.
 - **S3. e4, arms A and D.** Fixture generator, the two readers, the judge.

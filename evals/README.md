@@ -44,9 +44,14 @@ so a surprising number can be checked against what the model actually said.
   calibrated doubt ("cause unknown, suspect the replay job"), asks the model
   to compress, and checks the line keeps a doubt marker whenever it keeps
   the doubted subject. A control case checks certainty doesn't grow hedges.
-- **audit.** No model. Flags stored summaries whose leaves carried hedge
-  markers the summary dropped. Grader is a word list; read a flag before
-  believing it.
+- **audit.** No model. Three flags on every stored summary against its
+  leaves: hedge markers the leaves carried and the summary dropped;
+  tokens (numbers, code-shaped identifiers) the summary holds and no leaf
+  does; leaves that contribute nothing to the summary. Graders are word
+  lists and regexes; read a flag before believing it. Counts on
+  September 11, 2026, 130 summaries: hedge 13, invented 33, silent leaves
+  74 of 450. None is a gate (see `docs/design-nap-gate.md`, S1); the
+  invented list is where a summary stored over the wrong block shows up.
 
 ## Reading results
 

@@ -9,6 +9,10 @@
   audit  free lint of the real store: summaries against their leaves, one
          flag per nap-gate check (hedge dropped, invented token, silent
          leaf), counted so a check earns its way to a refusal.
+  e4     compression loss: plant eight facts in a stream, let the model nap
+         it, ask a wake-only reader for each; recall by quarter and stream
+         length, and the value kept per tree level. Not in `all`: the naps
+         are model calls too.
   verify score the judged verifier (three booleans per compression) against
          the e3 regex grader and the audit's hedge flag before it judges
          anything on its own. Not in `all`: ~170 calls.
@@ -360,9 +364,12 @@ def run_verify(model, n):
     e3 = json.load(open(path))
     pairs, rows = [], []
     for case in e3["cases"]:
-        for raw, graded in zip(case["raw"], case["lines"]):
+        for i, graded in enumerate(case["lines"]):
             ref = graded.startswith("PASS")
-            _, line = grade_e3(raw, case["subject"], case["hedge_required"])
+            if "raw" in case:      # older results keep only the graded line
+                _, line = grade_e3(case["raw"][i], case["subject"], case["hedge_required"])
+            else:
+                line = graded[5:]
             v = verify(case["leaves"], line, model)
             judge = bool(v["preservation_ok"]) and bool(v["faithfulness_ok"])
             pairs.append((ref, judge))
@@ -679,24 +686,196 @@ def run_e2(model, n):
     return out
 
 
+# ---------------------------------------------------------------- e4
+
+# Does compression lose planted facts, and where? (docs/design-nap-gate.md,
+# S3.) A stream of episodic leaves carries E4_FACTS at known positions,
+# oldest quarter and newest quarter, among routine noise. The session model
+# naps it the way a real session does: wake asks, the model answers, `nap`
+# stores, until wake asks for nothing. Then:
+#   arm A   a wake-only reader answers one question per fact; recall of the
+#           planted value, split by quarter, at each stream length. A second
+#           reader gets wake plus one recall, the ceiling.
+#   arm D   free: the planted value grepped in the summary above its leaf at
+#           each tree level. Loss per level is the number no paper has.
+# Values are distinctive so a hit is a hit and a guess is not.
+
+E4_FACTS = [
+    ("the deploy gate script", "scripts/gate-7f.sh", "gate"),
+    ("the retry cap on the queue worker", "11 retries", "11"),
+    ("the cache TTL", "41 minutes", "41"),
+    ("the release branch name", "rel/2026q3", "2026q3"),
+    ("the metrics port", "9614", "9614"),
+    ("the artifacts bucket", "kaa-artifacts-west", "artifacts-west"),
+    ("the lint rule the team ignores", "no-floating-promises", "floating-promises"),
+    ("the DB pool size", "23 connections", "23"),
+]
+E4_FACT_LEAVES = [
+    "Decided: {subject} is {value}; the old one broke the Lambda bundler and nobody wants that again.",
+    "Root cause of Tuesday's outage: {subject} was wrong. Set to {value}; verified in staging.",
+    "Handoff: {subject} stays {value} until the vendor fixes their side; do not change it.",
+    "Agreed with Sam: {subject} is {value}. Recorded here because the wiki page is stale.",
+]
+E4_NOISE = [
+    "PR {n} merged: typo fixes in the README and one renamed variable.",
+    "Ran the full suite after the merge; green, 3m12s.",
+    "Bumped the aws sdk minor version; no code changes needed.",
+    "Deleted the dead feature flag from the settings page.",
+    "Rotated the staging credentials; nothing else touched.",
+    "Meeting notes: sprint review moved to Thursday this week only.",
+    "Fixed the flaky screenshot test by waiting for the font to load.",
+    "Reformatted the migrations folder; no schema change.",
+    "Investigated a slow query; it was the missing index on created_at, added.",
+    "Small: the CLI help text had the wrong default for --limit.",
+    "Reviewed PR {n}; asked for a test, otherwise fine.",
+    "Cleaned up the docker-compose file; removed the unused redis service.",
+]
+
+
+def e4_stream(length, seed=0):
+    """`length` leaves; the eight facts split four into the oldest quarter,
+    four into the newest, each at a fixed slot; the rest is noise."""
+    import random
+    rnd = random.Random(seed)
+    q = length // 4
+    slots = {}
+    old = sorted(rnd.sample(range(0, q), 4))
+    new = sorted(rnd.sample(range(length - q, length), 4))
+    for i, pos in enumerate(old + new):
+        slots[pos] = i
+    leaves, placed = [], {}
+    for pos in range(length):
+        if pos in slots:
+            subject, value, _ = E4_FACTS[slots[pos]]
+            tpl = E4_FACT_LEAVES[slots[pos] % len(E4_FACT_LEAVES)]
+            leaves.append(tpl.format(subject=subject, value=value))
+            placed[slots[pos]] = pos
+        else:
+            # a day stamp keeps repeats of a template distinct: note refuses a duplicate
+            leaves.append("Day %d: " % (pos + 1) + E4_NOISE[pos % len(E4_NOISE)].format(n=100 + pos))
+    return leaves, placed
+
+
+def extract_line(reply, lo, hi):
+    m = re.search(r'nap %d-%d "([^"]+)"' % (lo, hi), reply)
+    quoted = re.findall(r'"([^"]+)"', reply)
+    return m.group(1) if m else (max(quoted, key=len) if quoted else reply.strip().splitlines()[-1])
+
+
+def e4_compress(env, model, log):
+    """Nap until wake asks for nothing, the way a session would. A line the
+    tool refuses is asked for again with the refusal appended, three times,
+    then hard-cut; the cut is logged as an artifact of the harness."""
+    calls = 0
+    while True:
+        w = subprocess.run([sys.executable, TOOL, "wake"], capture_output=True, text=True, env=env).stdout
+        if "Compress episodic" not in w:
+            return calls
+        prompt = w[w.index("Compress episodic"):]
+        lo, hi = (int(x) for x in re.search(r"nap (\d+)-(\d+)", prompt).groups())
+        ask_text = prompt + "\nReply with the line alone, in double quotes."
+        for attempt in range(3):
+            reply = ask(ask_text, model)
+            calls += 1
+            line = extract_line(reply, lo, hi)
+            r = subprocess.run([sys.executable, TOOL, "nap", "%d-%d" % (lo, hi), line],
+                               capture_output=True, text=True, env=env)
+            if r.returncode == 0:
+                log.append({"block": "%d-%d" % (lo, hi), "line": line, "attempts": attempt + 1})
+                break
+            ask_text = prompt + "\nYour last line was refused: %s\nReply with the line alone, in double quotes." % r.stderr.strip()[:200]
+        else:
+            line = line.encode()[:270].decode(errors="ignore")
+            subprocess.run([sys.executable, TOOL, "nap", "%d-%d" % (lo, hi), line],
+                           capture_output=True, text=True, env=env)
+            log.append({"block": "%d-%d" % (lo, hi), "line": line, "attempts": 3, "cut": True})
+
+
+E4_QUESTION = ("\n\nQuestion: what is {subject}? Answer with the value alone, "
+               "or the single word unknown if the memory does not say.")
+
+
+def run_e4(model, n, lengths=(32, 64)):
+    out = {"eval": "e4", "model": model, "n": n, "streams": []}
+    for length in lengths:
+        leaves, placed = e4_stream(length)
+        d, env = seeded_store([("episodic", t, "") for t in leaves])
+        naps = []
+        calls = e4_compress(env, model, naps)
+        w = wake(env)
+        header = "## Memory\nYour memory is segmem; this is what it holds.\n\n" + w
+        q = length // 4
+        row = {"length": length, "naps": len(naps), "nap_calls": calls,
+               "cut": sum(1 for x in naps if x.get("cut")), "wake_bytes": len(w),
+               "facts": [], "levels": {}}
+        import sqlite3
+        c = sqlite3.connect(os.path.join(d, "segmem.db"))
+        for i, (subject, value, key) in enumerate(E4_FACTS):
+            pos = placed[i]
+            quarter = "oldest" if pos < q else "newest"
+            f = {"subject": subject, "value": value, "pos": pos, "quarter": quarter,
+                 "wake": {"hit": 0, "unknown": 0, "wrong": 0},
+                 "wake_recall": {"hit": 0, "unknown": 0, "wrong": 0}, "levels": {}}
+            # arm D, free: the value in each summary above this leaf
+            for lo, hi, text in c.execute(
+                    "SELECT lo, hi, text FROM summaries WHERE kind='episodic' AND lo<=? AND hi>? ORDER BY hi-lo",
+                    (pos, pos)):
+                level = (hi - lo).bit_length() - 1
+                f["levels"][level] = bool(re.search(re.escape(key), text, re.I))
+            # arm A: the two readers
+            rec = subprocess.run([sys.executable, TOOL, "recall", key], capture_output=True,
+                                 text=True, env=env).stdout
+            for reader, ctx in (("wake", header), ("wake_recall", header + "\n\nRecall for the question:\n" + rec)):
+                for _ in range(n):
+                    a = ask(ctx + E4_QUESTION.format(subject=subject), model).strip()
+                    cls = "hit" if re.search(re.escape(key), a, re.I) else \
+                          "unknown" if re.search(r"\bunknown\b", a, re.I) else "wrong"
+                    f[reader][cls] += 1
+            row["facts"].append(f)
+            print("e4 T=%-3d %-7s pos %-3d %-38s wake:%s recall:%s levels:%s"
+                  % (length, quarter, pos, subject[:38], f["wake"], f["wake_recall"],
+                     {k: int(v) for k, v in sorted(f["levels"].items())}))
+        for quarter in ("oldest", "newest"):
+            fs = [f for f in row["facts"] if f["quarter"] == quarter]
+            row[quarter] = {r: sum(f[r]["hit"] for f in fs) / (len(fs) * n) for r in ("wake", "wake_recall")}
+        levels = {}
+        for f in row["facts"]:
+            for lvl, hit in f["levels"].items():
+                levels.setdefault(lvl, []).append(hit)
+        row["levels"] = {str(l): {"kept": sum(v), "of": len(v)} for l, v in sorted(levels.items())}
+        row["nap_log"] = naps
+        out["streams"].append(row)
+        print("e4 T=%d: %d naps (%d calls, %d cut), wake %d bytes; wake-only recall oldest %.0f%% newest %.0f%%; "
+              "with recall oldest %.0f%% newest %.0f%%; kept per level %s"
+              % (length, len(naps), calls, row["cut"], len(w),
+                 100 * row["oldest"]["wake"], 100 * row["newest"]["wake"],
+                 100 * row["oldest"]["wake_recall"], 100 * row["newest"]["wake_recall"],
+                 {l: "%d/%d" % (v["kept"], v["of"]) for l, v in row["levels"].items()}))
+    return out
+
+
 # ---------------------------------------------------------------- main
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("which", choices=["e1", "e2", "e3", "audit", "verify", "all"])
+    ap.add_argument("which", choices=["e1", "e2", "e3", "e4", "audit", "verify", "all"])
     ap.add_argument("--model", default="haiku", help="haiku, sonnet, or opus")
     ap.add_argument("-n", type=int, default=10, help="trials per condition")
+    ap.add_argument("--lengths", default="32,64", help="e4 stream lengths, comma-separated")
     a = ap.parse_args()
-    runs = {"e1": run_e1, "e2": run_e2, "e3": run_e3, "audit": run_audit, "verify": run_verify}
+    lengths = tuple(int(x) for x in a.lengths.split(","))
+    runs = {"e1": run_e1, "e2": run_e2, "e3": run_e3, "e4": run_e4, "audit": run_audit,
+            "verify": run_verify}
     todo = ["audit", "e3", "e1", "e2"] if a.which == "all" else [a.which]
     calls = sum({"e1": 2 * len(E1_QUESTIONS) * a.n, "e2": 3 * len(E2_CASES) * a.n,
                  "e3": len(E3_CASES) * a.n,
-                 "verify": len(E3_CASES) * 10 + len(audit_rows())}.get(w, 0) for w in todo)
+                 "verify": len(E3_CASES) * 10 + len(audit_rows()),
+                 "e4": 2 * len(E4_FACTS) * a.n * 2 + 90}.get(w, 0) for w in todo)
     if calls:
         print("About to make %d claude calls on model %s.\n" % (calls, a.model))
     os.makedirs(os.path.join(HERE, "results"), exist_ok=True)
     for w in todo:
-        result = runs[w](a.model, a.n)
+        result = runs[w](a.model, a.n, lengths) if w == "e4" else runs[w](a.model, a.n)
         path = os.path.join(HERE, "results", "%s-%s.json" % (w, a.model))
         json.dump(result, open(path, "w"), indent=2)
         print("wrote %s\n" % os.path.relpath(path))

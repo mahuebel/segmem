@@ -88,15 +88,39 @@ class Segmem(unittest.TestCase):
         self.assertIn("nap 0-1", out)             # smallest needed block first
         self.assertIn("Keep doubts as doubts", out)
         run("nap", "0-1", "e0 e1")
-        out = run("wake")
+        out = run("next-nap")
         while "Compress episodic" in out:
             import re
             lo, hi = re.search(r"nap (\d+)-(\d+)", out).groups()
             run("nap", "%s-%s" % (lo, hi), "sum %s-%s" % (lo, hi))
-            out = run("wake")
+            out = run("next-nap")
+        out = run("wake")
         self.assertIn("You are awake", out)
         self.assertNotIn("not compressed yet", out)
         self.assertNotIn("Compress", out)    # nothing premature after wake
+
+    def test_nap_asks_rest_after_a_burst(self):
+        # a dormant tree owes dozens; each nap printing the next ask drained
+        # them all in one turn. Three per half hour, then every ask site
+        # goes quiet; next-nap (data, not an ask) still answers.
+        import json, sqlite3
+        for i in range(40):
+            run("note", "episodic", "e%d" % i)
+        self.assertIn("Compress episodic", run("wake"))
+        self.assertIn("nap 2-3", run("nap", "0-1", "a"))
+        self.assertIn("nap 4-5", run("nap", "2-3", "b"))
+        out = run("nap", "4-5", "c")
+        self.assertIn("remain; the next ask comes after a rest", out)
+        self.assertNotIn("Compress", out)
+        self.assertNotIn("Compress", run("wake"))
+        self.assertNotIn("Compress", run("note", "episodic", "e40"))
+        self.assertEqual("", run("stale", "--hook", stdin=json.dumps({"session_id": "s1"})))
+        self.assertIn("nap 6-7", run("next-nap"))
+        # the rest is by the clock: age the summaries and the asks return
+        c = sqlite3.connect(os.path.join(run.dir, "segmem.db"))
+        c.execute("UPDATE summaries SET ts='2020-01-01T00:00:00.000Z'")
+        c.commit()
+        self.assertIn("nap 6-7", run("wake"))
 
     def test_wake_once_per_session(self):
         run("note", "procedural", "sky is blue")

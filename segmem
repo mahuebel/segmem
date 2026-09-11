@@ -295,7 +295,7 @@ def ask_nap(c, scope):
     if not nap:
         return None
     recent = c.execute("SELECT COUNT(*) FROM summaries WHERE ts > strftime("
-                       "'%Y-%m-%dT%H:%M:%fZ','now','-%d minutes')" % NAP_REST).fetchone()[0]
+                       "'%Y-%m-%dT%H:%M:%fZ','now',?)", ("-%d minutes" % NAP_REST,)).fetchone()[0]
     return None if recent >= NAP_BURST else nap
 
 
@@ -792,7 +792,9 @@ def cmd_nap(c, args):
         # the line was written from the block the prompt showed, not this one
         die("The pending block is #%d-%d, not #%d-%d." % (nap[2], nap[3], lo, hi - 1))
     with c:
-        c.execute("INSERT OR REPLACE INTO summaries(kind,scope,lo,hi,text) VALUES (?,?,?,?,?)",
+        # ts set here, not by default: a migrated table's default is ''
+        c.execute("INSERT OR REPLACE INTO summaries(kind,scope,lo,hi,text,ts) "
+                  "VALUES (?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
                   ("episodic", scope, lo, hi, text))
     nap = ask_nap(c, project())
     if nap:

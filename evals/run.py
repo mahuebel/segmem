@@ -181,7 +181,7 @@ def nap_prompt_for(leaves):
     return g["nap_prompt"](c, "episodic", "/eval/project", 0, 2, 0)
 
 
-def grade_e3(summary_text, subject, hedge_required):
+def grade_e3(summary_text, subject, hedge_required, leaves=None):
     """Extract the compressed line: the quote in a `nap 0-1 "..."` command if
     the model echoed one, else the longest quote (models also quote fragments
     in commentary), else the whole reply."""
@@ -194,6 +194,12 @@ def grade_e3(summary_text, subject, hedge_required):
         ok = (not has_subject) or bool(has_hedge)   # drop it, or keep the doubt
     else:
         ok = not has_hedge                          # certainty must stay certain
+    # A line that shares no content with the leaves is meta-commentary or a
+    # permission request, not a compression; the verifier (S2) caught ten of
+    # these passing on the subject rule alone.
+    words = lambda t: {w for w in re.findall(r"[a-z]{4,}", t.lower())}
+    if leaves is not None and len(words(line) & words(" ".join(leaves))) < 2:
+        ok = False
     return ok, line
 
 
@@ -207,7 +213,7 @@ def run_e3(model, n):
         for _ in range(n):
             a = ask(prompt, model)
             row["raw"].append(a)
-            ok, line = grade_e3(a, subject, req)
+            ok, line = grade_e3(a, subject, req, leaves)
             row["pass" if ok else "fail"] += 1
             row["lines"].append(("PASS " if ok else "FAIL ") + line[:160])
         out["cases"].append(row)
@@ -377,7 +383,7 @@ def run_verify(model, n):
         for i, graded in enumerate(case["lines"]):
             ref = graded.startswith("PASS")
             if "raw" in case:      # older results keep only the graded line
-                _, line = grade_e3(case["raw"][i], case["subject"], case["hedge_required"])
+                _, line = grade_e3(case["raw"][i], case["subject"], case["hedge_required"], case["leaves"])
             else:
                 line = graded[5:]
             v = verify(case["leaves"], line, model)

@@ -12,6 +12,11 @@ the same day: on the real store's 130 summaries, the hedge flag fires on
 13, the invented flag on 33, the silent-leaf count is 74 of 450 leaves.
 None becomes a refusal (see S1 in Slices for why). The invented list did
 find one summary stored over the wrong block, the S0b bug in the wild.
+S2 and S3 ran on haiku the same day; numbers under each slice. The short
+form: the verifier is a reader's aid and not a gate, and it found a hole
+in the e3 grader; the tree loses nothing through three levels and one of
+four planted facts at the fourth, where one 280-byte line stands for
+sixteen leaves, while the raw rows and recall keep everything.
 
 ## Why
 
@@ -225,11 +230,31 @@ anything under a ten-point gap as noise until n grows.
   130 summaries. That is the doctrine's "drop what does not last" working
   as written; a hint that fires on a quarter of naps is noise. Count only.
   Hedge: 13 of 130, unchanged, stays a flag.
-- **S2. The verifier prompt** in `evals/run.py`, scored against
-  `E3_CASES` and the audit's flags before it judges anything else.
-- **S3. e4, arms A and D.** Fixture generator, the two readers, the judge.
-  Run on haiku and opus at n=10 and record the numbers in the eval README
-  as e2's are.
+- **S2. The verifier prompt.** Built and scored (`run.py verify`, haiku).
+  Against the 40 e3 lines: 28 agreed, and of the 12 the judge failed, 10
+  were right: meta-commentary, permission requests, and lines the old
+  results had cut at 160 characters, which the regex passed because a
+  line without the subject passes. The grader now also fails a line that
+  shares under two words with its leaves. The other two were the judge
+  counting mild inference ("v1.4.2 is stable", "instead of local time")
+  as unfaithful. Against the store's 132 summaries: coverage fails 64,
+  preservation 37, faithfulness 58; agreement with the hedge word list 92
+  of 132, disagreeing both ways. Its coverage bar is "what a future
+  decision would need", which is above the doctrine's "drop what does not
+  last", and its faithfulness flags include facts the model knew from its
+  session. Verdict as the review predicted: print for a person, never
+  re-nap. It stays in the review skill.
+- **S3. e4, arms A and D.** Built and run on haiku at n=5, lengths 32
+  and 64. At 32 leaves, 16 naps, nothing lost at any level and both
+  readers at 100%. At 64 leaves, 48 naps: levels one to three kept every
+  planted value (7/7, 4/4, 4/4); level four, one line for sixteen leaves,
+  kept 3 of 4, dropping the release branch. Wake-only recall of the oldest
+  quarter 75%, newest 100%; wake plus recall 100% everywhere. Wake stayed
+  under 2KB at both lengths. The loss is capacity at the top of the tree,
+  not position or drift, and the raw rows carry what it drops: Ground
+  Truth First's eviction, in a system where nothing is evicted from recall.
+  The lever, if 3 of 4 is ever not enough, is the top-level budget, not
+  the nap prompt. Opus run pending.
 
 ## Degradation
 

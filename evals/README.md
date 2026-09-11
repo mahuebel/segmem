@@ -44,6 +44,15 @@ so a surprising number can be checked against what the model actually said.
   calibrated doubt ("cause unknown, suspect the replay job"), asks the model
   to compress, and checks the line keeps a doubt marker whenever it keeps
   the doubted subject. A control case checks certainty doesn't grow hedges.
+- **e4, compression loss.** Plants eight distinctive facts in a stream,
+  four in the oldest quarter and four in the newest, lets the session
+  model nap it the way a session does, then asks a wake-only reader for
+  each fact and greps each value in the summary above its leaf at every
+  tree level. The number that matters is where in the tree a fact goes
+  missing. Not in `all`; the naps are model calls.
+- **verify.** Scores the nap verifier, three booleans per compression in
+  the shape of TRUSTMEM's transition judge, against the e3 regex and the
+  audit's hedge flag before it judges anything else. Not in `all`.
 - **audit.** No model. Three flags on every stored summary against its
   leaves: hedge markers the leaves carried and the summary dropped;
   tokens (numbers, code-shaped identifiers) the summary holds and no leaf
@@ -74,6 +83,21 @@ is the unit search finds, a tagged line rather than a session diluted by
 the repo's other sessions. Both failures land on the install case; the
 other three say raw text plus retrieval is as good as a note.
 `e3.pass_rate` is the fraction of compressions that kept doubts as doubts.
+`verify` reports agreement per arm: on the e3 lines (haiku, September 11,
+2026) the judge agreed with the regex on 28 of 40 and was right on ten of
+the twelve it failed, which were meta-commentary, permission requests, or
+lines cut at 160 characters that the regex passed for lacking a subject;
+the grader now fails a line sharing under two words with its leaves. On
+the store it fails coverage on 64 of 132, preservation on 37, faithfulness
+on 58, with a coverage bar above the doctrine's and mild inference counted
+as unfaithful; agreement with the hedge word list is 92 of 132, and the
+disagreements cut both ways. A reader's aid, not a gate.
+`e4` (haiku, n=5): at 32 leaves no planted fact was lost at any level; at
+64 leaves the release-branch fact vanished from the level-four summary,
+the one line standing for sixteen leaves, so wake-only recall of the
+oldest quarter fell to 75% while wake plus recall held at 100%. The byte
+cap at the top of the tree is where loss starts, and the raw rows carry
+what it drops.
 Run at least n=10 per condition; single runs are noise. Rerun after any
 prompt change in `segmem` to see whether the change earned its place.
 

@@ -41,9 +41,19 @@ HEDGES = r"unknown|suspect|not proven|unconfirmed|untested|not tested|may be|may
 ASK_ENV = dict(os.environ, SEGMEM_DIR=tempfile.mkdtemp(prefix="segmem-eval-ask-"))
 
 
+# Each call is a full claude process. Without these it also starts every
+# MCP server in the user's config and keeps a session file; with a dozen
+# sessions on the machine that tripped the memory watchdog. (--bare would
+# also skip the plugin hooks, but it skips the login too.) The segmem
+# plugin still runs, against the throwaway store.
+ASK_FLAGS = ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+             "--no-session-persistence", "--no-chrome"]
+
+
 def ask(prompt, model, timeout=120):
-    r = subprocess.run(["claude", "-p", "--model", model, prompt],
-                       capture_output=True, text=True, timeout=timeout, env=ASK_ENV)
+    r = subprocess.run(["claude", "-p", "--model", model, *ASK_FLAGS, prompt],
+                       capture_output=True, text=True, timeout=timeout, env=ASK_ENV,
+                       stdin=subprocess.DEVNULL)
     if r.returncode:
         sys.exit("claude -p failed: %s" % (r.stderr.strip() or r.stdout.strip()))
     return r.stdout.strip()
@@ -768,11 +778,14 @@ def e4_compress(env, model, log):
     then hard-cut; the cut is logged as an artifact of the harness."""
     calls = 0
     while True:
-        w = subprocess.run([sys.executable, TOOL, "wake"], capture_output=True, text=True, env=env).stdout
-        if "Compress episodic" not in w:
+        # next-nap, not wake: wake rests after a burst of naps so one session
+        # never drains a dormant tree; the harness is meant to drain it.
+        nxt = json.loads(subprocess.run([sys.executable, TOOL, "next-nap", "--json"],
+                                        capture_output=True, text=True, env=env).stdout or "{}")
+        if not nxt:
             return calls
-        prompt = w[w.index("Compress episodic"):]
-        lo, hi = (int(x) for x in re.search(r"nap (\d+)-(\d+)", prompt).groups())
+        prompt = nxt["prompt"]
+        lo, hi = (int(x) for x in nxt["range"].split("-"))
         ask_text = prompt + "\nReply with the line alone, in double quotes."
         for attempt in range(3):
             reply = ask(ask_text, model)

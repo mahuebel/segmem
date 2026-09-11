@@ -760,7 +760,7 @@ class Segmem(unittest.TestCase):
         cmds = [h["command"] for evt in cfg["hooks"].values()
                 for m in evt for h in m["hooks"]]
         for want in ("segmem\" prompt", "segmem\" wake --once", "segmem\" hook --once",
-                     "segmem\" stale --hook"):
+                     "segmem\" hook --tool --once", "segmem\" stale --hook"):
             self.assertTrue(any(c.endswith(want) for c in cmds), want)
         for c in cmds:
             self.assertIn("${CLAUDE_PLUGIN_ROOT}", c)
@@ -769,6 +769,7 @@ class Segmem(unittest.TestCase):
         ts = Path(HERE, "hooks", "hooks.ts").read_text()
         self.assertIn('"wake", "--once"', ts)
         self.assertIn('"hook", "--once"', ts)
+        self.assertIn('"hook", "--tool", "--once"', ts)
         self.assertIn("--served=function", ts)
         # the subagent rule lives in Python; the module only fetches it
         self.assertIn('"prompt", "--subagent"', ts)
@@ -821,6 +822,49 @@ class Segmem(unittest.TestCase):
             if old:
                 os.environ["SEGMEM_QUIET"] = old
         self.assertIn("block", run("stale", "--hook", stdin=json.dumps({"session_id": "s1"})))
+
+    def test_hook_tool_recalls_on_the_program_about_to_run(self):
+        import json
+        run("note", "procedural", "stock macOS sqlite3 lacks FTS5; use python3", "--entities=sqlite")
+        run("note", "procedural", "git log has the what; memory keeps the why")
+        call = lambda cmd, sid="t1": json.dumps(
+            {"tool_input": {"command": cmd}, "session_id": sid})
+        # a bare program name matches a tag by prefix, and the command path answers as JSON
+        out = json.loads(run("hook", "--tool", stdin=call("/usr/bin/sqlite3 x.db .tables")))
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "PreToolUse")
+        self.assertIn("lacks FTS5", ctx)
+        self.assertIn("<segmem-recall>", ctx)
+        # once per session: the entity is now touched, so the next call is silent
+        self.assertEqual("", run("hook", "--tool", stdin=call("sqlite3 x.db")))
+        # another session sees it again, through a wrapper and a pipe
+        self.assertIn("lacks FTS5", run("hook", "--tool", stdin=call(
+            "cd /p && sudo sqlite3 x.db | head", "t2")))
+        # text is never searched: an untagged fact stays quiet
+        self.assertEqual("", run("hook", "--tool", stdin=call("git log", "t3")))
+        self.assertEqual("", run("hook", "--tool", stdin=call("ls -la", "t4")))
+        # the function path prints the block itself
+        self.assertIn("<segmem-recall>", run(
+            "hook", "--tool", "--served=function", stdin=call("sqlite3 x.db", "t5")))
+
+    def test_forget_records_a_rejection(self):
+        run("note", "procedural", "tests run with make check")
+        self.assertIn("Forgot #1", run("forget", "1", "no Makefile here"))
+        # the same line is refused, with the reason, before and at write
+        out = run("note", "procedural", "tests run with make check", check=False)
+        self.assertIn("forgotten", out)
+        self.assertIn("no Makefile here", out)
+        out = run("check-note", stdin='%s note procedural "tests run with make check"' % TOOL,
+                  check=False)
+        self.assertIn("no Makefile here", out)
+        # a reworded line, or the same line in another scope or kind, passes
+        run("note", "procedural", "tests run with python3 test_segmem.py")
+        run("note", "procedural", "tests run with make check", "--scope=global")
+        run("note", "episodic", "tests run with make check")
+        # forget without a reason still records the rejection
+        run("note", "identity", "prefers tabs")
+        run("forget", "4")
+        self.assertIn("forgotten on", run("note", "identity", "prefers tabs", check=False))
 
     def test_duplicate_note_refused_before_and_at_write(self):
         run("note", "procedural", "uses pnpm", "--entities=pnpm")

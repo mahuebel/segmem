@@ -166,6 +166,32 @@ export const register: Register = (on) => {
     return { ...r, context: [...(r.context ?? []), hint] };
   });
 
+  // Recall keyed on the action, not the prompt: a fact tagged with the
+  // program a Bash command runs prints as that command is about to run.
+  // Same claim as the prompt hook, so the two paths never both speak.
+  on("tool.call", { tool: "Bash" }, async ($, e, next) => {
+    let found = "";
+    try {
+      const id = await $.session.id();
+      const r = await $.process.run(
+        [$.plugin.root + "/segmem", "hook", "--tool", "--once",
+         "--session=" + id, "--served=function"],
+        {
+          cwd: await $.session.cwd(),
+          timeoutMs: TIMEOUT,
+          stdin: JSON.stringify({ tool_input: { command: e.command }, session_id: id }),
+        },
+      );
+      if (r.exitCode === 0) found = r.stdout.trim();
+      else $.ui.log("segmem hook --tool failed: " + r.stderr.trim());
+    } catch (err) {
+      $.ui.log("segmem hook --tool failed: " + String(err));
+    }
+    const r = await next(e);
+    if (!found || r.deny !== undefined) return r;
+    return { ...r, context: [...(r.context ?? []), found] };
+  });
+
   // Recall as a tool the model can call directly. Bash recall keeps working
   // everywhere, so an unflagged session loses nothing. `note` is not
   // registered: it stays a Bash command, which is what keeps "subagents

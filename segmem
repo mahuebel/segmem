@@ -89,6 +89,14 @@ CREATE TABLE IF NOT EXISTS claims (
   served  TEXT NOT NULL,                 -- 'command' hook or 'function' hook
   PRIMARY KEY (session, cmd, source)
 );
+CREATE TABLE IF NOT EXISTS forgotten (   -- the rejection ledger: see refuse_dup
+  ts       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  mid      INTEGER NOT NULL,             -- the id the note had; ids can be reused
+  kind     TEXT NOT NULL, scope TEXT NOT NULL,
+  entities TEXT NOT NULL DEFAULT '',
+  text     TEXT NOT NULL,
+  why      TEXT NOT NULL DEFAULT ''
+);
 """
 
 
@@ -611,6 +619,25 @@ def dup_of(c, kind, scope, text):
     return r[0] if r else None
 
 
+def refuse_dup(c, kind, scope, text, sup):
+    """Refuse a note that a live memory already says, or that was forgotten
+    in this kind and scope. The forgotten table is the rejection ledger: a
+    line the user threw out is not proposed again, and the refusal carries
+    the reason forget was given. Re-noting over itself is a reset, allowed.
+    A misfiled note re-noted where it belongs passes: the key includes kind
+    and scope."""
+    dup = dup_of(c, kind, scope, text)
+    if dup is not None and dup != sup:
+        die("#%d already says this. Nothing to do; if something changed, "
+            "note the change with --supersedes=%d." % (dup, dup))
+    r = c.execute("SELECT * FROM forgotten WHERE kind=? AND scope=? AND text=? "
+                  "ORDER BY ts DESC", (kind, scope, text)).fetchone()
+    if r:
+        die("#%d said this and was forgotten on %s%s. Not recorded; if it is true "
+            "after all, say what changed." % (r["mid"], r["ts"][:10],
+                                             ": " + r["why"] if r["why"] else ""))
+
+
 def note_scope(opts, kind):
     """Where a note lands: --scope as given, else global for the kinds that
     are about a person and the project for the kinds that are about work."""
@@ -634,10 +661,7 @@ def cmd_note(c, args):
     sup = int(opts["supersedes"]) if "supersedes" in opts else None
     if sup is not None and not c.execute("SELECT 1 FROM memories WHERE id=?", (sup,)).fetchone():
         die("No memory #%d to supersede." % sup)
-    dup = dup_of(c, kind, scope, text)
-    if dup is not None and dup != sup:     # re-noting over itself is a reset, allowed
-        die("#%d already says this. Nothing to do; if something changed, "
-            "note the change with --supersedes=%d." % (dup, dup))
+    refuse_dup(c, kind, scope, text, sup)
     entities, hints = canon(c, opts.get("entities", ""), kind, scope)
     with c:
         seq = stream_len(c, kind, scope)
@@ -692,10 +716,8 @@ def cmd_check_note(c, args):
             text = " ".join(text.split())
             check_len(text)
             scope = note_scope(opts, kind)
-            dup = dup_of(c, kind, scope, text)
-            if dup is not None and str(dup) != opts.get("supersedes"):
-                die("#%d already says this. Nothing to do; if something changed, "
-                    "note the change with --supersedes=%d." % (dup, dup))
+            sup = opts.get("supersedes", "")
+            refuse_dup(c, kind, scope, text, int(sup) if sup.isdigit() else None)
             _, hints = canon(c, opts.get("entities", ""), kind, scope)
             for h in hints:
                 print(h)
@@ -746,8 +768,12 @@ def cmd_nap(c, args):
 
 
 def cmd_forget(c, args):
-    if len(args) != 1 or not re.fullmatch(r"\d+(-\d+)?", args[0]):
-        die("usage: %s forget <id> | <lo>-<hi>   (a misfiled note by id, or a summary block)" % ME)
+    """Delete a note, and remember that it was deleted: the text goes to the
+    forgotten table with the reason given, and `note` refuses the same line
+    in the same kind and scope from then on (see refuse_dup)."""
+    if not 1 <= len(args) <= 2 or not re.fullmatch(r"\d+(-\d+)?", args[0]):
+        die("usage: %s forget <id> [\"why\"] | <lo>-<hi>   "
+            "(a note by id, with the reason; or a summary block)" % ME)
     if "-" in args[0]:
         lo, hi = (int(x) for x in args[0].split("-"))
         with c:
@@ -768,6 +794,9 @@ def cmd_forget(c, args):
     if ref:
         die("#%d is superseded by #%d; forget that one first." % (rid, ref["id"]))
     with c:
+        c.execute("INSERT INTO forgotten(mid,kind,scope,entities,text,why) VALUES (?,?,?,?,?,?)",
+                  (rid, row["kind"], row["scope"], row["entities"], row["text"],
+                   " ".join(args[1:2]).strip()))
         c.execute("INSERT INTO memories_fts(memories_fts, rowid, text, entities) "
                   "VALUES ('delete', ?, ?, ?)", (rid, row["text"], row["entities"]))
         c.execute("DELETE FROM memories WHERE id=?", (rid,))
@@ -1245,6 +1274,35 @@ def identifiers(text, tags=()):
     return out
 
 
+WRAP = ("sudo", "env", "time", "nohup", "exec", "command", "builtin", "xargs")
+OPS = (";", "&&", "||", "|", "&", "(", ")", "{", "}")
+
+
+def actions(command):
+    """The programs a shell command runs, each with its first argument: the
+    first two words of every segment, wrappers and VAR=x prefixes skipped,
+    lowercase basenames so /usr/bin/sqlite3 reads as sqlite3. Shell grammar
+    is read the way check-note reads it: per line, stopping at operators."""
+    import shlex
+    out = []
+    for line in command.splitlines():
+        try:
+            toks = shlex.split(line, comments=True)
+        except ValueError:
+            continue
+        seg = []
+        for t in toks + [";"]:
+            if t not in OPS:
+                if not re.match(r"^\d*[<>]", t):
+                    seg.append(t)
+                continue
+            while seg and (seg[0] in WRAP or re.match(r"^\w+=", seg[0])):
+                seg.pop(0)
+            out += [os.path.basename(a).lower() for a in seg[:2]]
+            seg = []
+    return out
+
+
 def cmd_hook(c, args):
     """Claude Code UserPromptSubmit hook: reads the prompt as JSON on stdin,
     prints matching memories as extra context. Never fails the prompt.
@@ -1252,25 +1310,47 @@ def cmd_hook(c, args):
     `--once` claims the session for one path: the claim is keyed on the
     session alone (source `session`), so the first prompt decides who serves
     recall for every prompt after it. There is no id both paths see per
-    prompt, so per-prompt arbitration is not available."""
+    prompt, so per-prompt arbitration is not available.
+
+    `--tool` is the PreToolUse form: the JSON carries a Bash command, and
+    the lookup is keyed on what is about to run, not on what was said. A
+    fact tagged with a program (`sqlite`, `git`) prints as that program is
+    about to run, once per session: an entity the session already touched
+    was already shown. Only tags match, never text: a text search for `git`
+    would print half the store on every call. The command path answers as
+    PreToolUse JSON, since plain stdout there reaches only the debug log.
+    It shares the prompt hook's claim: whoever serves recall serves this."""
     opts, _ = flags(args)
     data = hook_input()
-    text = data.get("prompt", "")
     sid = opts.get("session") or data.get("session_id", "")
+    served = opts.get("served", "command")
+    tool = "tool" in opts
     if "once" in opts:
-        served = opts.get("served", "command")
         if sid and claim(c, sid, "hook", "session", served) != served:
             return          # the other hook path owns this session's recall
     tags = known_tags(c)
-    ids = identifiers(text, tags)
+    if tool:
+        if QUIET:
+            return
+        acts = set(actions((data.get("tool_input") or {}).get("command", "")))
+        ids = [t for k, t in tags.items()
+               if any(a == k or (len(k) >= 4 and a.startswith(k)) for a in acts)]
+        if sid:
+            seen = {r[0] for r in c.execute("SELECT entity FROM touches WHERE session=?", (sid,))}
+            ids = [i for i in ids if i.lower() not in seen]
+    else:
+        ids = identifiers(data.get("prompt", ""), tags)
     if not ids:
         return
     try:
-        if not QUIET:
+        if tool:
+            touch(c, ids, "recall", sid)
+        elif not QUIET:
             touch(c, [i for i in ids if i.lower() in tags], "prompt", sid)
     except sqlite3.OperationalError:
         pass
-    q = " OR ".join('"%s"' % i.replace('"', '""') for i in ids)
+    col = "entities:" if tool else ""
+    q = " OR ".join(col + '"%s"' % i.replace('"', '""') for i in ids)
     p = project()
     try:
         rows = c.execute(
@@ -1283,12 +1363,18 @@ def cmd_hook(c, args):
     orows = org_search(oc, q, HOOK_MAX - len(rows)) if oc and len(rows) < HOOK_MAX else []
     if not rows and not orows:
         return
-    print("<segmem-recall>")
+    out = ["<segmem-recall>"]
     for r in rows:
-        print("#%d %s %s %s: %s" % (r["id"], r["ts"][:10], r["kind"], short(r["scope"]), r["text"]))
+        out.append("#%d %s %s %s: %s" % (r["id"], r["ts"][:10], r["kind"], short(r["scope"]), r["text"]))
     for r in orows:
-        print(org_line(r, path=False))
-    print("</segmem-recall>")
+        out.append(org_line(r, path=False))
+    out.append("</segmem-recall>")
+    if tool and served == "command":
+        import json
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                                 "additionalContext": "\n".join(out)}}))
+    else:
+        print("\n".join(out))
 
 
 # ---------------------------------------------------------------- mcp
@@ -2710,6 +2796,9 @@ CI counts, or "awaiting review" status. Record the why and what surprised you;
 git log has the what, and the tool stamps the date (date the text only for a
 past event). A fact that replaces an older one: add --supersedes=<id>.
 When `note` suggests a tag spelling, use it next time; never re-note.
+Tag a pitfall with the program it bites (`sqlite`, `git`): it then prints as
+that program is about to run. A wrong note: `{me} forget <id> "why"`; the
+same line is refused after.
 If `note` or a stop asks for a compression, do it before your next action.
 When a person was a subject this session, not a mention: before you finish,
 supersede their people note or confirm it unchanged with `{me} touch <name>`.

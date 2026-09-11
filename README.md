@@ -213,13 +213,14 @@ rewrites a note without an agent deciding to.
 | `segmem recall <query>` | full-text search across every kind and scope |
 | `segmem nap <lo>-<hi> "<text>"` | answer a compression request |
 | `segmem promote <id>` | lift a project fact to global, if three projects agree |
-| `segmem forget <id>` | delete a misfiled note; episodic only when newest |
+| `segmem forget <id> ["why"]` | delete a note and record the rejection: the same line is refused after; episodic only when newest |
 | `segmem forget <lo>-<hi>` | drop a bad summary; it's rebuilt on request |
 | `segmem stale [--min=n] [--hook] [--count]` | list people notes and procedural facts under evidence pressure; `--count` prints the number alone |
 | `segmem touch <entity\|id> [--keep]` | claim reviewed, unchanged; resets its pressure; `--keep` marks a procedural fact memory-resident |
 | `segmem contribute <id>` | print the org-repo candidate for a procedural fact, and the PR commands |
 | `segmem org-init <dir>` | scaffold a knowledge repo with the witnessing convention |
 | `segmem hook [--once --session=id --served=command\|function]` | the prompt hook; reads JSON on stdin |
+| `segmem hook --tool [...]` | the PreToolUse hook: facts tagged with the program a Bash command runs, once per session |
 | `segmem check-note` | read a shell command on stdin; run the note checks on it and write nothing |
 | `segmem serve [--port=7878] [--no-open]` | serve a live page over the store on loopback; Ctrl-C stops it |
 | `segmem html [file] [--no-open]` | write a self-contained snapshot page of the store, and open it |
@@ -330,6 +331,14 @@ wrong kind is refused with the trim mark, and a near-miss tag or a missing
 people record comes back as a hint beside the result. Every other command
 passes untouched. Without the flag the model learns the same thing from the
 note that failed; with it, the note is never sent.
+
+Also at `tool.call`, the module runs `segmem hook --tool` on every Bash
+command: a fact tagged with the program about to run (`sqlite`, `git`, a
+tag that is a prefix of the program name) prints before the shell runs it,
+once per session. Only tags match, never text, so `git` does not print half
+the store. The command hook in `hooks.json` does the same as a PreToolUse
+hook and answers as JSON, because plain stdout there reaches only the debug
+log. The two paths share the prompt hook's claim, so one of them speaks.
 
 After wake, the module counts what is under pressure with `segmem stale
 --count` and pins `segmem: N under pressure` beneath the prompt, or clears

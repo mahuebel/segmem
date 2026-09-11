@@ -92,12 +92,19 @@ the store it fails coverage on 64 of 132, preservation on 37, faithfulness
 on 58, with a coverage bar above the doctrine's and mild inference counted
 as unfaithful; agreement with the hedge word list is 92 of 132, and the
 disagreements cut both ways. A reader's aid, not a gate.
-`e4` (haiku, n=5): at 32 leaves no planted fact was lost at any level; at
-64 leaves the release-branch fact vanished from the level-four summary,
-the one line standing for sixteen leaves, so wake-only recall of the
-oldest quarter fell to 75% while wake plus recall held at 100%. The byte
-cap at the top of the tree is where loss starts, and the raw rows carry
+`e4` (n=5, lengths 32 and 64): haiku lost nothing at 32 leaves and, at
+64, one of four planted facts from the level-four summary, the one line
+standing for sixteen leaves, so wake-only recall of the oldest quarter
+fell to 75% while wake plus recall held at 100%. Opus kept every fact at
+every level at both lengths. The byte cap at the top of the tree is where
+loss starts, it is the smaller model that hits it, and the raw rows carry
 what it drops.
+`e3` after the grader fix (haiku, n=10): 32 of 40 with the widened hedge
+list, 8 fails of which 3 are the child asking approval to run the nap
+command instead of writing the line, harness noise the content check now
+fails on purpose, and 2 are real: "suspect the cache, not proven" became
+"ruling out cache as root cause". The word list still misses paraphrased
+doubt; read the misses.
 Run at least n=10 per condition; single runs are noise. Rerun after any
 prompt change in `segmem` to see whether the change earned its place.
 

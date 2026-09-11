@@ -12,7 +12,7 @@ the same day: on the real store's 130 summaries, the hedge flag fires on
 13, the invented flag on 33, the silent-leaf count is 74 of 450 leaves.
 None becomes a refusal (see S1 in Slices for why). The invented list did
 find one summary stored over the wrong block, the S0b bug in the wild.
-S2 and S3 ran on haiku the same day; numbers under each slice. The short
+S2 and S3 ran the same day, S3 on haiku and opus; numbers under each slice. The short
 form: the verifier is a reader's aid and not a gate, and it found a hole
 in the e3 grader; the tree loses nothing through three levels and one of
 four planted facts at the fourth, where one 280-byte line stands for
@@ -254,7 +254,9 @@ anything under a ten-point gap as noise until n grows.
   not position or drift, and the raw rows carry what it drops: Ground
   Truth First's eviction, in a system where nothing is evicted from recall.
   The lever, if 3 of 4 is ever not enough, is the top-level budget, not
-  the nap prompt. Opus run pending.
+  the nap prompt. Opus, same run: every fact kept at every level at both
+  lengths, both readers 100%. The loss at the top is the smaller model
+  fitting four facts into 280 bytes, not the tree.
 
 ## Degradation
 

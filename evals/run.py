@@ -32,7 +32,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(HERE, "..", "segmem")
-HEDGES = r"unknown|suspect|not proven|unconfirmed|untested|not tested|may be|maybe|might|possibl|unverified|unclear|likely|probabl"
+HEDGES = r"unknown|unidentified|undetermined|suspect|not proven|unconfirmed|untested|not tested|not yet|pending|may be|maybe|might|possibl|unverified|unclear|likely|probabl"
 
 
 # Child claude sessions run the user's hooks, the segmem plugin included:
@@ -206,7 +206,9 @@ def grade_e3(summary_text, subject, hedge_required, leaves=None):
 def run_e3(model, n):
     out = {"eval": "e3", "model": model, "n": n, "cases": []}
     for leaves, subject, req in E3_CASES:
-        prompt = nap_prompt_for(leaves)
+        # the line alone: a bare nap prompt makes the child act as an agent
+        # and ask approval to run the command instead of writing the line
+        prompt = nap_prompt_for(leaves) + "\nReply with the line alone, in double quotes."
         row = {"leaves": leaves, "subject": subject, "hedge_required": req,
                "pass": 0, "fail": 0, "lines": []}
         row["raw"] = []

@@ -823,6 +823,25 @@ class Segmem(unittest.TestCase):
                 os.environ["SEGMEM_QUIET"] = old
         self.assertIn("block", run("stale", "--hook", stdin=json.dumps({"session_id": "s1"})))
 
+    def test_hook_stays_silent_on_a_broad_identifier(self):
+        for i in range(12):
+            run("note", "episodic", "deploy step %d went through make-release" % i
+                if i == 0 else "deploy step %d went through the gate" % i)
+        run("note", "procedural", "the gate is scripts/gate.sh", "--entities=gate")
+        # `deploy` matches 12 of 13 facts: it says nothing, so nothing prints
+        self.assertEqual("", run("hook", stdin='{"prompt": "the `deploy` broke"}'))
+        # and it is not what earns a narrow neighbour its block
+        out = run("hook", stdin='{"prompt": "the `deploy` via `make-release`"}')
+        self.assertIn("make-release", out)
+        self.assertNotIn("step 1 ", out)
+        # a narrow identifier alone prints as before
+        self.assertIn("gate.sh", run("hook", stdin='{"prompt": "read `scripts/gate.sh`"}'))
+        # under four facts nothing is broad: a tiny store answers everything
+        run.dir = tempfile.mkdtemp()
+        run("note", "procedural", "deploys go through make-release")
+        run("note", "procedural", "deploys need the gate")
+        self.assertIn("make-release", run("hook", stdin='{"prompt": "`deploys`"}'))
+
     def test_hook_tool_recalls_on_the_program_about_to_run(self):
         import json
         run("note", "procedural", "stock macOS sqlite3 lacks FTS5; use python3", "--entities=sqlite")
@@ -902,9 +921,12 @@ class Segmem(unittest.TestCase):
         import json
         for i in range(12):
             run("note", "episodic", "widget incident %d" % i, "--entities=widget-core")
+        # enough other facts that widget-core stays under the silence gate's sixth
+        for i in range(66):
+            run("note", "episodic", "unrelated item %d" % i)
         out = run("hook", stdin=json.dumps({"prompt": "what about widget-core?"}))
         lines = [l for l in out.splitlines() if l.startswith("#")]
-        self.assertLessEqual(len(lines), 8)
+        self.assertEqual(len(lines), 8)
 
 
 if __name__ == "__main__":

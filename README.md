@@ -280,8 +280,10 @@ The `init` output includes this block. For Claude Code, merge it into
   (code spans, `#123`, paths, snake and kebab names, and capitalized words
   that are known tags), searches
   the current project plus global memory, and adds up to eight hits as a
-  `<segmem-recall>` block. No identifiers or no hits means no output. It never
-  blocks a prompt.
+  `<segmem-recall>` block. No identifiers or no hits means no output. An
+  identifier that matches more than a sixth of the store (`wake`, in this
+  repo) is too broad to mean anything and is dropped, so a prompt made only
+  of such words stays quiet. It never blocks a prompt.
 - `Stop` runs `stale --hook`, which interrupts the agent when a people note
   or a procedural fact has fallen behind the evidence, once per subject and
   session, and never

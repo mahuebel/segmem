@@ -1303,6 +1303,31 @@ def actions(command):
     return out
 
 
+def narrow(c, ids, scope, col=""):
+    """The silence gate. An identifier that matches more than a sixth of the
+    live facts in scope (and more than three) says nothing about this
+    prompt: `wake` matched 13 of segmem's 42, and every prompt naming it got
+    eight lines of history. Such a word is dropped, and a prompt made only
+    of such words gets no block. Returns (kept, broad), broad as (word,
+    count) so the page can say why. After Remember When It Matters (arXiv
+    2607.08716): selective injection beat always-on."""
+    n = c.execute("SELECT count(*) FROM memories WHERE scope IN (?,?) AND %s" % LIVE,
+                  (GLOBAL, scope)).fetchone()[0]
+    cap = max(3, n // 6)
+    kept, broad = [], []
+    for i in ids:
+        q = col + '"%s"' % i.replace('"', '""')
+        try:
+            df = c.execute(
+                "SELECT count(*) FROM memories_fts f JOIN memories m ON m.id=f.rowid "
+                "WHERE memories_fts MATCH ? AND m.scope IN (?,?) AND %s" % LIVE,
+                (q, GLOBAL, scope)).fetchone()[0]
+        except sqlite3.OperationalError:
+            df = 0
+        (broad if df > cap else kept).append((i, df) if df > cap else i)
+    return kept, broad
+
+
 def cmd_hook(c, args):
     """Claude Code UserPromptSubmit hook: reads the prompt as JSON on stdin,
     prints matching memories as extra context. Never fails the prompt.
@@ -1340,6 +1365,9 @@ def cmd_hook(c, args):
             ids = [i for i in ids if i.lower() not in seen]
     else:
         ids = identifiers(data.get("prompt", ""), tags)
+    p = project()
+    col = "entities:" if tool else ""
+    ids, _ = narrow(c, ids, p, col)
     if not ids:
         return
     try:
@@ -1349,9 +1377,7 @@ def cmd_hook(c, args):
             touch(c, [i for i in ids if i.lower() in tags], "prompt", sid)
     except sqlite3.OperationalError:
         pass
-    col = "entities:" if tool else ""
     q = " OR ".join(col + '"%s"' % i.replace('"', '""') for i in ids)
-    p = project()
     try:
         rows = c.execute(
             "SELECT m.* FROM memories_fts f JOIN memories m ON m.id=f.rowid "
@@ -1977,6 +2003,9 @@ def serve_hook(c, prompt, scope):
                          or (len(lw) > 3 and lw in t)), None)
             dropped.append({"word": w, "why": "capitalized but not a tag: prose",
                             "near": tags[near] if near else None})
+    ids, broad = narrow(c, ids, scope)
+    for w, df in broad:
+        dropped.append({"word": w, "why": "too broad: matches %d facts" % df})
     rows, orows, q = [], [], None
     if ids:
         q = " OR ".join('"%s"' % i.replace('"', '""') for i in ids)

@@ -38,6 +38,18 @@ leave no touches and take no Stop nag. Find the spawner and set it.
 never get reviewed. Supersede each with the same text and the entities it
 should carry, or forget it if it fails the 30-day test.
 
+**Summaries.** `python3 evals/run.py audit` (free) flags stored summaries
+against their leaves: a dropped hedge, a token no leaf holds, leaves that
+contribute nothing. Read each flagged summary beside its leaves and judge
+it on three questions, as `docs/design-nap-gate.md` describes: does it keep
+what a future decision needs, does a doubt stay a doubt, is every claim in
+a leaf. Print the ones that fail, with the reason, for the person. Never
+re-nap on your own: a re-nap replaces a line, and one judge at the
+agreement rates measured so far is wrong too often for a write. A summary
+that describes a different block than the one it sits over is the range
+bug from before September 11, 2026; say so and let the person `forget` it
+from that project.
+
 **Store.** Database and write-ahead log sizes. A log many times the
 database means a long-lived process holds a connection (`segmem serve`, an
 MCP client); harmless. Integrity should say ok.

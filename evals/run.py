@@ -9,6 +9,9 @@
   audit  free lint of the real store: summaries against their leaves, one
          flag per nap-gate check (hedge dropped, invented token, silent
          leaf), counted so a check earns its way to a refusal.
+  verify score the judged verifier (three booleans per compression) against
+         the e3 regex grader and the audit's hedge flag before it judges
+         anything on its own. Not in `all`: ~170 calls.
 
 Run:  python3 evals/run.py all --model haiku -n 10
 Results land in evals/results/<eval>-<model>.json. Grading is mechanical;
@@ -249,26 +252,31 @@ def audit_flags(summary, leaves, leaf_dates, identifiers):
     return {"invented": invented, "hedge": hedge, "silent": silent}
 
 
-def run_audit(_model=None, _n=None):
-    """Free: real-store summaries against their leaves, one flag per check.
-    The hedge flag is the original audit; invented and silent are the nap
-    gate's other checks, counted so their firing rate decides whether they
-    ever become refusals."""
-    env = dict(os.environ)
+def audit_rows():
+    """Every stored summary in the real store with its leaves and flags."""
     import sqlite3
-    db = os.path.join(env.get("SEGMEM_DIR") or os.path.expanduser("~/.segmem"), "segmem.db")
+    db = os.path.join(os.environ.get("SEGMEM_DIR") or os.path.expanduser("~/.segmem"), "segmem.db")
     c = sqlite3.connect(db)
     identifiers = _segmem().identifiers
-    rows, total = [], 0
+    rows = []
     for kind, scope, lo, hi, text in c.execute("SELECT kind,scope,lo,hi,text FROM summaries"):
-        total += 1
         leaves = c.execute(
             "SELECT text, ts FROM memories WHERE kind=? AND scope=? AND seq>=? AND seq<? ORDER BY seq",
             (kind, scope, lo, hi)).fetchall()
         f = audit_flags(text, [t for t, _ in leaves], [ts[:10] for _, ts in leaves], identifiers)
         f.update({"scope": scope, "block": "%d-%d" % (lo, hi - 1), "summary": text,
-                  "leaves": len(leaves)})
+                  "leaves": len(leaves), "leaf_texts": [t for t, _ in leaves]})
         rows.append(f)
+    return rows
+
+
+def run_audit(_model=None, _n=None):
+    """Free: real-store summaries against their leaves, one flag per check.
+    The hedge flag is the original audit; invented and silent are the nap
+    gate's other checks, counted so their firing rate decides whether they
+    ever become refusals."""
+    rows = audit_rows()
+    total = len(rows)
     hedged = [r for r in rows if r["hedge"]]
     invented = [r for r in rows if r["invented"]]
     silent = [r for r in rows if r["silent"]]
@@ -281,8 +289,119 @@ def run_audit(_model=None, _n=None):
         print("    %s #%s: %s" % (os.path.basename(r["scope"]), r["block"], ", ".join(r["invented"])))
     print("  silent leaves: %d summaries, %d leaves of %d"
           % (len(silent), sum(len(r["silent"]) for r in silent), sum(r["leaves"] for r in rows)))
-    return {"eval": "audit", "summaries": total, "flagged": hedged,
-            "invented": invented, "silent": silent}
+    strip = lambda rs: [{k: v for k, v in r.items() if k != "leaf_texts"} for r in rs]
+    return {"eval": "audit", "summaries": total, "flagged": strip(hedged),
+            "invented": strip(invented), "silent": strip(silent)}
+
+
+# ---------------------------------------------------------------- verify
+
+# The nap gate's judged verifier (docs/design-nap-gate.md, S2): TRUSTMEM's
+# three booleans (arXiv 2606.25161) over one compression, one call, JSON
+# only. It judges nothing in the store until this eval has scored it against
+# graders we trust: the e3 lines the hedge regex passed or failed, and the
+# real store's summaries with the audit's hedge flag as the reference. A
+# re-nap is a destructive write; the verifier only ever prints for a person.
+VERIFY_PROMPT = """You are judging one compression in an agent's memory. Two sources \
+(memory notes, or summaries of notes) were compressed into one line of at most \
+280 bytes. Judge the line on three questions and answer with JSON only.
+
+coverage_ok: the line keeps what a future decision would need from the sources. \
+Dropping detail that does not last is allowed; dropping a decision, a root cause, \
+or a constraint is not.
+preservation_ok: nothing in the line contradicts a source, and a doubt in a \
+source stays a doubt: an unknown cause must not become a cause. Dropping a \
+doubted subject entirely is allowed.
+faithfulness_ok: every claim in the line is in a source. Rewording is fine; a \
+fact, number, or name from nowhere is not.
+
+Sources:
+{sources}
+
+Line:
+{line}
+
+Return only: {{"coverage_ok": true, "preservation_ok": true, "faithfulness_ok": true, \
+"issues": ["short labels"]}}"""
+
+
+def verify(sources, line, model):
+    prompt = VERIFY_PROMPT.format(sources="\n".join("- " + t for t in sources), line=line)
+    reply = ask(prompt, model)
+    m = re.search(r"\{.*\}", reply, re.S)
+    try:
+        v = json.loads(m.group(0)) if m else {}
+    except json.JSONDecodeError:
+        v = {}
+    out = {k: v.get(k) for k in ("coverage_ok", "preservation_ok", "faithfulness_ok")}
+    out["issues"] = v.get("issues", [])
+    out["parsed"] = bool(v)
+    return out
+
+
+def _agreement(pairs):
+    """pairs of (reference_pass, judge_pass) -> counts and rate."""
+    n = len(pairs)
+    agree = sum(1 for r, j in pairs if r == j)
+    return {"n": n, "agree": agree, "rate": agree / n if n else None,
+            "judge_fails_reference_pass": sum(1 for r, j in pairs if r and not j),
+            "judge_passes_reference_fail": sum(1 for r, j in pairs if j and not r)}
+
+
+def run_verify(model, n):
+    out = {"eval": "verify", "model": model, "arms": {}}
+    # Arm 1: e3 lines. The regex grader's verdict is the reference; the
+    # judge's verdict is preservation_ok and faithfulness_ok together (a
+    # dropped hedge is a doubt turned fact; a grown hedge is an unsupported
+    # claim). Uses this model's e3 results if present, else haiku's.
+    path = os.path.join(HERE, "results", "e3-%s.json" % model)
+    if not os.path.exists(path):
+        path = os.path.join(HERE, "results", "e3-haiku.json")
+    e3 = json.load(open(path))
+    pairs, rows = [], []
+    for case in e3["cases"]:
+        for raw, graded in zip(case["raw"], case["lines"]):
+            ref = graded.startswith("PASS")
+            _, line = grade_e3(raw, case["subject"], case["hedge_required"])
+            v = verify(case["leaves"], line, model)
+            judge = bool(v["preservation_ok"]) and bool(v["faithfulness_ok"])
+            pairs.append((ref, judge))
+            rows.append({"subject": case["subject"], "reference": ref, "judge": judge,
+                         "verdict": v, "line": line[:200]})
+            print("verify e3 %-8s ref:%s judge:%s cov:%s pres:%s faith:%s %s"
+                  % (case["subject"][:8], "PASS" if ref else "FAIL", "PASS" if judge else "FAIL",
+                     v["coverage_ok"], v["preservation_ok"], v["faithfulness_ok"],
+                     ",".join(map(str, v["issues"]))[:60]))
+    out["arms"]["e3"] = {"agreement": _agreement(pairs), "rows": rows, "source": os.path.basename(path)}
+    # Arm 2: the real store. The hedge flag is the reference for
+    # preservation only (flag set means a doubt was dropped). The other two
+    # booleans are reported as rates, with no reference to agree with.
+    pairs, rows = [], []
+    for r in audit_rows():
+        v = verify(r["leaf_texts"], r["summary"], model)
+        ref = not r["hedge"]
+        judge = bool(v["preservation_ok"])
+        pairs.append((ref, judge))
+        rows.append({"scope": os.path.basename(r["scope"]), "block": r["block"],
+                     "hedge_flag": r["hedge"], "invented": r["invented"], "verdict": v,
+                     "summary": r["summary"][:200]})
+    parsed = [r for r in rows if r["verdict"]["parsed"]]
+    out["arms"]["store"] = {
+        "agreement_preservation_vs_hedge_flag": _agreement(pairs),
+        "parsed": len(parsed), "summaries": len(rows),
+        "coverage_fail": sum(1 for r in parsed if r["verdict"]["coverage_ok"] is False),
+        "preservation_fail": sum(1 for r in parsed if r["verdict"]["preservation_ok"] is False),
+        "faithfulness_fail": sum(1 for r in parsed if r["verdict"]["faithfulness_ok"] is False),
+        "rows": rows}
+    a1, a2 = out["arms"]["e3"]["agreement"], out["arms"]["store"]["agreement_preservation_vs_hedge_flag"]
+    st = out["arms"]["store"]
+    print("verify: e3 arm agreement %d/%d (judge failed %d the regex passed, passed %d it failed); "
+          "store arm preservation vs hedge flag %d/%d (judge failed %d unflagged, passed %d flagged); "
+          "store fails: coverage %d, preservation %d, faithfulness %d of %d parsed"
+          % (a1["agree"], a1["n"], a1["judge_fails_reference_pass"], a1["judge_passes_reference_fail"],
+             a2["agree"], a2["n"], a2["judge_fails_reference_pass"], a2["judge_passes_reference_fail"],
+             st["coverage_fail"], st["preservation_fail"], st["faithfulness_fail"], st["parsed"]))
+    return out
 
 
 # ---------------------------------------------------------------- e2
@@ -564,14 +683,15 @@ def run_e2(model, n):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("which", choices=["e1", "e2", "e3", "audit", "all"])
+    ap.add_argument("which", choices=["e1", "e2", "e3", "audit", "verify", "all"])
     ap.add_argument("--model", default="haiku", help="haiku, sonnet, or opus")
     ap.add_argument("-n", type=int, default=10, help="trials per condition")
     a = ap.parse_args()
-    runs = {"e1": run_e1, "e2": run_e2, "e3": run_e3, "audit": run_audit}
+    runs = {"e1": run_e1, "e2": run_e2, "e3": run_e3, "audit": run_audit, "verify": run_verify}
     todo = ["audit", "e3", "e1", "e2"] if a.which == "all" else [a.which]
     calls = sum({"e1": 2 * len(E1_QUESTIONS) * a.n, "e2": 3 * len(E2_CASES) * a.n,
-                 "e3": len(E3_CASES) * a.n}.get(w, 0) for w in todo)
+                 "e3": len(E3_CASES) * a.n,
+                 "verify": len(E3_CASES) * 10 + len(audit_rows())}.get(w, 0) for w in todo)
     if calls:
         print("About to make %d claude calls on model %s.\n" % (calls, a.model))
     os.makedirs(os.path.join(HERE, "results"), exist_ok=True)

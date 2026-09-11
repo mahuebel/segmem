@@ -26,6 +26,9 @@ import sys
 KINDS = ("identity", "procedural", "episodic", "people")
 GLOBAL = "global"
 MAX_BYTES = 280
+NAP_AIM = 240           # the prompt's target; a line written to the limit misses it
+NAP_BURST = 3           # compressions asked for per NAP_REST minutes, per store
+NAP_REST = 30
 WAKE_EPISODIC = 16      # lines of project episodic cover
 WAKE_EPISODIC_GLOBAL = 8
 WAKE_PROCEDURAL = 32    # newest procedural notes printed in full; recall finds the rest
@@ -71,6 +74,7 @@ CREATE TABLE IF NOT EXISTS summaries (
   kind  TEXT NOT NULL, scope TEXT NOT NULL,
   lo    INTEGER NOT NULL, hi INTEGER NOT NULL,
   text  TEXT NOT NULL,
+  ts    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),  -- written or rewritten
   PRIMARY KEY (kind, scope, lo, hi)
 );
 CREATE TABLE IF NOT EXISTS touches (
@@ -106,11 +110,13 @@ def connect():
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA foreign_keys=ON")
     c.executescript(SCHEMA)
-    if "scope" not in [r[1] for r in c.execute("PRAGMA table_info(touches)")]:
-        try:
-            c.execute("ALTER TABLE touches ADD COLUMN scope TEXT NOT NULL DEFAULT ''")
-        except sqlite3.OperationalError:
-            pass        # two hooks migrating at once: the other one won
+    for table, col in (("touches", "scope TEXT NOT NULL DEFAULT ''"),
+                       ("summaries", "ts TEXT NOT NULL DEFAULT ''")):
+        if col.split()[0] not in [r[1] for r in c.execute("PRAGMA table_info(%s)" % table)]:
+            try:
+                c.execute("ALTER TABLE %s ADD COLUMN %s" % (table, col))
+            except sqlite3.OperationalError:
+                pass        # two hooks migrating at once: the other one won
     return c
 
 
@@ -261,10 +267,10 @@ def nap_prompt(c, kind, scope, lo, hi, left):
     tail = "" if not left else "\n%d compression%s remain after this one." % (
         left, "" if left == 1 else "s")
     return ("Compress episodic memories #%d-%d (%s) into one line of at most %d "
-            "bytes.\nKeep what has lasting effect, drop what does not. Invent "
+            "bytes; aim for %d.\nKeep what has lasting effect, drop what does not. Invent "
             "nothing.\nKeep doubts as doubts: an unknown cause must not become "
             "a cause.\n\n%s\n%s\nRun: %s nap %d-%d \"<your line>\""
-            % (lo, hi - 1, short(scope), MAX_BYTES, body, tail, ME, lo, hi - 1))
+            % (lo, hi - 1, short(scope), MAX_BYTES, NAP_AIM, body, tail, ME, lo, hi - 1))
 
 
 def next_nap(c, scope):
@@ -278,6 +284,19 @@ def next_nap(c, scope):
             lo, hi = todo[0]
             return sc, nap_prompt(c, "episodic", sc, lo, hi, len(todo) - 1), lo, hi - 1
     return None
+
+
+def ask_nap(c, scope):
+    """next_nap's prompt, or None while the store rests. Every ask site
+    (wake, note, nap, the Stop hook) goes through here; `next-nap` does not.
+    Without the rest a dormant tree drains in one turn: each nap prints the
+    next ask, the agent obeys it, and one session pays for thirty."""
+    nap = next_nap(c, scope)
+    if not nap:
+        return None
+    recent = c.execute("SELECT COUNT(*) FROM summaries WHERE ts > strftime("
+                       "'%Y-%m-%dT%H:%M:%fZ','now','-%d minutes')" % NAP_REST).fetchone()[0]
+    return None if recent >= NAP_BURST else nap
 
 
 # ---------------------------------------------------------------- promotion
@@ -684,7 +703,7 @@ def cmd_note(c, args):
     if kind != "people":
         # a people note is the dossier revision itself, not evidence against it
         touch(c, entities.split(","), "note")
-    nap = next_nap(c, project())
+    nap = ask_nap(c, project())
     if nap:
         print("\n" + nap[1])
 
@@ -775,8 +794,14 @@ def cmd_nap(c, args):
     with c:
         c.execute("INSERT OR REPLACE INTO summaries(kind,scope,lo,hi,text) VALUES (?,?,?,?,?)",
                   ("episodic", scope, lo, hi, text))
-    nap = next_nap(c, project())
-    print(nap[1] if nap else "All compressed.")
+    nap = ask_nap(c, project())
+    if nap:
+        print(nap[1])
+    else:
+        left = sum(len(pending(c, "episodic", sc, stream_len(c, "episodic", sc)))
+                   for sc in {scope, GLOBAL})
+        print("All compressed." if not left else
+              "Done. %d remain; the next ask comes after a rest." % left)
 
 
 def cmd_forget(c, args):
@@ -950,7 +975,7 @@ def stale_hook(c, due, pdue):
     # A compression the wake asked for and the turn read past. Wake never
     # blocks, so this is the one place the ask cannot be skipped: once per
     # session, the same prompt wake printed.
-    nap = None if "#nap" in nagged else next_nap(c, project())
+    nap = None if "#nap" in nagged else ask_nap(c, project())
     if not due and not pdue and not nap:
         return
     touch(c, [e for e, _, _, _ in due] + ["#%d" % r[0]["id"] for r in pdue]
@@ -1252,7 +1277,7 @@ def cmd_wake(c, args):
         return
     print("\n".join(out))
     print("\nYou are awake.")
-    nap = next_nap(c, p)
+    nap = ask_nap(c, p)
     if nap:
         print("\n" + nap[1])
 

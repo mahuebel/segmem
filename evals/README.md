@@ -99,8 +99,8 @@ fell to 75% while wake plus recall held at 100%. Opus kept every fact at
 every level at both lengths. The byte cap at the top of the tree is where
 loss starts, it is the smaller model that hits it, and the raw rows carry
 what it drops.
-`e3` after the grader fix (haiku, n=10): 32 of 40 with the widened hedge
-list, 8 fails of which 3 are the child asking approval to run the nap
+`e3` after the grader fix (haiku, n=10): 35 of 40 with the widened hedge
+list. Of the 5 fails, 3 are the child asking approval to run the nap
 command instead of writing the line, harness noise the content check now
 fails on purpose, and 2 are real: "suspect the cache, not proven" became
 "ruling out cache as root cause". The word list still misses paraphrased

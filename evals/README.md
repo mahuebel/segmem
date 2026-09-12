@@ -32,7 +32,7 @@ so a surprising number can be checked against what the model actually said.
   a command the fixture defines as damaging counts as wrong; an inspection
   command grades other, since looking first is not damage. The score is the
   count of wrong first commands the memory prevented. One-shot prediction,
-  no tools; the tool-using version is under "Not covered yet".
+  no tools; the tool-using version is the `install` case under "Agentic cases".
   A third arm, `raw`, is the control MemDelta (arXiv 2606.29914) asks for:
   the same facts as verbatim past-session transcript chunks, picked by a
   word-overlap search over a small corpus that includes decoys from another
@@ -108,9 +108,40 @@ doubt; read the misses.
 Run at least n=10 per condition; single runs are noise. Rerun after any
 prompt change in `segmem` to see whether the change earned its place.
 
+## Agentic cases: `plugin-evals/`
+
+`claude plugin eval` (Claude Code 2.1.269 and later) runs a case as a
+real session with the plugin loaded, then again without it, and reports
+the delta. Cases live in `plugin-evals/<case>/` (the manifest names the
+directory) and are graded by regex, so no judge model runs. From the repo
+root:
+
+```sh
+claude plugin eval . --scaffold --model haiku      # every case, 10 runs each
+claude plugin eval . --scaffold --case install --runs 3
+```
+
+`--scaffold` is required: each case's `scaffold.sh` builds the fixture
+checkout and seeds the store. The harness scrubs the environment and
+gives every run its own `HOME`, so the seeding lands in that run's
+`~/.segmem` and the real store is never opened; with `--keep-temp` the
+sealed home can be inspected. Results and the HTML report land in
+`plugin-evals/results/` (ignored).
+
+- **install.** e2's install case, agentic: a scaffolded Node checkout
+  with a legacy `pnpm-lock.yaml`, a seeded note saying the project uses
+  npm, and the agent free to read the files before naming its first
+  command. September 12, 2026, haiku, n=10: with segmem 10 of 10 chose
+  npm; without, 9 of 10 chose pnpm. Delta 0.9, about $0.50 and three
+  minutes. The one-shot e2 install case was 10 of 10 both ways.
+
+Bash-granting cases (the agent runs the install instead of naming it)
+are blocked on this machine: the harness refuses to grant Bash while
+`~/.docker` holds a symlink it cannot exclude from the sandbox.
+
 ## Not covered yet
 
-The agentic pair: seeding a wrong root cause and checking a tool-using
-session re-verifies against a fixture repo (and writes `--supersedes`)
-rather than repeating the anchor. Those need `claude -p` with Bash in a
-sandbox; the design is in the repo history.
+Seeding a wrong root cause and checking a tool-using session re-verifies
+against a fixture repo (and writes `--supersedes`) rather than repeating
+the anchor: a `plugin-evals/` case with a scaffolded repo whose code
+contradicts the seeded note, graded on `--supersedes` reaching the store.

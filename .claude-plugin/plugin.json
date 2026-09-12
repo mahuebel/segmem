@@ -14,5 +14,8 @@
     "hooks",
     "recall",
     "context"
-  ]
+  ],
+  "experimental": {
+    "evals": "plugin-evals"
+  }
 }

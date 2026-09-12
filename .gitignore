@@ -4,3 +4,4 @@ __pycache__/
 *.db-shm
 .segmem/
 .claude/types/
+plugin-evals/results/

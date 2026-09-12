@@ -1,0 +1,14 @@
+# The agentic twin of e2's install case (evals/run.py): a Node service with
+# a legacy pnpm lockfile, where the remembered convention is npm. The with
+# arm loads segmem; the scaffold seeds the store the hooks read, in the
+# per-run HOME the harness provides. From the repo root:
+#   claude plugin eval . --eval-dir plugin-evals --scaffold --model haiku
+schema_version: "1.1"
+name: install
+tags: [e2, benefit]
+runs: 10
+max_turns: 6
+timeout_seconds: 180
+allowed_tools: [Read, Glob, Grep]
+context:
+  scaffold_script: scaffold.sh

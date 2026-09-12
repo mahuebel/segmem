@@ -34,3 +34,19 @@ how far apart its parts are, while a query over the raw chunks does not.
 So plant one fact at each position of a block, nap, and check that wake or
 recall still finds it; then reverse the block and check again. Naps are the
 sequential design; bronze rows plus recall are the parallel one.
+
+## A `used` touch, from the RMM paper
+
+Google's Reflective Memory Management (arXiv 2503.08026, ACL 2025) trains
+a reranker from the generator's own citations: which retrieved memories the
+answer leaned on, a label the same call gives for free and that agrees
+with a judge at 86.7 F1. Its ablation prices the trained reranker at 1.4
+accuracy points on LongMemEval while swapping the retriever buys 4.8, so
+the learned part is not worth building at segmem's scale. The one idea
+that transfers: `touch <id> --used`, a touch kind recorded when an answer
+leaned on a fact. segmem's consumer already runs the other way, where
+attention makes a fact suspect; a fact served often and never used is
+exactly one under pressure, and one served and used is stable. About 20
+lines: a `cmd_touch` flag, a weight, `presses`. Shelved September 11, 2026:
+the signal is self-confirming, since the session that cites a fact often
+wrote it. Build it when a real false-pressure case shows up.

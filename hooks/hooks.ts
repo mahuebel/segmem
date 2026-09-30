@@ -127,8 +127,9 @@ export const register: Register = (on) => {
   let doctrine: string | undefined;
 
   on("agent.spawn", async ($, e, next) => {
+    // Cached only on success: one timeout must not strip the rule from
+    // every later spawn in this module's life.
     if (doctrine === undefined) {
-      doctrine = "";
       try {
         const r = await $.process.run(
           [$.plugin.root + "/segmem", "prompt", "--subagent"],

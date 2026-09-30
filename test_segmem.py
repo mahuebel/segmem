@@ -157,6 +157,32 @@ class Segmem(unittest.TestCase):
         self.assertIn("make-release", run("hook", "--once", stdin=ask.replace(
             '"session_id": "s1"', '"session_id": ""')))
 
+    def test_resume_reopens_the_recall_claim(self):
+        # a resume keeps its session id; where the path that owned recall is
+        # gone, the command hook must be able to take it back
+        import json
+        run("note", "procedural", "the deploy runs from make-release",
+            "--entities=make-release")
+        ask = json.dumps({"prompt": "how does `make-release` work?", "session_id": "s1"})
+        run("hook", "--once", "--session=s1", "--served=function", stdin=ask)
+        self.assertEqual("", run("hook", "--once", stdin=ask))
+        run("wake", "--once", stdin=json.dumps({"session_id": "s1", "source": "resume"}))
+        self.assertIn("make-release", run("hook", "--once", stdin=ask))
+
+    def test_supersede_refuses_a_fork(self):
+        run("note", "procedural", "uses npm")
+        run("note", "procedural", "uses pnpm", "--supersedes=1")
+        out = run("note", "procedural", "uses yarn", "--supersedes=1", check=False)
+        self.assertIn("the live fact is #2", out)
+        self.assertNotIn("yarn", run("wake"))
+        self.assertIn("yarn", run("note", "procedural", "uses yarn", "--supersedes=2") + run("wake"))
+
+    def test_printed_hooks_claim_the_session(self):
+        # plugin plus the printed block must not double wake and recall
+        out = run("init", check=False)
+        self.assertIn("wake --once --served=manual", out)
+        self.assertIn("hook --once --served=manual", out)
+
     def test_compaction_wakes_through_the_command_hook(self):
         """prompt.context does not fire again after a compaction, so the
         function path cannot re-wake and the command hook must. Its claim is

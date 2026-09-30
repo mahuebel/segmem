@@ -64,8 +64,9 @@ Requires Python 3.8 or later and `git`. Nothing else.
 
 That's the whole install: the three hooks register automatically, and the
 doctrine (what to record and when) is injected at session start, so there is
-no CLAUDE.md paste and no settings.json merge. Skip the manual steps below;
-running both doubles wake and recall.
+no CLAUDE.md paste and no settings.json merge. Skip the manual steps below.
+The hooks they print claim each session with `--once`, so running both no
+longer doubles wake and recall, but it still starts a second process per event.
 
 ### Any harness
 
@@ -265,8 +266,8 @@ The `init` output includes this block. For Claude Code, merge it into
 
 ```json
 {"hooks": {
-  "SessionStart": [{"hooks": [{"type": "command", "command": "~/.segmem/src/segmem wake"}]}],
-  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "~/.segmem/src/segmem hook"}]}]
+  "SessionStart": [{"hooks": [{"type": "command", "command": "~/.segmem/src/segmem wake --once --served=manual"}]}],
+  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "~/.segmem/src/segmem hook --once --served=manual"}]}]
 }}
 ```
 

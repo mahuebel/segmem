@@ -683,6 +683,17 @@ def cmd_note(c, args):
     sup = int(opts["supersedes"]) if "supersedes" in opts else None
     if sup is not None and not c.execute("SELECT 1 FROM memories WHERE id=?", (sup,)).fetchone():
         die("No memory #%d to supersede." % sup)
+    head, seen = sup, {sup}
+    while True:
+        nxt = c.execute("SELECT id FROM memories WHERE supersedes=?", (head,)).fetchone()
+        if not nxt or nxt[0] in seen:     # forget reuses ids; never loop
+            break
+        head = nxt[0]
+        seen.add(head)
+    if head != sup:
+        # Two successors fork the fact: both stay live and wake serves both.
+        die("#%d was already superseded; the live fact is #%d. Supersede #%d instead."
+            % (sup, head, head))
     refuse_dup(c, kind, scope, text, sup)
     entities, hints = canon(c, opts.get("entities", ""), kind, scope)
     with c:
@@ -1173,6 +1184,12 @@ def cmd_wake(c, args):
         sid = opts.get("session") or data.get("session_id", "")
         src = opts.get("source") or data.get("source", "startup")
         served = opts.get("served", "command")
+        if sid and src == "resume":
+            # A resume keeps its session id, so recall's claim from the first
+            # run would outlive it; where the path that owned it is gone (the
+            # module in Desktop, an older build) recall went silent. Reopen it.
+            with c:
+                c.execute("DELETE FROM claims WHERE session=? AND cmd='hook'", (sid,))
         if sid and claim(c, sid, "wake", src, served) != served:
             return          # the other hook path owns this session's wake
     p = project()
@@ -2935,8 +2952,8 @@ per prompt, to review a people note or procedural fact that has fallen behind
 the evidence.
 
 {{"hooks": {{
-  "SessionStart": [{{"hooks": [{{"type": "command", "command": "{me} wake"}}]}}],
-  "UserPromptSubmit": [{{"hooks": [{{"type": "command", "command": "{me} hook"}}]}}]
+  "SessionStart": [{{"hooks": [{{"type": "command", "command": "{me} wake --once --served=manual"}}]}}],
+  "UserPromptSubmit": [{{"hooks": [{{"type": "command", "command": "{me} hook --once --served=manual"}}]}}]
 }}}}
 """
 

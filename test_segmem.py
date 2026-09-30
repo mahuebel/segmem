@@ -520,6 +520,25 @@ class Segmem(unittest.TestCase):
         run("touch", "1")
         self.assertEqual("", run("stale", "--hook", stdin=json.dumps({"session_id": "s2"})))
 
+    def test_prompt_hook_asks_upkeep_one_subject_at_a_time(self):
+        # the ask comes before the work, so the answer ends the turn; one
+        # subject per prompt, each once per session
+        import json
+        for tag in ("pkg", "db"):
+            run("note", "procedural", "uses %s the careful way" % tag, "--entities=" + tag)
+            for i in range(3):
+                run("note", "episodic", "%s event %d" % (tag, i), "--entities=" + tag)
+        ask = lambda sid: run("hook", stdin=json.dumps({"prompt": "yes", "session_id": sid}))
+        first, second = ask("s1"), ask("s1")
+        self.assertIn("<segmem-upkeep>", first)
+        self.assertEqual(1, first.count("Procedural facts under pressure"))
+        self.assertIn("<segmem-upkeep>", second)
+        self.assertNotEqual(first, second)
+        self.assertNotIn("<segmem-upkeep>", ask("s1"))
+        run("touch", "1")
+        run("touch", "5")
+        self.assertNotIn("<segmem-upkeep>", ask("s2"))
+
     def test_stop_hook_asks_for_the_pending_nap_once(self):
         # wake never blocks on a missing compression, so the stop is where the
         # ask lands: the same prompt, once per session, nothing else due
@@ -814,7 +833,7 @@ class Segmem(unittest.TestCase):
         cmds = [h["command"] for evt in cfg["hooks"].values()
                 for m in evt for h in m["hooks"]]
         for want in ("segmem\" prompt", "segmem\" wake --once", "segmem\" hook --once",
-                     "segmem\" hook --tool --once", "segmem\" stale --hook"):
+                     "segmem\" hook --tool --once"):
             self.assertTrue(any(c.endswith(want) for c in cmds), want)
         for c in cmds:
             self.assertIn("${CLAUDE_PLUGIN_ROOT}", c)

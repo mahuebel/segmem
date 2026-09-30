@@ -24,8 +24,9 @@
 //
 // The module makes no model call. A nap draft lived here from S6 to 0.8.0:
 // it cost one session-model completion on the first-prompt path and, in the
-// one project with a compression backlog, never once converted. The Stop
-// hook now asks for the nap instead, where the ask cannot be read past.
+// one project with a compression backlog, never once converted. The prompt
+// hook now asks for the nap, one subject per prompt, before the work: at
+// Stop the ask landed after the answer and buried it.
 import type { EngineInterface, Register } from "claude-code";
 
 const TIMEOUT = 10_000;
@@ -57,8 +58,8 @@ async function gather($: EngineInterface): Promise<string> {
   else $.ui.log("segmem wake failed: " + (wake.status === "fulfilled"
     ? wake.value.stderr.trim() : String(wake.reason)));
 
-  // What the Stop hook will interrupt about, as a line the user can see
-  // before it does. The Stop block stays the model's trigger; this is a
+  // What the prompt hook will ask the model to review, as a line the user
+  // can see. The <segmem-upkeep> block stays the model's trigger; this is a
   // notice.
   if (stale.status === "fulfilled" && stale.value.exitCode === 0) {
     const n = Number(stale.value.stdout.trim());

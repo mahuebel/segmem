@@ -1,6 +1,6 @@
 ---
 name: compile
-description: Move a stable-and-hot segmem fact out of memory and into the repo in its strongest form (enforcement, then a skill, then CLAUDE.md, then docs). Use when wake or the Stop hook says a fact is "stable and hot" or "compile it into the repo", or when the user asks to make a memory permanent.
+description: Move a stable-and-hot segmem fact out of memory and into the repo in its strongest form (enforcement, then a skill, then CLAUDE.md, then docs). Use when wake or a <segmem-upkeep> block says a fact is "stable and hot" or "compile it into the repo", or when the user asks to make a memory permanent.
 ---
 
 # Compile a fact into the repo

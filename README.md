@@ -168,8 +168,7 @@ project's attention, a global fact feels all of it.
 
 A session nobody is watching (a builder fleet, a scheduled run) should read
 memory without pressing on it. Set `SEGMEM_QUIET=1` in its environment: the
-prompt hook still recalls but records no touches, and the `Stop` hook never
-blocks it.
+prompt hook still recalls but records no touches and asks for no upkeep.
 
 **People dossiers.** Only a people note or an explicit review resets the
 clock; an episodic note *about* a person raises pressure on their dossier, it
@@ -179,9 +178,8 @@ the threshold (6):
 - `segmem stale` lists the dossiers under pressure, with counts and dates.
 - `wake` flags them under the people list: `alice: dossier from 2026-08-24,
   3 notes since`.
-- The `Stop` hook interrupts the agent once per session with the same list
-  and one instruction: supersede each dossier with what changed, or confirm
-  it unchanged with `segmem touch <name>`.
+- The prompt hook asks the agent, once per session, to supersede the
+  dossier with what changed or confirm it unchanged with `segmem touch <name>`.
 
 **Procedural facts.** The same clock runs per note, against the touches on
 its entities, with a higher threshold (12), because busy components accrue
@@ -252,7 +250,7 @@ millisecond at a million memories.
 
 The agent writes each summary itself. When `wake` needs a summary that
 doesn't exist, it prints the block raw, never blocks, and asks for one line;
-the agent answers with `nap`. If the turn reads past the ask, the Stop hook
+the agent answers with `nap`. If the turn reads past the ask, the prompt hook
 repeats it once per session. Compression is requested only when wake would
 print the block, never ahead of time, and never in the background.
 
@@ -268,8 +266,7 @@ The `init` output includes this block. For Claude Code, merge it into
 ```json
 {"hooks": {
   "SessionStart": [{"hooks": [{"type": "command", "command": "~/.segmem/src/segmem wake"}]}],
-  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "~/.segmem/src/segmem hook"}]}],
-  "Stop": [{"hooks": [{"type": "command", "command": "~/.segmem/src/segmem stale --hook"}]}]
+  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "~/.segmem/src/segmem hook"}]}]
 }}
 ```
 
@@ -284,12 +281,14 @@ The `init` output includes this block. For Claude Code, merge it into
   identifier that matches more than a sixth of the store (`wake`, in this
   repo) is too broad to mean anything and is dropped, so a prompt made only
   of such words stays quiet. It never blocks a prompt.
-- `Stop` runs `stale --hook`, which interrupts the agent when a people note
-  or a procedural fact has fallen behind the evidence, once per subject and
-  session, and never
-  twice in a row: a stop caused by its own block passes through. It also
-  asks once per session for the compression wake printed raw, since a wake
-  that never blocks is a wake the agent can read past.
+- The same hook asks for memory upkeep in a `<segmem-upkeep>` block when a
+  people note or a procedural fact has fallen behind the evidence: one
+  subject per prompt, each once per session, done before the answer and not
+  mentioned in it. With nothing under pressure, it asks once per session for
+  the compression wake printed raw. It used to ask from a `Stop` hook, which
+  put the upkeep after the answer, so the answer scrolled away. `stale
+  --hook` still works for installs that wire it, but `init` no longer prints
+  it.
 
 ### Function hooks
 
@@ -344,8 +343,8 @@ log. The two paths share the prompt hook's claim, so one of them speaks.
 
 After wake, the module counts what is under pressure with `segmem stale
 --count` and pins `segmem: N under pressure` beneath the prompt, or clears
-the line when nothing is due. It is a notice, not a prompt: the Stop hook's
-block is still what asks the model to verify a fact against the repo. A
+the line when nothing is due. It is a notice, not a prompt: the prompt hook's
+`<segmem-upkeep>` block is what asks the model to verify a fact against the repo. A
 headless run has nowhere to draw it, and the engine says so in the debug
 log rather than failing.
 
@@ -359,7 +358,7 @@ not. `note` is not registered: it stays a shell command, which is what keeps
 The module makes no model call. Version 0.8.0 drafted the pending
 compression with the session's model at start; that cost one completion on
 the first-prompt path and, in the one project with a backlog, never once
-turned into a nap. The Stop hook asks for the compression instead, and the
+turned into a nap. The prompt hook asks for the compression instead, and the
 plugin still never runs `nap`: a summary that turns an unknown cause into a
 cause is worse than no summary, and only the model reading the originals
 can tell the two apart.
@@ -465,7 +464,7 @@ in skills, loaded only when they apply. The plugin ships four, under
 
 | Skill | When it loads |
 |---|---|
-| `segmem:compile` | wake or the Stop hook calls a fact stable and hot; moves it into the repo down the form ladder and supersedes the note with a pointer |
+| `segmem:compile` | wake or a `<segmem-upkeep>` block calls a fact stable and hot; moves it into the repo down the form ladder and supersedes the note with a pointer |
 | `segmem:org` | recall shows an `(org)` fact, wake reports a contradiction or a co-sign, or the user wants to share a fact with the team |
 | `segmem:review` | "how is memory doing"; reads `segmem audit` and says what to fix |
 | `segmem:import` | a project also has Claude Code's markdown memory in `~/.claude/projects/<slug>/memory/`; moves what passes the 30-day test into segmem |

@@ -1,5 +1,5 @@
 {
-  "description": "segmem: doctrine and wake at session start, recall on every prompt and before every Bash command, staleness nag at stop",
+  "description": "segmem: doctrine and wake at session start, recall and one memory-upkeep ask on prompts, recall before every Bash command",
   "hooks": {
     "SessionStart": [
       {
@@ -35,17 +35,6 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/segmem\" hook --tool --once",
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/segmem\" stale --hook",
             "timeout": 10
           }
         ]

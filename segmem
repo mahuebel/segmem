@@ -16,6 +16,7 @@ Touches are telemetry, not memory: who got mentioned, recalled, or tagged,
 pressing on the people dossiers and procedural facts. Wake never prints
 them as facts.
 """
+import functools
 import os
 from pathlib import Path
 import re
@@ -38,7 +39,7 @@ PROC_STALE_MIN = 12     # same, per procedural note; hub entities accrue fast
 TOUCH_WEIGHT = {"note": 3, "recall": 2, "prompt": 1}
 # A harness-driven child session (a builder fleet, a scheduled run) reads
 # memory but leaves no evidence and takes no nag: its prompts are not a
-# person's attention, and a Stop block costs it a turn nobody reads.
+# person's attention, and an upkeep ask costs it a turn nobody reads.
 QUIET = bool(os.environ.get("SEGMEM_QUIET"))
 
 ME = os.path.abspath(sys.argv[0])
@@ -120,6 +121,7 @@ def connect():
     return c
 
 
+@functools.cache    # each call spawns git; one process has one cwd
 def project():
     """Scope key for the cwd: the main repo path, shared across worktrees."""
     if os.environ.get("SEGMEM_PROJECT"):
@@ -288,7 +290,7 @@ def next_nap(c, scope):
 
 def ask_nap(c, scope):
     """next_nap's prompt, or None while the store rests. Every ask site
-    (wake, note, nap, the Stop hook) goes through here; `next-nap` does not.
+    (wake, note, nap, the upkeep ask) goes through here; `next-nap` does not.
     Without the rest a dormant tree drains in one turn: each nap prints the
     next ask, the agent obeys it, and one session pays for thirty."""
     nap = next_nap(c, scope)
@@ -610,7 +612,7 @@ def canon(c, raw, kind, scope=GLOBAL):
         seen.add(k)
         if scope != GLOBAL and k == short(scope).lower():
             hints.append("tag %s is the scope itself and was dropped; tag the subject "
-                         "(a component, file, or person) instead" % e)
+                         "(a component, file, or person) next time" % e)
             continue
         if k in tags:
             out.append(tags[k])
@@ -626,7 +628,8 @@ def canon(c, raw, kind, scope=GLOBAL):
                              "\"<who they are>\" --entities=%s" % (e, ME, e))
     if kind == "procedural" and not out:
         hints.append("no --entities: a procedural fact with no subject never feels "
-                     "pressure, so it can go stale unseen; tag the component it governs")
+                     "pressure, so it can go stale unseen. Fix it now, without asking: note it "
+                     "again with --entities=<the component it governs> --supersedes=<its id>")
     return ",".join(out), hints
 
 
@@ -958,10 +961,11 @@ def cmd_stale(c, args):
 
 
 def stale_hook(c, due, pdue):
-    """Claude Code Stop hook: when a dossier or a procedural fact is under
-    pressure, block the stop once per subject and session so a live agent
-    reviews it. stop_hook_active means this stop is already the result of a
-    block: let it through."""
+    """The old Stop hook, kept for manual installs that still wire it: block
+    the stop once per subject and session. The plugin asks at the next prompt
+    instead (upkeep, from cmd_hook): an ask after the answer buries the
+    answer under the upkeep. stop_hook_active means this stop is already the
+    result of a block: let it through."""
     import json
     try:
         data = json.load(sys.stdin)
@@ -969,17 +973,32 @@ def stale_hook(c, due, pdue):
         data = {}
     if not isinstance(data, dict) or data.get("stop_hook_active") or QUIET:
         return
-    sid = data.get("session_id", "")
+    text = upkeep(c, data.get("session_id", ""), due, pdue)
+    if text:
+        print(json.dumps({"decision": "block", "reason": text}))
+
+
+def due_now(c):
+    due = [r for r in dossier_pressure(c) if r[1] >= STALE_MIN]
+    pdue = [r for r in note_pressure(c, [project(), GLOBAL]) if r[1] >= PROC_STALE_MIN]
+    return due, pdue
+
+
+def upkeep(c, sid, due, pdue, one=False):
+    """The ask for what is under pressure or owed a nap, each subject once
+    per session, or None. `one` keeps only the hottest subject: the prompt
+    hook asks for one per prompt, so a "yes" never waits on four reviews."""
     nagged = {e for (e,) in c.execute(
         "SELECT DISTINCT entity FROM touches WHERE kind='nag' AND session=?", (sid,))}
     due = [r for r in due if r[0] not in nagged]
     pdue = [r for r in pdue if "#%d" % r[0]["id"] not in nagged]
-    # A compression the wake asked for and the turn read past. Wake never
-    # blocks, so this is the one place the ask cannot be skipped: once per
-    # session, the same prompt wake printed.
-    nap = None if "#nap" in nagged else ask_nap(c, project())
+    if one and (due or pdue):
+        top = max(due + pdue, key=lambda r: r[1])
+        due, pdue = ([top], []) if top in due else ([], [top])
+    # A compression the wake asked for and the turn read past, once per session.
+    nap = None if "#nap" in nagged or (one and (due or pdue)) else ask_nap(c, project())
     if not due and not pdue and not nap:
-        return
+        return None
     touch(c, [e for e, _, _, _ in due] + ["#%d" % r[0]["id"] for r in pdue]
           + (["#nap"] if nap else []), "nag", sid)
     parts = []
@@ -1008,7 +1027,7 @@ def stale_hook(c, due, pdue):
         parts.append("Keep hedges as hedges when you supersede.")
     if nap:
         parts.append(nap[1])
-    print(json.dumps({"decision": "block", "reason": " ".join(parts)}))
+    return " ".join(parts)
 
 
 def cmd_promote(c, args):
@@ -1392,6 +1411,14 @@ def cmd_hook(c, args):
     if "once" in opts:
         if sid and claim(c, sid, "hook", "session", served) != served:
             return          # the other hook path owns this session's recall
+    if not tool and not QUIET and sid:
+        # Memory upkeep asked here, before the work, so the reply the user
+        # reads last is the answer. At Stop it landed after the answer.
+        ask = upkeep(c, sid, *due_now(c), one=True)
+        if ask:
+            print("<segmem-upkeep>\nBefore you answer, in as few commands as you can, "
+                  "and without mentioning it in your reply unless a fact you relied on "
+                  "proved wrong: %s\n</segmem-upkeep>" % ask)
     tags = known_tags(c)
     if tool:
         if QUIET:
@@ -2867,10 +2894,10 @@ When `note` suggests a tag spelling, use it next time; never re-note.
 Tag a pitfall with the program it bites (`sqlite`, `git`): it then prints as
 that program is about to run. A wrong note: `{me} forget <id> "why"`; the
 same line is refused after.
-If `note` or a stop asks for a compression, do it before your next action.
+If `note` or a <segmem-upkeep> block asks for a compression, do it before your next action.
 When a person was a subject this session, not a mention: before you finish,
 supersede their people note or confirm it unchanged with `{me} touch <name>`.
-When wake or a stop flags a fact under pressure, check the claim against the
+When wake or a <segmem-upkeep> block flags a fact under pressure, check the claim against the
 repo before answering: supersede what changed, confirm what held with
 `{me} touch <id>`. When segmem calls a fact stable and hot, load the segmem
 `compile` skill: it moves the fact into the repo in its strongest form.
@@ -2903,13 +2930,13 @@ HOOK = """\
 Hooks (recommended): merge into ~/.claude/settings.json (Claude Code) or save
 as ~/.codex/hooks.json (Codex CLI). SessionStart makes wake run on every start
 and resume without relying on the agent; UserPromptSubmit searches every
-prompt for names, #issues, and paths; Stop nags once per session when a
-people note or a procedural fact has fallen behind the evidence.
+prompt for names, #issues, and paths, and asks once per session, one subject
+per prompt, to review a people note or procedural fact that has fallen behind
+the evidence.
 
 {{"hooks": {{
   "SessionStart": [{{"hooks": [{{"type": "command", "command": "{me} wake"}}]}}],
-  "UserPromptSubmit": [{{"hooks": [{{"type": "command", "command": "{me} hook"}}]}}],
-  "Stop": [{{"hooks": [{{"type": "command", "command": "{me} stale --hook"}}]}}]
+  "UserPromptSubmit": [{{"hooks": [{{"type": "command", "command": "{me} hook"}}]}}]
 }}}}
 """
 
